@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+out/
+.cache/
+compile_commands.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Secrets — never commit credentials
+*.token
+.env
+secrets/
+
+# VORTEX artifacts
+*.vxc
+*.vxprof
+__pycache__/
