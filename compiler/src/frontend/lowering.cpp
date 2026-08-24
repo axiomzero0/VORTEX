@@ -49,6 +49,7 @@ struct NameSets {
     stdx::small_vector<SymbolId, 16> referenced{};          // this body only
     stdx::small_vector<SymbolId, 16> child_referenced{};    // from nested defs (transitive)
     stdx::small_vector<SymbolId, 16> globals_declared{};
+    stdx::small_vector<SymbolId, 16> nonlocals_declared{};
 };
 
 [[nodiscard]] bool contains_sym(const stdx::small_vector<SymbolId, 16>& v, SymbolId s) noexcept {
@@ -127,18 +128,36 @@ void names_of_stmt(Stmt* s, NameSets& out) noexcept {
         }
         case StmtKind::Assign:
             for (Expr* t : s->targets) {
-                if (t->kind == ExprKind::Name) add_unique(out.bound, t->name);
-                else names_of_expr(t, out);
+                if (t->kind == ExprKind::Name) {
+                    // nonlocal-declared targets bind through the closure,
+                    // not locally (they must propagate as captures).
+                    if (!contains_sym(out.nonlocals_declared, t->name)) {
+                        add_unique(out.bound, t->name);
+                    } else {
+                        add_unique(out.referenced, t->name);
+                    }
+                } else {
+                    names_of_expr(t, out);
+                }
             }
             names_of_expr(s->value, out);
             return;
         case StmtKind::AugAssign:
-            names_of_expr(s->targets[0], out);
+            if (s->targets[0]->kind == ExprKind::Name &&
+                contains_sym(out.nonlocals_declared, s->targets[0]->name)) {
+                add_unique(out.referenced, s->targets[0]->name);
+            } else {
+                names_of_expr(s->targets[0], out);
+            }
             names_of_expr(s->value, out);
             return;
         case StmtKind::For:
             if (s->for_target && s->for_target->kind == ExprKind::Name) {
-                add_unique(out.bound, s->for_target->name);
+                if (!contains_sym(out.nonlocals_declared, s->for_target->name)) {
+                    add_unique(out.bound, s->for_target->name);
+                } else {
+                    add_unique(out.referenced, s->for_target->name);
+                }
             } else if (s->for_target) {
                 names_of_expr(s->for_target, out);
             }
@@ -147,8 +166,15 @@ void names_of_stmt(Stmt* s, NameSets& out) noexcept {
             names_of_stmts(s->orelse, out);
             return;
         case StmtKind::Global:
-        case StmtKind::Nonlocal:
             for (SymbolId n : s->names) add_unique(out.globals_declared, n);
+            return;
+        case StmtKind::Nonlocal:
+            // nonlocal names are closure references (captured from the
+            // enclosing scope), never globals, never locals.
+            for (SymbolId n : s->names) {
+                add_unique(out.referenced, n);
+                add_unique(out.nonlocals_declared, n);
+            }
             return;
         case StmtKind::Try:
             names_of_stmts(s->body, out);
@@ -187,6 +213,12 @@ stdx::small_vector<SymbolId, 16> free_names(const StmtList& body) noexcept {
     NameSets n = analyze(body);
     stdx::small_vector<SymbolId, 16> out;
     for (SymbolId r : n.referenced) {
+        // nonlocal wins over a local assignment in the same scope: the name
+        // is a closure capture, not a local.
+        if (contains_sym(n.nonlocals_declared, r)) {
+            if (!contains_sym(out, r)) out.push_back(r);
+            continue;
+        }
         if (contains_sym(n.bound, r)) continue;
         if (contains_sym(n.globals_declared, r)) continue;
         if (contains_sym(out, r)) continue;
@@ -210,8 +242,10 @@ namespace {
 class Lowerer {
 public:
     Lowerer(Module& m, LowerContext& ctx, LoweredUnit& unit, bool is_toplevel,
-            bool class_body, const stdx::small_vector<SymbolId, 8>& captured)
-        : mod_(m), ctx_(ctx), unit_(unit), is_toplevel_(is_toplevel), class_body_(class_body) {
+            bool class_body, const stdx::small_vector<SymbolId, 8>& captured,
+            std::uint32_t forced_unit_id = 0xFFFFFFFF)
+        : mod_(m), ctx_(ctx), unit_(unit), is_toplevel_(is_toplevel),
+          class_body_(class_body), forced_unit_id_(forced_unit_id) {
         for (SymbolId c : captured) captured_.push_back(c);
     }
 
@@ -286,12 +320,22 @@ private:
     }
 
     NodeId py_op(NodeKind k, std::uint16_t subop, std::initializer_list<NodeId> data_ins) noexcept {
-        NodeId n = g().create(k, data_ins);
+        // Python-level ops are NOT pure: they may invoke user __add__ etc.
+        // (arbitrary effects) and may raise. They carry control+effect
+        // inputs so they schedule INSIDE their try block (the module-level
+        // try/except range bug).
+        NodeId n = g().create(k);
         Node& node = g().node(n);
         node.subop = subop;
-        node.set_flag(NodeFlag::Pure);
         node.set_flag(NodeFlag::MayThrow);
         node.set_flag(NodeFlag::MayCall);
+        node.set_flag(NodeFlag::OnEffectChain);
+        g().add_input(n, control_);
+        g().add_input(n, memory_);
+        for (NodeId d : data_ins) {
+            if (d != vortex::ir::invalid_node) g().add_input(n, d);
+        }
+        memory_ = n;
         return n;
     }
 
@@ -312,7 +356,14 @@ private:
     }
 
     void write_var(SymbolId name, NodeId value) noexcept {
-        vars_.insert(name, value);
+        // Nonlocal writes go through the cell (late binding for closures).
+        if (contains_sym8(nonlocal_names_, name)) {
+            NodeId cell = captured_cell(name);
+            vars_.insert_or_assign(name, value);   // local view for reads
+            call_native(NativeHelper::CellSet, {cell, value});
+            return;
+        }
+        vars_.insert_or_assign(name, value);
         deleted_locals_.erase(name);
         if (contains_sym8(cell_vars_, name)) {
             NodeId cell = cell_of(name);
@@ -346,6 +397,7 @@ private:
     // --- arm merging ---------------------------------------------------------------
     struct ArmState {
         NodeId control{vortex::ir::invalid_node};
+        NodeId memory{vortex::ir::invalid_node};   // effect-chain tail at arm end
         VarMap vars{};
     };
 
@@ -361,10 +413,23 @@ private:
         if (live.size() == 1) {
             control_ = live[0]->control;
             vars_ = live[0]->vars;
+            if (live[0]->memory != vortex::ir::invalid_node) memory_ = live[0]->memory;
             return control_;
         }
         NodeId region = g().create(NodeKind::Region);
         for (ArmState* arm : live) g().add_input(region, arm->control);
+
+        // Effect-chain merge (Rule 40 continuity): a Region needs an
+        // EffectPhi or later memory ops chain off one arm only — unsound
+        // (the break-path effect bug).
+        NodeId eff_phi = g().create(NodeKind::EffectPhi);
+        for (ArmState* arm : live) {
+            g().add_input(eff_phi, arm->memory != vortex::ir::invalid_node
+                                       ? arm->memory
+                                       : memory_);
+        }
+        g().add_input(eff_phi, region);
+        memory_ = eff_phi;
 
         VarMap merged = live[0]->vars;
         for (std::size_t i = 1; i < live.size(); ++i) {
@@ -375,7 +440,7 @@ private:
                         g().add_input(phi, *cur);
                         g().add_input(phi, kv.second);
                         g().add_input(phi, region);
-                        merged.insert(kv.first, phi);
+                        merged.insert_or_assign(kv.first, phi);
                     }
                 } else {
                     merged.insert(kv.first, kv.second);
@@ -414,12 +479,14 @@ private:
     Result<NodeId> lower_compare_chain(Expr* e) noexcept;
     Result<NodeId> lower_call(Expr* e) noexcept;
     Result<NodeId> lower_listcomp(Expr* e) noexcept;
+    Result<void> lower_listcomp_clause(Expr* e, NodeId result) noexcept;
 
     Module& mod_;
     LowerContext& ctx_;
     LoweredUnit& unit_;
     bool is_toplevel_;
     bool class_body_;
+    std::uint32_t forced_unit_id_{0xFFFFFFFF};
     stdx::small_vector<SymbolId, 8> captured_;
     stdx::small_vector<SymbolId, 8> cell_vars_{};
 
@@ -429,6 +496,14 @@ private:
 
     VarMap vars_{};
     VarMap deleted_locals_{};
+    stdx::small_vector<SymbolId, 8> nonlocal_names_{};
+
+    [[nodiscard]] NodeId captured_cell(SymbolId name) noexcept {
+        // The cell for a nonlocal name lives in the __cells__ tuple at the
+        // capture index (same layout lower_function_def materialized).
+        NodeId idx = const_int(capture_index(name));
+        return effect_op(NodeKind::LoadIndex, {cells_param_, idx}, true);
+    }
     VarMap local_cells_{};
 
     struct LoopCtx {
@@ -491,7 +566,11 @@ Result<void> Lowerer::run(Stmt* def, const StmtList& body,
         unit_.name = graph.function_name;
     }
 
-    unit_.code_unit_id = ctx_.next_code_unit_id++;
+    if (forced_unit_id_ != 0xFFFFFFFF) {
+        unit_.code_unit_id = forced_unit_id_;
+    } else {
+        unit_.code_unit_id = ctx_.next_code_unit_id++;
+    }
     ++ctx_.units_lowered;
 
     // Create cells for captured locals at entry (unbound until first write).
@@ -540,7 +619,7 @@ Result<void> Lowerer::lower_stmts_tracked(const StmtList& body) noexcept {
         if (control_ == vortex::ir::invalid_node) return {};
         VORTEX_TRY_VOID(lower_stmt(s));
         if (control_ != vortex::ir::invalid_node && try_snapshots_) {
-            try_snapshots_->push_back(ArmState{control_, clone_vars(vars_)});
+            try_snapshots_->push_back(ArmState{control_, memory_, clone_vars(vars_)});
         }
     }
     return {};
@@ -636,7 +715,7 @@ Result<void> Lowerer::lower_stmt(Stmt* s) noexcept {
             if (loop_stack_.empty()) {
                 return fail_msg("lower: 'break' outside loop", diag_code::parse_unexpected_token);
             }
-            loop_stack_.back()->exits.push_back(ArmState{control_, clone_vars(vars_)});
+            loop_stack_.back()->exits.push_back(ArmState{control_, memory_, clone_vars(vars_)});
             control_ = vortex::ir::invalid_node;
             return {};
         }
@@ -646,14 +725,25 @@ Result<void> Lowerer::lower_stmt(Stmt* s) noexcept {
                 return fail_msg("lower: 'continue' outside loop",
                                 diag_code::parse_unexpected_token);
             }
-            loop_stack_.back()->backedges.push_back(ArmState{control_, clone_vars(vars_)});
+            loop_stack_.back()->backedges.push_back(ArmState{control_, memory_, clone_vars(vars_)});
             control_ = vortex::ir::invalid_node;
             return {};
         }
 
         case StmtKind::Global:
-        case StmtKind::Nonlocal:
             return {};   // name analysis already accounted for these
+        case StmtKind::Nonlocal:
+            // Declared nonlocals resolve through the closure cells for BOTH
+            // reads and writes (Python semantics).
+            for (SymbolId n : s->names) {
+                if (!contains_sym8(captured_, n)) {
+                    captured_.push_back(n);
+                }
+                if (!contains_sym8(nonlocal_names_, n)) {
+                    nonlocal_names_.push_back(n);
+                }
+            }
+            return {};
 
         case StmtKind::Assert: {
             NodeId cond = VORTEX_TRY(lower_expr(s->cond));
@@ -760,13 +850,16 @@ Result<void> Lowerer::lower_if(Stmt* s) noexcept {
 
     control_ = t;
     VarMap entry = clone_vars(vars_);
+    NodeId entry_memory = memory_;   // CRITICAL: the else arm must resume the
+                                     // SAME effect chain as the then arm.
     VORTEX_TRY_VOID(lower_stmts(s->body));
-    ArmState then_arm{control_, clone_vars(vars_)};
+    ArmState then_arm{control_, memory_, clone_vars(vars_)};
 
     vars_ = entry;
+    memory_ = entry_memory;
     control_ = f;
     VORTEX_TRY_VOID(lower_stmts(s->orelse));
-    ArmState else_arm{control_, clone_vars(vars_)};
+    ArmState else_arm{control_, memory_, clone_vars(vars_)};
 
     stdx::small_vector<ArmState, 4> arms;
     arms.push_back(std::move(then_arm));
@@ -791,7 +884,7 @@ Result<void> Lowerer::lower_while(Stmt* s) noexcept {
         g().add_input(phi, kv.second);
         g().add_input(phi, phi);
         g().add_input(phi, loop);
-        vars_.insert(kv.first, phi);
+        vars_.insert_or_assign(kv.first, phi);
         sk.header_phis.push_back({kv.first, phi});
     }
     NodeId eff_phi = g().create(NodeKind::EffectPhi);
@@ -813,7 +906,7 @@ Result<void> Lowerer::lower_while(Stmt* s) noexcept {
     control_ = t;
     VORTEX_TRY_VOID(lower_stmts(s->body));
     if (control_ != vortex::ir::invalid_node) {
-        ctx.backedges.push_back(ArmState{control_, clone_vars(vars_)});
+        ctx.backedges.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
 
     control_ = f;
@@ -821,7 +914,7 @@ Result<void> Lowerer::lower_while(Stmt* s) noexcept {
         VORTEX_TRY_VOID(lower_stmts(s->orelse));
     }
     if (control_ != vortex::ir::invalid_node) {
-        ctx.exits.push_back(ArmState{control_, clone_vars(vars_)});
+        ctx.exits.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
     loop_stack_.pop_back();
 
@@ -845,7 +938,7 @@ Result<void> Lowerer::lower_for(Stmt* s) noexcept {
         g().add_input(phi, kv.second);
         g().add_input(phi, phi);
         g().add_input(phi, loop);
-        vars_.insert(kv.first, phi);
+        vars_.insert_or_assign(kv.first, phi);
         sk.header_phis.push_back({kv.first, phi});
     }
     NodeId eff_phi = g().create(NodeKind::EffectPhi);
@@ -869,7 +962,7 @@ Result<void> Lowerer::lower_for(Stmt* s) noexcept {
     VORTEX_TRY_VOID(lower_assign_target(s->for_target, value));
     VORTEX_TRY_VOID(lower_stmts(s->body));
     if (control_ != vortex::ir::invalid_node) {
-        ctx.backedges.push_back(ArmState{control_, clone_vars(vars_)});
+        ctx.backedges.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
 
     control_ = f;
@@ -877,7 +970,7 @@ Result<void> Lowerer::lower_for(Stmt* s) noexcept {
         VORTEX_TRY_VOID(lower_stmts(s->orelse));
     }
     if (control_ != vortex::ir::invalid_node) {
-        ctx.exits.push_back(ArmState{control_, clone_vars(vars_)});
+        ctx.exits.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
     loop_stack_.pop_back();
 
@@ -911,7 +1004,7 @@ void Lowerer::patch_loop(const LoopSkeleton& sk, LoopCtx& ctx) noexcept {
                             g().add_input(phi, *cur);
                             g().add_input(phi, kv.second);
                             g().add_input(phi, backedge_ctrl);
-                            backedge_vars.insert(kv.first, phi);
+                            backedge_vars.insert_or_assign(kv.first, phi);
                         }
                     } else {
                         backedge_vars.insert(kv.first, kv.second);
@@ -937,15 +1030,20 @@ void Lowerer::patch_loop(const LoopSkeleton& sk, LoopCtx& ctx) noexcept {
 // ---------------------------------------------------------------------------
 Result<void> Lowerer::lower_try(Stmt* s) noexcept {
     stdx::small_vector<ArmState, 8> snapshots;
+    // Marker Jump: the try body's protected region starts at this block.
+    // Recorded in Catch.aux0 so the scheduler can emit exact try ranges.
+    NodeId try_marker = g().create(NodeKind::Jump, {control_});
+    control_ = try_marker;
     try_snapshots_ = &snapshots;
     VORTEX_TRY_VOID(lower_stmts_tracked(s->body));
     try_snapshots_ = nullptr;
-
-    ArmState normal{control_, clone_vars(vars_)};
+    ArmState body_end{control_, memory_, clone_vars(vars_)};
+    ArmState normal = body_end;   // exit state when no exception occurs
 
     if (!s->handlers.empty()) {
         // Catch region merging every statement-level raise point.
         NodeId catch_region = g().create(NodeKind::Catch);
+        g().node(catch_region).aux0 = try_marker;
         stdx::small_vector<ArmState, 8> catch_arms;
         for (ArmState& snap : snapshots) {
             if (snap.control != vortex::ir::invalid_node) {
@@ -967,7 +1065,7 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
                             g().add_input(phi, *cur);
                             g().add_input(phi, kv.second);
                             g().add_input(phi, catch_region);
-                            catch_vars.insert(kv.first, phi);
+                            catch_vars.insert_or_assign(kv.first, phi);
                         }
                     } else {
                         catch_vars.insert(kv.first, kv.second);
@@ -1016,7 +1114,7 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
                             g().add_input(phi, *old);
                             g().add_input(phi, kv.second);
                             g().add_input(phi, region);
-                            matched_vars.insert(kv.first, phi);
+                            matched_vars.insert_or_assign(kv.first, phi);
                         }
                     }
                 }
@@ -1032,8 +1130,9 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
 
         stdx::small_vector<ArmState, 4> arms;
         arms.push_back(std::move(normal));
-        arms.push_back(ArmState{matched_exit, matched_vars});
+        arms.push_back(ArmState{matched_exit, memory_, matched_vars});
         merge_arms(arms);
+
     } else {
         control_ = normal.control;
         vars_ = normal.vars;
@@ -1052,8 +1151,12 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
 // ---------------------------------------------------------------------------
 Result<void> Lowerer::lower_function_def(Stmt* s) noexcept {
     // Transitive captures: child free names ∩ my bound names.
+    // (Toplevel children capture nothing: module names are globals.)
     stdx::small_vector<SymbolId, 16> child_free = free_names(s->body);
     stdx::small_vector<SymbolId, 8> captures;
+    if (is_toplevel_) {
+        // no captures; cells argument stays None
+    } else
     for (SymbolId f : child_free) {
         bool is_param = false;
         for (SymbolId p : s->params) {
@@ -1065,7 +1168,8 @@ Result<void> Lowerer::lower_function_def(Stmt* s) noexcept {
         }
     }
 
-    PendingFunction pf{s->name, s, ctx_.next_code_unit_id};
+    PendingFunction pf{s->name, s, ctx_.next_code_unit_id++, {}};   // reserve
+    for (SymbolId cap : captures) pf.captures.push_back(cap);
     unit_.children.push_back(pf);
 
     stdx::small_vector<NodeId, 4> default_values;
@@ -1106,7 +1210,7 @@ Result<void> Lowerer::lower_function_def(Stmt* s) noexcept {
 
 Result<void> Lowerer::lower_class_def(Stmt* s) noexcept {
     // class body is its own unit returning the namespace dict
-    PendingFunction pf{s->name, s, ctx_.next_code_unit_id};
+    PendingFunction pf{s->name, s, ctx_.next_code_unit_id++, {}};   // reserve
     unit_.children.push_back(pf);
 
     NodeId fn = g().create(NodeKind::CallNative);
@@ -1188,9 +1292,29 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
 
         case ExprKind::Subscript: {
             NodeId base = VORTEX_TRY(lower_expr(e->sub));
+            if (e->index && e->index->kind == ExprKind::SliceLit) {
+                Expr* sl = e->index;
+                // (lower, upper, step) tuple; None for omitted parts.
+                NodeId lo = sl->sub ? VORTEX_TRY(lower_expr(sl->sub)) : const_none();
+                NodeId hi = sl->index ? VORTEX_TRY(lower_expr(sl->index)) : const_none();
+                NodeId st = sl->lower ? VORTEX_TRY(lower_expr(sl->lower)) : const_none();
+                NodeId tup = g().create(NodeKind::NewTuple);
+                Node& tn = g().node(tup);
+                tn.set_flag(NodeFlag::OnEffectChain);
+                g().add_input(tup, control_);
+                g().add_input(tup, memory_);
+                g().add_input(tup, lo);
+                g().add_input(tup, hi);
+                g().add_input(tup, st);
+                memory_ = tup;
+                return effect_op(NodeKind::LoadIndex, {base, tup}, true);
+            }
             NodeId idx = VORTEX_TRY(lower_expr(e->index));
             return effect_op(NodeKind::LoadIndex, {base, idx}, true);
         }
+        case ExprKind::SliceLit:
+            // handled inline by Subscript; bare slice literals are invalid
+            return fail_msg("lower: bare slice literal", diag_code::parse_unexpected_token);
 
         case ExprKind::ListLit: {
             NodeId n = g().create(NodeKind::NewList);
@@ -1268,12 +1392,16 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
             NodeId f = g().create(NodeKind::IfFalse, {iff});
 
             control_ = t;
+            VarMap entry = clone_vars(vars_);
+            NodeId entry_memory = memory_;
             NodeId tv = VORTEX_TRY(lower_expr(e->sub));
-            ArmState then_arm{control_, clone_vars(vars_)};
+            ArmState then_arm{control_, memory_, clone_vars(vars_)};
 
+            vars_ = entry;
+            memory_ = entry_memory;
             control_ = f;
             NodeId fv = VORTEX_TRY(lower_expr(e->upper));
-            ArmState else_arm{control_, clone_vars(vars_)};
+            ArmState else_arm{control_, memory_, clone_vars(vars_)};
 
             stdx::small_vector<ArmState, 4> arms;
             arms.push_back(std::move(then_arm));
@@ -1301,33 +1429,39 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
 }
 
 Result<NodeId> Lowerer::lower_boolop(Expr* e) noexcept {
-    // Short-circuit via control flow; result is the last evaluated operand
-    // (Python semantics: `a or b` yields a if truthy else b).
+    // TRUE short-circuit: evaluate lhs; decide without touching rhs.
+    //   a or b  -> if truthy(a): a else b   (b evaluated ONLY on false path)
+    //   a and b -> if truthy(a): b else a   (b evaluated ONLY on true path)
+    // The result is the last evaluated OPERAND (Python value semantics).
     const bool is_or = e->op == bool_or;
     NodeId lhs = VORTEX_TRY(lower_expr(e->args[0]));
-    NodeId rhs = VORTEX_TRY(lower_expr(e->args[1]));
 
-    NodeId cond = py_op(NodeKind::PyUnary, is_or ? 4 : 5, {lhs});   // truth-test op
+    NodeId cond = py_op(NodeKind::PyUnary, 4, {lhs});   // truth-test
     NodeId iff = g().create(NodeKind::If, {control_, cond});
     NodeId t = g().create(NodeKind::IfTrue, {iff});
     NodeId f = g().create(NodeKind::IfFalse, {iff});
 
-    // or: True -> lhs, False -> rhs. and: True -> rhs, False -> lhs.
-    NodeId shortv = is_or ? lhs : lhs;
-    NodeId longv = rhs;
+    VarMap entry_vars = clone_vars(vars_);
+    NodeId entry_memory = memory_;
 
+    // Short arm: value = lhs, no rhs evaluation.
     control_ = is_or ? t : f;
-    ArmState short_arm{control_, clone_vars(vars_)};
+    ArmState short_arm{control_, memory_, clone_vars(vars_)};
+
+    // Long arm: evaluate rhs HERE (only reachable via this control path).
+    vars_ = entry_vars;
+    memory_ = entry_memory;
     control_ = is_or ? f : t;
-    ArmState long_arm{control_, clone_vars(vars_)};
+    NodeId rhs = VORTEX_TRY(lower_expr(e->args[1]));
+    ArmState long_arm{control_, memory_, clone_vars(vars_)};
 
     stdx::small_vector<ArmState, 4> arms;
     arms.push_back(std::move(short_arm));
     arms.push_back(std::move(long_arm));
     NodeId region = merge_arms(arms);
     NodeId phi = g().create(NodeKind::Phi);
-    g().add_input(phi, shortv);
-    g().add_input(phi, longv);
+    g().add_input(phi, lhs);    // short-circuit value
+    g().add_input(phi, rhs);    // long-path value
     g().add_input(phi, region);
     return phi;
 }
@@ -1338,35 +1472,42 @@ Result<NodeId> Lowerer::lower_compare_chain(Expr* e) noexcept {
         NodeId rhs = VORTEX_TRY(lower_expr(e->args[1]));
         return py_op(NodeKind::PyCompare, e->cmp_ops[0], {lhs, rhs});
     }
-    // a op1 b op2 c  ==  (a op1 b) and (b op2 c) with short-circuit.
+    // a op1 b op2 c == (a op1 b) and (b op2 c) — short-circuit, bool result.
     NodeId lhs = VORTEX_TRY(lower_expr(e->args[0]));
-    NodeId result = const_int(1);
-    for (std::uint32_t i = 0; i < e->cmp_ops.size(); ++i) {
-        NodeId rhs = VORTEX_TRY(lower_expr(e->args[i + 1]));
-        NodeId cmp = py_op(NodeKind::PyCompare, e->cmp_ops[i], {lhs, rhs});
-        if (i == 0) {
-            result = cmp;
-        } else {
-            NodeId cond = py_op(NodeKind::PyUnary, 5, {result});   // truth-test
-            NodeId iff = g().create(NodeKind::If, {control_, cond});
-            NodeId t = g().create(NodeKind::IfTrue, {iff});
-            NodeId f = g().create(NodeKind::IfFalse, {iff});
-            control_ = t;
-            NodeId short_false = const_int(0);
-            ArmState short_arm{control_, clone_vars(vars_)};
-            control_ = f;
-            ArmState long_arm{control_, clone_vars(vars_)};
-            stdx::small_vector<ArmState, 4> arms;
-            arms.push_back(std::move(short_arm));
-            arms.push_back(std::move(long_arm));
-            NodeId region = merge_arms(arms);
-            NodeId phi = g().create(NodeKind::Phi);
-            g().add_input(phi, short_false);
-            g().add_input(phi, cmp);
-            g().add_input(phi, region);
-            result = phi;
-        }
-        lhs = rhs;
+    NodeId rhs = VORTEX_TRY(lower_expr(e->args[1]));
+    NodeId result = py_op(NodeKind::PyCompare, e->cmp_ops[0], {lhs, rhs});
+    lhs = rhs;
+    for (std::uint32_t i = 1; i < e->cmp_ops.size(); ++i) {
+        NodeId cond = py_op(NodeKind::PyUnary, 4, {result});   // truth-test
+        NodeId iff = g().create(NodeKind::If, {control_, cond});
+        NodeId t = g().create(NodeKind::IfTrue, {iff});
+        NodeId f = g().create(NodeKind::IfFalse, {iff});
+
+        VarMap entry_vars = clone_vars(vars_);
+        NodeId entry_memory = memory_;
+
+        // false path: chain result is False
+        control_ = f;
+        ArmState false_arm{control_, memory_, clone_vars(vars_)};
+
+        // true path: evaluate the next comparison
+        vars_ = entry_vars;
+        memory_ = entry_memory;
+        control_ = t;
+        NodeId next_rhs = VORTEX_TRY(lower_expr(e->args[i + 1]));
+        NodeId cmp = py_op(NodeKind::PyCompare, e->cmp_ops[i], {lhs, next_rhs});
+        ArmState true_arm{control_, memory_, clone_vars(vars_)};
+
+        stdx::small_vector<ArmState, 4> arms;
+        arms.push_back(std::move(false_arm));
+        arms.push_back(std::move(true_arm));
+        NodeId region = merge_arms(arms);
+        NodeId phi = g().create(NodeKind::Phi);
+        g().add_input(phi, result);   // False from the short path
+        g().add_input(phi, cmp);
+        g().add_input(phi, region);
+        result = phi;
+        lhs = next_rhs;
     }
     return result;
 }
@@ -1425,9 +1566,15 @@ Result<NodeId> Lowerer::lower_call(Expr* e) noexcept {
 
 Result<NodeId> Lowerer::lower_listcomp(Expr* e) noexcept {
     // [elt for target in iter (if cond)] -> loop appending to a new list.
-    // Genexps use the same lowering (documented eager-materialization).
+    // Multi-clause comps arrive as nested ListComps: each clause lowers as
+    // one loop level, all appending to ONE result list (Python nested-loop
+    // semantics). Genexps: same lowering (documented eager materialization).
     NodeId result = effect_op(NodeKind::NewList, {}, true);
+    VORTEX_TRY_VOID(lower_listcomp_clause(e, result));
+    return result;
+}
 
+Result<void> Lowerer::lower_listcomp_clause(Expr* e, NodeId result) noexcept {
     NodeId iterable = VORTEX_TRY(lower_expr(e->comp.iter));
     NodeId it = effect_op(NodeKind::Iter, {iterable}, true);
 
@@ -1443,7 +1590,7 @@ Result<NodeId> Lowerer::lower_listcomp(Expr* e) noexcept {
         g().add_input(phi, kv.second);
         g().add_input(phi, phi);
         g().add_input(phi, loop);
-        vars_.insert(kv.first, phi);
+        vars_.insert_or_assign(kv.first, phi);
         sk.header_phis.push_back({kv.first, phi});
     }
     NodeId eff_phi = g().create(NodeKind::EffectPhi);
@@ -1466,6 +1613,11 @@ Result<NodeId> Lowerer::lower_listcomp(Expr* e) noexcept {
     NodeId value = effect_op(NodeKind::IterNext, {it}, false);
     VORTEX_TRY_VOID(lower_assign_target(e->comp.target, value));
 
+    // Nested clause: recurse into the inner loop (same result list).
+    if (!e->args.empty() && e->args[0]->kind == ExprKind::ListComp &&
+        e->args[0]->comp.is_genexp == e->comp.is_genexp) {
+        VORTEX_TRY_VOID(lower_listcomp_clause(e->args[0], result));
+    } else {
     NodeId append = VORTEX_TRY(lower_expr(e->args[0]));
     if (e->comp.cond) {
         NodeId c = VORTEX_TRY(lower_expr(e->comp.cond));
@@ -1475,22 +1627,23 @@ Result<NodeId> Lowerer::lower_listcomp(Expr* e) noexcept {
         control_ = ct;
         effect_op(NodeKind::ListAppend, {result, append}, true);
         stdx::small_vector<ArmState, 4> arms;
-        arms.push_back(ArmState{control_, clone_vars(vars_)});
-        arms.push_back(ArmState{cf, clone_vars(vars_)});
+        arms.push_back(ArmState{control_, memory_, clone_vars(vars_)});
+        arms.push_back(ArmState{cf, memory_, clone_vars(vars_)});
         merge_arms(arms);
     } else {
         effect_op(NodeKind::ListAppend, {result, append}, true);
     }
+    }   // close the non-nested branch
 
     if (control_ != vortex::ir::invalid_node) {
-        ctx.backedges.push_back(ArmState{control_, clone_vars(vars_)});
+        ctx.backedges.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
     control_ = f;
-    ctx.exits.push_back(ArmState{control_, clone_vars(vars_)});
+    ctx.exits.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     loop_stack_.pop_back();
 
     patch_loop(sk, ctx);
-    return result;
+    return {};
 }
 
 }  // namespace
@@ -1500,7 +1653,7 @@ Result<NodeId> Lowerer::lower_listcomp(Expr* e) noexcept {
 // ---------------------------------------------------------------------------
 Result<LoweredUnit> lower_unit(Module& module, LowerContext& ctx, Stmt* def, SymbolId name,
                                stdx::small_vector<SymbolId, 8>& captured_names,
-                               bool class_body) noexcept {
+                               bool class_body, std::uint32_t forced_unit_id) noexcept {
     LoweredUnit unit;
     StmtList body_storage;
     if (!def) {
@@ -1509,15 +1662,27 @@ Result<LoweredUnit> lower_unit(Module& module, LowerContext& ctx, Stmt* def, Sym
     const StmtList& body = def ? def->body : body_storage;
 
     // Locals captured (transitively) by nested functions become cells.
+    // Module-toplevel children resolve free names through GLOBALS (Python
+    // semantics: module scope is the global scope) — no cells there.
     NameSets sets = analyze(body);
     stdx::small_vector<SymbolId, 8> cell_vars;
-    for (SymbolId b : sets.bound) {
-        if (contains_sym(sets.child_referenced, b)) {
-            cell_vars.push_back(b);
+    if (def != nullptr) {
+        for (SymbolId b : sets.bound) {
+            if (contains_sym(sets.child_referenced, b)) {
+                cell_vars.push_back(b);
+            }
+        }
+        // nonlocal-declared names in nested scopes force their enclosing
+        // bindings to be cells too (they are captured by definition).
+        for (SymbolId nl : sets.nonlocals_declared) {
+            if (contains_sym(sets.bound, nl) && !contains_sym8(cell_vars, nl)) {
+                cell_vars.push_back(nl);
+            }
         }
     }
 
-    Lowerer lowerer(module, ctx, unit, def == nullptr, class_body, captured_names);
+    Lowerer lowerer(module, ctx, unit, def == nullptr, class_body, captured_names,
+                    forced_unit_id);
     lowerer.bound_names_saved_ = sets.bound;
     Result<void> ok = lowerer.run(def, body, cell_vars);
     if (!ok) return std::unexpected(ok.error());

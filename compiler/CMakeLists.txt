@@ -19,9 +19,10 @@ add_library(vortex_compiler STATIC
     src/frontend/lexer.cpp
     src/frontend/parser.cpp
     src/frontend/lowering.cpp
+    src/pipeline/scheduler.cpp
 )
 
-target_include_directories(vortex_compiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(vortex_compiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/runtime/include)
 target_link_libraries(vortex_compiler PUBLIC vortex_common)
 vortex_set_target_flags(vortex_compiler)
 

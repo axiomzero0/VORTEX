@@ -42,6 +42,10 @@ struct PendingFunction {
     SymbolId name{0xFFFF'FFFF};
     Stmt* def{nullptr};
     std::uint32_t code_unit_hint{0};
+    /// Free names this child captures from the ENCLOSING scope (the driver
+    /// lowers children separately and must pass these so the child's hidden
+    /// __cells__ parameter resolves).
+    stdx::small_vector<SymbolId, 8> captures{};
 };
 
 /// Native runtime helper ids used by CallNative nodes (resolved by the
@@ -93,10 +97,14 @@ struct LowerContext {
 /// `module` provides the AST + string pool; `captured_names` are the free
 /// variables resolved through cells (empty for non-closures).
 /// `class_body` marks namespace-dict units (class bodies return their dict).
+/// `forced_unit_id` (default 0xFFFFFFFF = self-assign): the driver lowers
+/// children in discovery order and passes the id reserved at discovery so
+/// MakeFunction constants match the linked CodeUnit ids exactly.
 [[nodiscard]] Result<LoweredUnit> lower_unit(Module& module, LowerContext& ctx, Stmt* def,
                                              SymbolId name,
                                              stdx::small_vector<SymbolId, 8>& captured_names,
-                                             bool class_body = false) noexcept;
+                                             bool class_body = false,
+                                             std::uint32_t forced_unit_id = 0xFFFFFFFF) noexcept;
 
 /// Compute the set of names assigned or bound in a function body (used by
 /// capture analysis: a child name neither assigned locally nor declared

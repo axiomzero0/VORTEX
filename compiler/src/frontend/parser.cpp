@@ -862,14 +862,64 @@ Result<Expr*> Parser::parse_atom_with_trailers() noexcept {
             e = *call;
         } else if (check(TokKind::LBracket)) {
             advance();
+            // Slice support: [a], [a:b], [a:b:c], [:b], [a:], [:], [::2]
+            if (check(TokKind::Colon)) {
+                // omitted lower bound
+                Expr* slice = new_expr(ExprKind::SliceLit, peek().line);
+                slice->sub = new_expr(ExprKind::NoneLit, peek().line);
+                advance();   // ':'
+                if (!check(TokKind::RBracket) && !check(TokKind::Colon)) {
+                    Result<Expr*> upper = parse_testlist(true);
+                    if (!upper) return std::unexpected(upper.error());
+                    slice->index = *upper;
+                }
+                if (accept(TokKind::Colon)) {
+                    if (!check(TokKind::RBracket)) {
+                        Result<Expr*> step = parse_testlist(true);
+                        if (!step) return std::unexpected(step.error());
+                        slice->lower = *step;
+                    }
+                }
+                auto rb = expect(TokKind::RBracket, "']' closing subscript");
+                if (!rb) return std::unexpected(rb.error());
+                Expr* sub = new_expr(ExprKind::Subscript, e->line);
+                sub->sub = e;
+                sub->index = slice;
+                e = sub;
+                continue;
+            }
             Result<Expr*> idx = parse_testlist(true);
             if (!idx) return std::unexpected(idx.error());
-            auto rb = expect(TokKind::RBracket, "']' closing subscript");
-            if (!rb) return std::unexpected(rb.error());
-            Expr* sub = new_expr(ExprKind::Subscript, e->line);
-            sub->sub = e;
-            sub->index = *idx;
-            e = sub;
+            if (check(TokKind::Colon)) {
+                Expr* slice = new_expr(ExprKind::SliceLit, (*idx)->line);
+                slice->sub = *idx;          // lower (may be NoneLit marker)
+                advance();                  // ':'
+                if (!check(TokKind::RBracket) && !check(TokKind::Colon)) {
+                    Result<Expr*> upper = parse_testlist(true);
+                    if (!upper) return std::unexpected(upper.error());
+                    slice->index = *upper;
+                }
+                if (accept(TokKind::Colon)) {
+                    if (!check(TokKind::RBracket)) {
+                        Result<Expr*> step = parse_testlist(true);
+                        if (!step) return std::unexpected(step.error());
+                        slice->lower = *step;
+                    }
+                }
+                auto rb = expect(TokKind::RBracket, "']' closing subscript");
+                if (!rb) return std::unexpected(rb.error());
+                Expr* sub = new_expr(ExprKind::Subscript, e->line);
+                sub->sub = e;
+                sub->index = slice;
+                e = sub;
+            } else {
+                auto rb = expect(TokKind::RBracket, "']' closing subscript");
+                if (!rb) return std::unexpected(rb.error());
+                Expr* sub = new_expr(ExprKind::Subscript, e->line);
+                sub->sub = e;
+                sub->index = *idx;
+                e = sub;
+            }
         } else {
             break;
         }
@@ -947,28 +997,47 @@ Result<Expr*> Parser::parse_call_args(Expr* callee) noexcept {
 }
 
 Result<Expr*> Parser::parse_comprehension_tail(Expr* elt, bool genexp) noexcept {
-    // Consumes the closing bracket for list comps (' ]'); genexps leave
-    // their ')' to the enclosing paren parser.
-    // 'for' already consumed.
-    Expr* comp = new_expr(ExprKind::ListComp, elt->line);
-    comp->comp.is_genexp = genexp;
-    ++suppress_in_operator_;   // comprehension target must not eat 'in'
-    Result<Expr*> target = parse_testlist(true);
-    --suppress_in_operator_;
-    if (!target) return std::unexpected(target.error());
-    comp->comp.target = *target;
-    auto in = expect(TokKind::KwIn, "'in' inside comprehension");
-    if (!in) return std::unexpected(in.error());
-    Result<Expr*> iter = parse_or();
-    if (!iter) return std::unexpected(iter.error());
-    comp->comp.iter = *iter;
-    if (check(TokKind::KwIf)) {
-        advance();
-        Result<Expr*> c = parse_or();
-        if (!c) return std::unexpected(c.error());
-        comp->comp.cond = *c;
+    // Multi-clause comprehensions: [x for a in A for b in B if c ...] —
+    // nested loops sharing one element expression. 'for' already consumed.
+    stdx::small_vector<Comprehension, 4> clauses;
+    for (;;) {
+        Comprehension clause;
+        ++suppress_in_operator_;
+        Result<Expr*> target = parse_testlist(true);
+        --suppress_in_operator_;
+        if (!target) return std::unexpected(target.error());
+        clause.target = *target;
+        auto in = expect(TokKind::KwIn, "'in' inside comprehension");
+        if (!in) return std::unexpected(in.error());
+        Result<Expr*> iter = parse_or();
+        if (!iter) return std::unexpected(iter.error());
+        clause.iter = *iter;
+        if (check(TokKind::KwIf)) {
+            advance();
+            Result<Expr*> c = parse_or();
+            if (!c) return std::unexpected(c.error());
+            clause.cond = *c;
+        }
+        clauses.push_back(clause);
+        if (check(TokKind::KwFor)) {
+            advance();
+            continue;
+        }
+        break;
     }
+    Expr* comp = new_expr(ExprKind::ListComp, elt->line);
+    comp->comp = clauses[clauses.size() - 1];
     comp->args.push_back(elt);
+    for (std::size_t i = clauses.size() - 1; i-- > 0;) {
+        Expr* outer = new_expr(ExprKind::ListComp, elt->line);
+        outer->comp = clauses[i];
+        outer->args.push_back(comp);
+        comp = outer;
+    }
+    for (Expr* e = comp; e && e->kind == ExprKind::ListComp;) {
+        e->comp.is_genexp = genexp;
+        e = e->args.empty() ? nullptr : e->args[0];
+    }
     if (!genexp) {
         auto rb = expect(TokKind::RBracket, "']' closing comprehension");
         if (!rb) return std::unexpected(rb.error());

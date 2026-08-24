@@ -125,6 +125,11 @@ public:
         destroy_elements();
         release_heap();
         if (other.is_inline()) {
+            // CRITICAL: retreat to our own inline storage BEFORE copying —
+            // begin_ may point at the buffer release_heap() just freed
+            // (heap destination + inline source: the classic UAF).
+            begin_ = inline_ptr();
+            capacity_ = N;
             move_elements(other);
         } else {
             begin_ = other.begin_;

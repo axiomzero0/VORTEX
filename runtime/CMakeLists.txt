@@ -8,6 +8,7 @@ add_library(vortex_runtime STATIC
     src/objects.cpp
     src/interp.cpp
     src/builtins.cpp
+    src/driver.cpp
     src/deopt.cpp
 )
 target_include_directories(vortex_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

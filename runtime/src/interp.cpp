@@ -1,1 +1,1884 @@
-// placeholder — filled in Phase 5
+// =============================================================================
+// vortex/rt/interp.cpp — Tier-0 direct-threaded interpreter implementation.
+// =============================================================================
+
+#include "vortex/rt/interp.hpp"
+
+#include <cctype>
+#include <cmath>
+#include <cstring>
+
+#include "vortex/frontend/lowering.hpp"
+#include "vortex/support/config.hpp"
+#include "vortex/support/symbol_table.hpp"
+
+namespace vortex::rt {
+inline namespace abi_v1 {
+
+using vortex::fe::NativeHelper;
+using vortex::ir::BinOpKind;
+using vortex::ir::CmpOpKind;
+
+Program::~Program() {
+    Runtime& rt = Runtime::instance();
+    for (CodeUnit* u : units) delete u;
+    if (globals) rt.decref(reinterpret_cast<PyObj*>(globals));
+    for (PyModuleObj* m : native_modules) {
+        rt.decref(reinterpret_cast<PyObj*>(m));
+    }
+    for (auto& kv : sym_key_cache) {
+        rt.decref(reinterpret_cast<PyObj*>(kv.second));
+    }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+void Vm::set_pending(Value exc_owned) noexcept {
+    Runtime& rt = Runtime::instance();
+    if (pending_exception_.tag == Tag::Obj && pending_exception_.as.obj) {
+        rt.decref(pending_exception_.as.obj);
+    }
+    pending_exception_ = exc_owned;
+}
+
+Value Vm::take_pending() noexcept {
+    Value v = pending_exception_;
+    pending_exception_ = Value::none();
+    return v;
+}
+
+void Vm::raise_builtin(PyTypeObj* type, const char* message) noexcept {
+    Runtime& rt = Runtime::instance();
+    auto* msg = rt.new_str(message);
+    Value arg = Value::object(reinterpret_cast<PyObj*>(msg));
+    PyInstanceObj* exc = rt.new_exception(type, &arg, 1);
+    set_pending(Value::object(reinterpret_cast<PyObj*>(exc)));
+}
+
+bool Vm::unwind_to_handler(Frame& f) noexcept {
+    // Find innermost try range containing current pc.
+    for (std::size_t i = f.handlers.size(); i-- > 0;) {
+        const Frame::Handler& h = f.handlers[i];
+        if (f.pc >= h.try_pc_start && f.pc < h.try_pc_end) {
+            f.pc = h.handler_pc;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Vm::get_global(std::uint32_t symbol, Value& out) noexcept {
+    Value key = Value::integer(symbol);   // symbols hash as ints; dict lookup
+    // NOTE: globals keys are symbol-string objects created at install time.
+    // We look up by interned string identity via symbol-int packed keys.
+    // Store convention: globals dict keys are PyStr created from symbols —
+    // pre-intern a lookup key per symbol for O(1) reuse.
+    Runtime& rt = Runtime::instance();
+    // Per-program key cache: owned refs, cleared on Program teardown (the
+    // strings must outlive every dict they probe).
+    PyStrObj* keystr = nullptr;
+    if (PyStrObj** slot = program.sym_key_cache.get(symbol)) {
+        keystr = *slot;
+    } else {
+        keystr = rt.new_str(global_symbols().text(symbol));
+        rt.incref(reinterpret_cast<PyObj*>(keystr));
+        program.sym_key_cache.insert(symbol, keystr);
+    }
+    if (dict_get(program.globals, Value::object(reinterpret_cast<PyObj*>(keystr)), out)) {
+        return true;
+    }
+    // fall back: symbol-int keys (module versioning fast path writes these)
+    if (dict_get(program.globals, key, out)) return true;
+    stdx::small_vector<char, 128> msg;
+    for (char c : "name '") msg.push_back(c);
+    for (char c : global_symbols().text(symbol)) msg.push_back(c);
+    for (char c : "' is not defined") msg.push_back(c);
+    msg.push_back('\0');
+    raise_builtin(Runtime::instance().type_name_error, msg.data());
+    return false;
+}
+
+bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
+    Runtime& rt = Runtime::instance();
+    if (obj.tag != Tag::Obj || !obj.as.obj) {
+        raise_builtin(rt.type_attribute_error, "attribute lookup on non-object");
+        return false;
+    }
+    PyObj* o = obj.as.obj;
+    switch (o->tag) {
+        case ObjTag::Module: {
+            auto* m = static_cast<PyModuleObj*>(o);
+            Value key = Value::integer(symbol);
+            if (!dict_get(m->ns, key, out)) {
+                // try string key
+                PyStrObj* keystr = rt.new_str(global_symbols().text(symbol));
+                if (dict_get(m->ns, Value::object(reinterpret_cast<PyObj*>(keystr)), out)) {
+                    rt.decref(reinterpret_cast<PyObj*>(keystr));
+                    return true;
+                }
+                rt.decref(reinterpret_cast<PyObj*>(keystr));
+                raise_builtin(rt.type_attribute_error, "module attribute not found");
+                return false;
+            }
+            return true;
+        }
+        case ObjTag::Instance: {
+            auto* inst = static_cast<PyInstanceObj*>(o);
+            std::uint32_t slot = 0;
+            if (rt.shape_find(inst->shape, symbol, slot) && slot < inst->slot_capacity) {
+                out = inst->slots[slot];
+                return true;
+            }
+            // walk type chain for methods
+            for (PyTypeObj* t = inst->type; t; t = t->base) {
+                Value key = Value::integer(symbol);
+                if (dict_get(t->dict, key, out)) {
+                    // bind method
+                    if (out.tag == Tag::Obj && out.as.obj &&
+                        out.as.obj->tag == ObjTag::Function) {
+                        auto* bm = static_cast<PyBoundMethodObj*>(
+                            std::malloc(sizeof(PyBoundMethodObj)));
+                        bm->tag = ObjTag::BoundMethod;
+                        bm->refcount = 1;
+                        bm->func = out;
+                        bm->recv = obj;
+                        rt.incref(out.as.obj);
+                        rt.incref(obj.as.obj);
+                        out = Value::object(reinterpret_cast<PyObj*>(bm));
+                    }
+                    return true;
+                }
+            }
+            raise_builtin(rt.type_attribute_error, "attribute not found");
+            return false;
+        }
+        case ObjTag::Type: {
+            auto* t = static_cast<PyTypeObj*>(o);
+            Value key = Value::integer(symbol);
+            for (PyTypeObj* tt = t; tt; tt = tt->base) {
+                if (dict_get(tt->dict, key, out)) return true;
+            }
+            raise_builtin(rt.type_attribute_error, "class attribute not found");
+            return false;
+        }
+        case ObjTag::List: {
+            // bound sequence methods
+            const char* name = nullptr;
+            std::string_view sym = global_symbols().text(symbol);
+            if (sym == "append") name = "append";
+            if (sym == "pop") name = "pop";
+            if (name) {
+                auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
+                bm->tag = ObjTag::BoundMethod;
+                bm->refcount = 1;
+                bm->func = Value::integer(0x100 + (sym == "append" ? 0 : 1));  // marker
+                bm->recv = obj;
+                rt.incref(obj.as.obj);
+                out = Value::object(reinterpret_cast<PyObj*>(bm));
+                return true;
+            }
+            raise_builtin(rt.type_attribute_error, "list attribute not found");
+            return false;
+        }
+        case ObjTag::Dict: {
+            std::string_view sym = global_symbols().text(symbol);
+            if (sym == "get" || sym == "keys" || sym == "values" || sym == "items") {
+                auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
+                bm->tag = ObjTag::BoundMethod;
+                bm->refcount = 1;
+                bm->func = Value::integer(0x200 + (sym == "get" ? 0 : sym == "keys" ? 1
+                                                  : sym == "values" ? 2 : 3));
+                bm->recv = obj;
+                rt.incref(obj.as.obj);
+                out = Value::object(reinterpret_cast<PyObj*>(bm));
+                return true;
+            }
+            raise_builtin(rt.type_attribute_error, "dict attribute not found");
+            return false;
+        }
+        case ObjTag::Str: {
+            std::string_view sym = global_symbols().text(symbol);
+            struct StrMethod { const char* name; std::uint64_t kind; };
+            static const StrMethod str_methods[] = {
+                {"upper", 0x300},    {"lower", 0x301},   {"split", 0x302},
+                {"startswith", 0x303}, {"endswith", 0x304}, {"strip", 0x305},
+                {"replace", 0x306},  {"join", 0x307},
+            };
+            for (const StrMethod& m : str_methods) {
+                if (sym == m.name) {
+                    auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
+                    bm->tag = ObjTag::BoundMethod;
+                    bm->refcount = 1;
+                    bm->func = Value::integer(static_cast<std::int64_t>(m.kind));
+                    bm->recv = obj;
+                    rt.incref(obj.as.obj);
+                    out = Value::object(reinterpret_cast<PyObj*>(bm));
+                    return true;
+                }
+            }
+            raise_builtin(rt.type_attribute_error, "str attribute not found");
+            return false;
+        }
+        default:
+            raise_builtin(rt.type_attribute_error, "object has no such attribute");
+            return false;
+    }
+}
+
+bool Vm::set_attr(const Value& obj, std::uint32_t symbol, Value value) noexcept {
+    Runtime& rt = Runtime::instance();
+    if (obj.tag != Tag::Obj || !obj.as.obj) {
+        raise_builtin(rt.type_attribute_error, "attribute store on non-object");
+        return false;
+    }
+    PyObj* o = obj.as.obj;
+    if (o->tag == ObjTag::Instance) {
+        auto* inst = static_cast<PyInstanceObj*>(o);
+        std::uint32_t slot = 0;
+        if (!rt.shape_find(inst->shape, symbol, slot)) {
+            ShapeNode* extended = rt.shape_add_attr(inst->shape, symbol);
+            slot = extended->slot;
+            inst->shape = extended;
+        }
+        if (slot >= inst->slot_capacity) {
+            std::uint32_t new_cap = slot + 1;
+            Value* fresh = static_cast<Value*>(std::calloc(new_cap, sizeof(Value)));
+            if (!fresh) return false;
+            if (inst->slots) {
+                std::memcpy(fresh, inst->slots, sizeof(Value) * inst->slot_capacity);
+                std::free(inst->slots);
+            }
+            inst->slots = fresh;
+            inst->slot_capacity = new_cap;
+        }
+        // store: incref new, decref old
+        if (value.tag == Tag::Obj && value.as.obj) rt.incref(value.as.obj);
+        Value& slot_ref = inst->slots[slot];
+        if (slot_ref.tag == Tag::Obj && slot_ref.as.obj) rt.decref(slot_ref.as.obj);
+        slot_ref = value;
+        return true;
+    }
+    if (o->tag == ObjTag::Module) {
+        auto* m = static_cast<PyModuleObj*>(o);
+        return dict_set(m->ns, Value::integer(symbol), value);
+    }
+    if (o->tag == ObjTag::Type) {
+        auto* t = static_cast<PyTypeObj*>(o);
+        return dict_set(t->dict, Value::integer(symbol), value);
+    }
+    raise_builtin(rt.type_attribute_error, "object does not support attribute assignment");
+    return false;
+}
+
+bool Vm::get_iter(const Value& obj, Value& out) noexcept {
+    Runtime& rt = Runtime::instance();
+    if (obj.tag == Tag::Obj && obj.as.obj) {
+        switch (obj.as.obj->tag) {
+            case ObjTag::RangeIter:
+            case ObjTag::ListIter:
+            case ObjTag::StrIter:
+            case ObjTag::DictIter:
+            case ObjTag::Generator:
+                out = obj;
+                return true;
+            case ObjTag::List: {
+                auto* li = static_cast<PyListIterObj*>(std::malloc(sizeof(PyListIterObj)));
+                li->tag = ObjTag::ListIter;
+                li->refcount = 1;
+                li->list = static_cast<PyListObj*>(obj.as.obj);
+                li->index = 0;
+                out = Value::object(reinterpret_cast<PyObj*>(li));
+                return true;
+            }
+            case ObjTag::Str: {
+                auto* si = static_cast<PyStrIterObj*>(std::malloc(sizeof(PyStrIterObj)));
+                si->tag = ObjTag::StrIter;
+                si->refcount = 1;
+                si->str = static_cast<PyStrObj*>(obj.as.obj);
+                si->index = 0;
+                out = Value::object(reinterpret_cast<PyObj*>(si));
+                return true;
+            }
+            case ObjTag::Dict: {
+                auto* di = static_cast<PyDictIterObj*>(std::malloc(sizeof(PyDictIterObj)));
+                di->tag = ObjTag::DictIter;
+                di->refcount = 1;
+                di->dict = static_cast<PyDictObj*>(obj.as.obj);
+                di->slot = 0;   // seq cursor (insertion order)
+                di->remaining = static_cast<PyDictObj*>(obj.as.obj)->count;
+                out = Value::object(reinterpret_cast<PyObj*>(di));
+                return true;
+            }
+            default:
+                break;
+        }
+    }
+    raise_builtin(rt.type_type_error, "object is not iterable");
+    return false;
+}
+
+bool Vm::iter_check(Value& it, bool& more) noexcept {
+    Runtime& rt = Runtime::instance();
+    if (it.tag != Tag::Obj || !it.as.obj) {
+        raise_builtin(rt.type_type_error, "iterator protocol on non-object");
+        return false;
+    }
+    PyObj* o = it.as.obj;
+    switch (o->tag) {
+        case ObjTag::RangeIter: {
+            auto* r = static_cast<PyRangeIterObj*>(o);
+            more = r->step > 0 ? r->current < r->stop
+                               : (r->step < 0 ? r->current > r->stop : false);
+            return true;
+        }
+        case ObjTag::ListIter: {
+            auto* l = static_cast<PyListIterObj*>(o);
+            more = l->list && l->index < l->list->length;
+            return true;
+        }
+        case ObjTag::StrIter: {
+            auto* s = static_cast<PyStrIterObj*>(o);
+            more = s->str && s->index < s->str->length;
+            return true;
+        }
+        case ObjTag::DictIter: {
+            auto* d = static_cast<PyDictIterObj*>(o);
+            more = d->remaining > 0;
+            return true;
+        }
+        case ObjTag::Generator: {
+            auto* g = static_cast<PyGeneratorObj*>(o);
+            if (g->exhausted) {
+                more = false;
+                return true;
+            }
+            Value out;
+            bool has = false;
+            if (!generator_step(g, has, out)) return false;
+            // cache the value inside the generator (values tuple-less: use a
+            // small heap slot via the frame's first scratch register)
+            if (has) {
+                g->frame->regs[g->frame->n_regs > 0 ? g->frame->n_regs - 1 : 0] = out;
+                more = true;
+            } else {
+                more = false;
+            }
+            return true;
+        }
+        default:
+            raise_builtin(rt.type_type_error, "object is not an iterator");
+            return false;
+    }
+}
+
+bool Vm::iter_next(const Value& it, Value& out) noexcept {
+    Runtime& rt = Runtime::instance();
+    if (it.tag != Tag::Obj || !it.as.obj) {
+        raise_builtin(rt.type_type_error, "iterator protocol on non-object");
+        return false;
+    }
+    PyObj* o = it.as.obj;
+    switch (o->tag) {
+        case ObjTag::RangeIter: {
+            auto* r = static_cast<PyRangeIterObj*>(o);
+            out = Value::integer(r->current);
+            r->current += r->step;
+            return true;
+        }
+        case ObjTag::ListIter: {
+            auto* l = static_cast<PyListIterObj*>(o);
+            out = l->list->items[l->index++];
+            return true;
+        }
+        case ObjTag::StrIter: {
+            auto* s = static_cast<PyStrIterObj*>(o);
+            out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                std::string_view(s->str->data() + s->index, 1))));
+            ++s->index;
+            return true;
+        }
+        case ObjTag::DictIter: {
+            // Insertion-order iteration (CPython 3.7+ guarantee): repeatedly
+            // select the live entry with the smallest seq >= cursor.
+            auto* di = static_cast<PyDictIterObj*>(o);
+            PyDictObj* dict = di->dict;
+            if (di->remaining == 0 || !dict) {
+                out = Value::none();
+                return true;
+            }
+            std::uint32_t best = 0xFFFFFFFFu;
+            std::uint32_t best_slot = 0;
+            for (std::uint32_t i = 0; i < dict->capacity; ++i) {
+                const DictEntry& e = dict->entries[i];
+                if (!e.used || e.seq < di->slot) continue;   // already emitted
+                if (e.seq < best) {
+                    best = e.seq;
+                    best_slot = i;
+                }
+            }
+            if (best == 0xFFFFFFFFu) {
+                out = Value::none();
+                return true;
+            }
+            out = dict->entries[best_slot].key;
+            di->slot = best + 1;   // next scan starts after this seq
+            --di->remaining;
+            return true;
+        }
+        case ObjTag::Generator: {
+            auto* g = static_cast<PyGeneratorObj*>(o);
+            // cached by iter_check in the last register slot
+            out = g->frame->regs[g->frame->n_regs > 0 ? g->frame->n_regs - 1 : 0];
+            return true;
+        }
+        default:
+            raise_builtin(rt.type_type_error, "object is not an iterator");
+            return false;
+    }
+}
+
+bool Vm::generator_step(PyGeneratorObj* gen, bool& has_value, Value& out) noexcept {
+    has_value = false;
+    if (gen->exhausted || !gen->frame) {
+        gen->exhausted = true;
+        return true;
+    }
+    ExecStatus st = exec_frame(*gen->frame);
+    if (st == ExecStatus::Suspended) {
+        out = frame_return_;
+        frame_return_ = Value::none();
+        has_value = true;
+        return true;
+    }
+    if (st == ExecStatus::Raised) {
+        gen->exhausted = true;
+        return false;   // pending_exception_ carries the raise
+    }
+    // Returned: generator finished. StopIteration semantics handled by caller
+    // setting exhausted.
+    gen->exhausted = true;
+    has_value = false;
+    return true;
+}
+
+// =============================================================================
+// Parameter binding & calls
+// =============================================================================
+bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t argc,
+                          PyTupleObj* kw_names, std::uint32_t nkw) noexcept {
+    Runtime& rt = Runtime::instance();
+    CodeUnit* unit = f.unit;
+    std::uint32_t n_params = static_cast<std::uint32_t>(unit->param_regs.size());
+
+    // The hidden closure-cells parameter occupies the LAST slot (appended by
+    // lowering after the declared params). Exclude it from plain binding.
+    std::uint32_t declared = n_params;
+    if (fn && fn->cells && declared > 0) declared -= 1;
+
+    // varargs / kwargs packing: trailing params
+    std::uint32_t plain = declared;
+    if (unit->has_varargs && plain > 0) plain -= 1;
+    if (unit->has_kwargs && plain > 0) plain -= 1;
+
+    if (argc > plain) {
+        if (!unit->has_varargs) {
+            raise_builtin(rt.type_type_error, "too many positional arguments");
+            return false;
+        }
+    }
+
+    // positional
+    std::uint32_t i = 0;
+    for (; i < argc && i < plain; ++i) {
+        Value v = args[i];
+        if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+        f.regs[unit->param_regs[i]] = v;
+    }
+    // defaults for missing positionals
+    std::uint32_t ndefaults = fn && fn->defaults ? fn->defaults->length : 0;
+    for (; i < plain; ++i) {
+        bool used_default = false;
+        if (fn && fn->defaults && ndefaults > 0 && i + ndefaults >= plain) {
+            // default index: ndefaults - (plain - i)
+            std::uint32_t di = ndefaults - (plain - i);
+            if (di < ndefaults) {
+                Value dv = fn->defaults->items[di];
+                if (dv.tag == Tag::Obj && dv.as.obj) rt.incref(dv.as.obj);
+                f.regs[unit->param_regs[i]] = dv;
+                used_default = true;
+            }
+        }
+        if (!used_default) {
+            raise_builtin(rt.type_type_error, "missing required argument");
+            return false;
+        }
+    }
+    // varargs tuple
+    if (unit->has_varargs && n_params >= 1) {
+        std::uint32_t var_reg = unit->param_regs[plain];
+        PyTupleObj* tup = rt.new_tuple(argc > plain ? argc - plain : 0);
+        for (std::uint32_t k = plain; k < argc; ++k) {
+            tup->items[k - plain] = args[k];
+            if (args[k].tag == Tag::Obj && args[k].as.obj) rt.incref(args[k].as.obj);
+        }
+        f.regs[var_reg] = Value::object(reinterpret_cast<PyObj*>(tup));
+    }
+    // kwargs dict from kw_names
+    if (unit->has_kwargs && n_params >= 2) {
+        std::uint32_t kw_reg = unit->param_regs[plain + 1];
+        PyDictObj* d = rt.new_dict();
+        for (std::uint32_t k = 0; k < nkw && kw_names; ++k) {
+            Value key = kw_names->items[k];
+            Value val = argc + k < argc + nkw ? args[argc + k] : Value::none();
+            if (!dict_set(d, key, val)) {
+                raise_builtin(rt.type_memory_error, "kwargs dict allocation failed");
+                return false;
+            }
+        }
+        f.regs[kw_reg] = Value::object(reinterpret_cast<PyObj*>(d));
+    } else if (nkw > 0 && kw_names) {
+        // match keyword names against parameter names
+        for (std::uint32_t k = 0; k < nkw; ++k) {
+            Value key = kw_names->items[k];
+            if (key.tag != Tag::Int) continue;
+            bool matched = false;
+            for (std::uint32_t p = 0; p < plain; ++p) {
+                if (unit->param_names.size() > p &&
+                    unit->param_names[p] == static_cast<std::uint32_t>(key.as.i)) {
+                    Value val = args[argc + k];
+                    if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                    f.regs[unit->param_regs[p]] = val;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                raise_builtin(rt.type_type_error, "unexpected keyword argument");
+                return false;
+            }
+        }
+    }
+
+    // closure cells: hidden last param
+    if (fn && fn->cells && !unit->param_regs.empty()) {
+        std::uint32_t cells_reg = unit->param_regs.back();
+        Value cv = Value::object(reinterpret_cast<PyObj*>(fn->cells));
+        rt.incref(reinterpret_cast<PyObj*>(fn->cells));
+        f.regs[cells_reg] = cv;
+    }
+    return true;
+}
+
+bool Vm::builtin_call(PyNativeFnObj* fn, Value* args, std::uint32_t argc, Value& out) noexcept {
+    out = fn->fn(fn->user, args, argc);
+    if (out.tag == Tag::Obj && out.as.obj == nullptr) {
+        out = Value::none();
+        return false;   // null signals error (pending set by helper)
+    }
+    return true;
+}
+
+bool Vm::call_value(const Value& callee, Value* args, std::uint32_t argc, Value& out) noexcept {
+    return call_value_kw(callee, args, argc, nullptr, 0, out);
+}
+
+bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
+                       PyTupleObj* kw_names, std::uint32_t nkw, Value& out) noexcept {
+    Runtime& rt = Runtime::instance();
+
+    if (callee.tag != Tag::Obj || !callee.as.obj) {
+        raise_builtin(rt.type_type_error, "call of non-callable value");
+        return false;
+    }
+    PyObj* target = callee.as.obj;
+
+    if (call_depth >= cfg::max_call_depth) {
+        raise_builtin(rt.type_runtime_error, "maximum recursion depth exceeded");
+        return false;
+    }
+
+    switch (target->tag) {
+        case ObjTag::NativeFn: {
+            auto* fn = static_cast<PyNativeFnObj*>(target);
+            return builtin_call(fn, args, argc, out);
+        }
+        case ObjTag::BoundMethod: {
+            auto* bm = static_cast<PyBoundMethodObj*>(target);
+            // builtin bound methods on list/dict/str
+            if (bm->func.tag == Tag::Int) {
+                std::uint64_t kind = static_cast<std::uint64_t>(bm->func.as.i);
+                return builtin_bound_method(kind, bm->recv, args, argc, out);
+            }
+            // general: call func with recv prepended
+            stdx::small_vector<Value, 8> full;
+            full.push_back(bm->recv);
+            for (std::uint32_t i = 0; i < argc; ++i) full.push_back(args[i]);
+            bool ok = call_value_kw(bm->func, full.data(), argc + 1, kw_names, nkw, out);
+            return ok;
+        }
+        case ObjTag::Function: {
+            auto* fn = static_cast<PyFuncObj*>(target);
+            CodeUnit* unit = nullptr;
+            if (fn->code_unit_id < program.units.size()) {
+                unit = program.units[fn->code_unit_id];
+            }
+            if (!unit) {
+                raise_builtin(rt.type_runtime_error, "code unit not linked");
+                return false;
+            }
+            unit->call_count.fetch_add(1, std::memory_order_relaxed);
+
+            if (unit->is_generator) {
+                auto* gen = static_cast<PyGeneratorObj*>(std::malloc(sizeof(PyGeneratorObj)));
+                gen->tag = ObjTag::Generator;
+                gen->refcount = 1;
+                gen->frame = new Frame(unit);
+                gen->code_unit_id = fn->code_unit_id;
+                gen->exhausted = false;
+                if (!bind_parameters(*gen->frame, fn, args, argc, kw_names, nkw)) {
+                    delete gen->frame;
+                    std::free(gen);
+                    return false;
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(gen));
+                return true;
+            }
+
+            Frame f(unit);
+            if (!bind_parameters(f, fn, args, argc, kw_names, nkw)) return false;
+            ++call_depth;
+            ExecStatus st = exec_frame(f);
+            --call_depth;
+            if (st == ExecStatus::Returned) {
+                out = frame_return_;
+                frame_return_ = Value::none();
+                return true;
+            }
+            return false;   // Raised (pending set) or Suspended (invalid here)
+        }
+        case ObjTag::Type: {
+            auto* t = static_cast<PyTypeObj*>(target);
+            PyInstanceObj* inst = rt.new_instance(t);
+            out = Value::object(reinterpret_cast<PyObj*>(inst));
+            rt.incref(reinterpret_cast<PyObj*>(inst));
+            // __init__? walk chain
+            Value init;
+            for (PyTypeObj* tt = t; tt; tt = tt->base) {
+                if (dict_get(tt->dict, Value::integer(
+                        global_symbols().intern("__init__")), init)) {
+                    break;
+                }
+                init = Value::none();
+            }
+            if (init.tag == Tag::Obj && init.as.obj) {
+                stdx::small_vector<Value, 8> full;
+                full.push_back(out);   // self
+                for (std::uint32_t i = 0; i < argc; ++i) full.push_back(args[i]);
+                Value ignored;
+                if (!call_value_kw(init, full.data(), argc + 1, kw_names, nkw, ignored)) {
+                    rt.decref(reinterpret_cast<PyObj*>(inst));
+                    return false;
+                }
+            }
+            return true;
+        }
+        default:
+            raise_builtin(rt.type_type_error, "object is not callable");
+            return false;
+    }
+}
+
+bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args,
+                              std::uint32_t argc, Value& out) noexcept {
+    Runtime& rt = Runtime::instance();
+    if (kind >= 0x100 && kind < 0x200) {
+        // list methods
+        auto* l = static_cast<PyListObj*>(recv.as.obj);
+        if (kind == 0x100) {   // append
+            if (argc != 1) {
+                raise_builtin(rt.type_type_error, "append takes exactly one argument");
+                return false;
+            }
+            Value v = args[0];
+            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+            if (!list_push(l, v)) {
+                raise_builtin(rt.type_memory_error, "list allocation failed");
+                return false;
+            }
+            out = Value::none();
+            return true;
+        }
+        if (kind == 0x101) {   // pop
+            if (l->length == 0) {
+                raise_builtin(rt.type_index_error, "pop from empty list");
+                return false;
+            }
+            out = l->items[l->length - 1];
+            l->length--;
+            out = out;
+            return true;
+        }
+    }
+    if (kind >= 0x200 && kind < 0x300) {
+        // dict methods: get/keys/values/items
+        auto* d = static_cast<PyDictObj*>(recv.as.obj);
+        if (kind == 0x200) {   // get(key[, default])
+            if (argc == 0) {
+                raise_builtin(rt.type_type_error, "get needs a key");
+                return false;
+            }
+            if (!dict_get(d, args[0], out)) {
+                out = argc > 1 ? args[1] : Value::none();
+            }
+            return true;
+        }
+        // keys/values/items -> list
+        auto* result = rt.new_list();
+        for (std::uint32_t i = 0; i < d->capacity; ++i) {
+            if (!d->entries[i].used) continue;
+            Value v;
+                if (kind == 0x201) v = d->entries[i].key;
+            else if (kind == 0x202) v = d->entries[i].value;
+            else {
+                auto* pair = rt.new_tuple(2);
+                pair->items[0] = d->entries[i].key;
+                pair->items[1] = d->entries[i].value;
+                if (pair->items[0].tag == Tag::Obj) rt.incref(pair->items[0].as.obj);
+                if (pair->items[1].tag == Tag::Obj) rt.incref(pair->items[1].as.obj);
+                v = Value::object(reinterpret_cast<PyObj*>(pair));
+            }
+            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+            if (!list_push(result, v)) {
+                raise_builtin(rt.type_memory_error, "list allocation failed");
+                return false;
+            }
+        }
+        out = Value::object(reinterpret_cast<PyObj*>(result));
+        return true;
+    }
+    if (kind >= 0x300) {
+        // Str bound methods. Kinds assigned at LOAD_ATTR:
+        //   0x300 upper, 0x301 lower, 0x302 split, 0x303 startswith,
+        //   0x304 endswith, 0x305 strip, 0x306 replace, 0x307 join.
+        auto* str = static_cast<PyStrObj*>(recv.as.obj);
+        std::string_view sv(str->data(), str->length);
+        switch (kind) {
+            case 0x300: {   // upper
+                stdx::small_vector<char, 128> buf;
+                for (char c : sv) buf.push_back(static_cast<char>(std::toupper((unsigned char)c)));
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x301: {   // lower
+                stdx::small_vector<char, 128> buf;
+                for (char c : sv) buf.push_back(static_cast<char>(std::tolower((unsigned char)c)));
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x302: {   // split(sep)
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "split expects a string separator");
+                    return false;
+                }
+                auto* sep = static_cast<PyStrObj*>(args[0].as.obj);
+                auto* result = rt.new_list();
+                std::string_view sepv(sep->data(), sep->length);
+                if (sepv.empty()) {
+                    // no separator: split on whitespace (subset: whole string)
+                    auto* piece = rt.new_str(sv);
+                    list_push(result, Value::object(reinterpret_cast<PyObj*>(piece)));
+                } else {
+                    std::size_t start = 0;
+                    for (;;) {
+                        std::size_t at = sv.find(sepv, start);
+                        if (at == std::string_view::npos) {
+                            auto* piece = rt.new_str(sv.substr(start));
+                            list_push(result, Value::object(reinterpret_cast<PyObj*>(piece)));
+                            break;
+                        }
+                        auto* piece = rt.new_str(sv.substr(start, at - start));
+                        list_push(result, Value::object(reinterpret_cast<PyObj*>(piece)));
+                        start = at + sepv.size();
+                    }
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(result));
+                return true;
+            }
+            case 0x303: {   // startswith
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "startswith expects a string");
+                    return false;
+                }
+                auto* pre = static_cast<PyStrObj*>(args[0].as.obj);
+                std::string_view pv(pre->data(), pre->length);
+                out = Value::boolean(sv.size() >= pv.size() && sv.substr(0, pv.size()) == pv);
+                return true;
+            }
+            case 0x304: {   // endswith
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "endswith expects a string");
+                    return false;
+                }
+                auto* suf = static_cast<PyStrObj*>(args[0].as.obj);
+                std::string_view pv(suf->data(), suf->length);
+                out = Value::boolean(sv.size() >= pv.size() && sv.substr(sv.size() - pv.size()) == pv);
+                return true;
+            }
+            case 0x305: {   // strip
+                std::size_t b = 0, e = sv.size();
+                while (b < e && std::isspace((unsigned char)sv[b])) ++b;
+                while (e > b && std::isspace((unsigned char)sv[e - 1])) --e;
+                out = Value::object(reinterpret_cast<PyObj*>(
+                    rt.new_str(sv.substr(b, e - b))));
+                return true;
+            }
+            case 0x306: {   // replace(old, new)
+                if (argc < 2 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str || args[1].tag != Tag::Obj ||
+                    !args[1].as.obj || args[1].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "replace expects two strings");
+                    return false;
+                }
+                auto* old_s = static_cast<PyStrObj*>(args[0].as.obj);
+                auto* new_s = static_cast<PyStrObj*>(args[1].as.obj);
+                std::string_view ov(old_s->data(), old_s->length);
+                std::string_view nv(new_s->data(), new_s->length);
+                stdx::small_vector<char, 128> buf;
+                if (ov.empty()) {
+                    out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(sv)));
+                    return true;
+                }
+                std::size_t start = 0;
+                for (;;) {
+                    std::size_t at = sv.find(ov, start);
+                    if (at == std::string_view::npos) {
+                        for (std::size_t k = start; k < sv.size(); ++k) buf.push_back(sv[k]);
+                        break;
+                    }
+                    for (std::size_t k = start; k < at; ++k) buf.push_back(sv[k]);
+                    for (char c : nv) buf.push_back(c);
+                    start = at + ov.size();
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x307: {   // join(iterable of str)
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::List) {
+                    raise_builtin(rt.type_type_error, "join expects a list");
+                    return false;
+                }
+                auto* parts = static_cast<PyListObj*>(args[0].as.obj);
+                stdx::small_vector<char, 128> buf;
+                for (std::uint32_t i = 0; i < parts->length; ++i) {
+                    if (i) for (char c : sv) buf.push_back(c);
+                    Value& p = parts->items[i];
+                    if (p.tag == Tag::Obj && p.as.obj && p.as.obj->tag == ObjTag::Str) {
+                        auto* ps = static_cast<PyStrObj*>(p.as.obj);
+                        for (std::uint32_t k = 0; k < ps->length; ++k) buf.push_back(ps->data()[k]);
+                    }
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            default:
+                raise_builtin(rt.type_not_implemented_error, "unknown str method");
+                return false;
+        }
+    }
+    raise_builtin(rt.type_type_error, "unknown bound method");
+    return false;
+}
+
+// =============================================================================
+// Native helpers (CallNative ops)
+// =============================================================================
+bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
+                       Value& out) noexcept {
+    Runtime& rt = Runtime::instance();
+    switch (static_cast<NativeHelper>(helper)) {
+        case NativeHelper::MakeFunction: {
+            // args: [code_unit_id, ndefaults, defaults..., cells]
+            if (argc < 3) {
+                raise_builtin(rt.type_runtime_error, "MakeFunction arity");
+                return false;
+            }
+            std::uint32_t unit_id = static_cast<std::uint32_t>(args[0].as.i);
+            std::uint32_t ndefaults = static_cast<std::uint32_t>(args[1].as.i);
+            PyTupleObj* defaults = nullptr;
+            if (ndefaults > 0) {
+                defaults = rt.new_tuple(ndefaults);
+                for (std::uint32_t i = 0; i < ndefaults; ++i) {
+                    defaults->items[i] = args[2 + i];
+                    if (args[2 + i].tag == Tag::Obj && args[2 + i].as.obj) {
+                        rt.incref(args[2 + i].as.obj);
+                    }
+                }
+            }
+            Value cells_v = args[2 + ndefaults];
+            PyTupleObj* cells = nullptr;
+            if (cells_v.tag == Tag::Obj && cells_v.as.obj &&
+                cells_v.as.obj->tag == ObjTag::Tuple) {
+                cells = static_cast<PyTupleObj*>(cells_v.as.obj);
+            }
+            CodeUnit* unit = unit_id < program.units.size() ? program.units[unit_id] : nullptr;
+            if (!unit) {
+                raise_builtin(rt.type_runtime_error, "MakeFunction: unknown code unit");
+                return false;
+            }
+            SymbolId name = unit->name;
+            auto* fn = rt.new_func(unit_id, name, defaults, cells,
+                                   static_cast<std::uint32_t>(unit->param_regs.size()),
+                                   unit->has_varargs, unit->has_kwargs);
+            out = Value::object(reinterpret_cast<PyObj*>(fn));
+            return true;
+        }
+        case NativeHelper::MakeCell: {
+            PyCellObj* cell = rt.new_cell(args[0]);
+            out = Value::object(reinterpret_cast<PyObj*>(cell));
+            return true;
+        }
+        case NativeHelper::CellGet: {
+            auto* cell = static_cast<PyCellObj*>(args[0].as.obj);
+            if (cell->flags & PyCellObj::kUnbound) {
+                raise_builtin(rt.type_runtime_error,
+                              "cannot read unbound closure variable (UnboundLocalError)");
+                return false;
+            }
+            out = cell->value;
+            return true;
+        }
+        case NativeHelper::CellSet: {
+            auto* cell = static_cast<PyCellObj*>(args[0].as.obj);
+            Value v = args[1];
+            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+            if (cell->value.tag == Tag::Obj && cell->value.as.obj) {
+                rt.decref(cell->value.as.obj);
+            }
+            cell->value = v;
+            cell->flags &= ~PyCellObj::kUnbound;
+            out = Value::none();
+            return true;
+        }
+        case NativeHelper::ImportModule: {
+            std::uint32_t sym = 0;
+            // arg is a symbol-string const: Value integer symbol or str object
+            if (args[0].tag == Tag::Int) {
+                sym = static_cast<std::uint32_t>(args[0].as.i);
+            } else if (args[0].tag == Tag::Obj && args[0].as.obj &&
+                       args[0].as.obj->tag == ObjTag::Str) {
+                sym = global_symbols().intern(
+                    static_cast<PyStrObj*>(args[0].as.obj)->view());
+            }
+            PyModuleObj* mod = load_native_module(sym);
+            if (!mod) {
+                stdx::small_vector<char, 128> msg;
+                for (char c : "no module named '") msg.push_back(c);
+                for (char c : global_symbols().text(sym)) msg.push_back(c);
+                msg.push_back('\'');
+                msg.push_back('\0');
+                raise_builtin(rt.type_runtime_error, msg.data());
+                return false;
+            }
+            out = Value::object(reinterpret_cast<PyObj*>(mod));
+            return true;
+        }
+        case NativeHelper::MakeClass: {
+            // args: [name_str, namespace_dict, base_or_none]
+            std::string_view name;
+            if (args[0].tag == Tag::Int) {
+                name = global_symbols().text(static_cast<std::uint32_t>(args[0].as.i));
+            } else if (args[0].tag == Tag::Obj && args[0].as.obj &&
+                       args[0].as.obj->tag == ObjTag::Str) {
+                name = static_cast<PyStrObj*>(args[0].as.obj)->view();
+            }
+            PyDictObj* ns = nullptr;
+            if (args[1].tag == Tag::Obj && args[1].as.obj &&
+                args[1].as.obj->tag == ObjTag::Dict) {
+                ns = static_cast<PyDictObj*>(args[1].as.obj);
+            }
+            PyTypeObj* base = nullptr;
+            if (args[2].tag == Tag::Obj && args[2].as.obj &&
+                args[2].as.obj->tag == ObjTag::Type) {
+                base = static_cast<PyTypeObj*>(args[2].as.obj);
+            }
+            PyTypeObj* cls = rt.new_type(global_symbols().intern(name), base, ns);
+            // Inherit base attributes: own (ns) entries WIN — copy base
+            // entries only where the subclass did not define them.
+            if (base && base->dict) {
+                for (std::uint32_t i = 0; i < base->dict->capacity; ++i) {
+                    if (!base->dict->entries[i].used) continue;
+                    Value existing;
+                    if (dict_get(cls->dict, base->dict->entries[i].key, existing)) {
+                        continue;   // subclass override stays
+                    }
+                    if (!dict_set(cls->dict, base->dict->entries[i].key,
+                                  base->dict->entries[i].value)) {
+                        raise_builtin(rt.type_memory_error, "class dict copy failed");
+                        return false;
+                    }
+                }
+            }
+            out = Value::object(reinterpret_cast<PyObj*>(cls));
+            return true;
+        }
+        case NativeHelper::UnpackSequence: {
+            // args: [value, n]
+            std::uint32_t n = static_cast<std::uint32_t>(args[1].as.i);
+            PyTupleObj* tup = rt.new_tuple(n);
+            bool ok = false;
+            if (args[0].tag == Tag::Obj && args[0].as.obj) {
+                PyObj* src = args[0].as.obj;
+                if (src->tag == ObjTag::List) {
+                    auto* l = static_cast<PyListObj*>(src);
+                    if (l->length == n) {
+                        for (std::uint32_t i = 0; i < n; ++i) {
+                            tup->items[i] = l->items[i];
+                            if (l->items[i].tag == Tag::Obj) rt.incref(l->items[i].as.obj);
+                        }
+                        ok = true;
+                    }
+                } else if (src->tag == ObjTag::Tuple) {
+                    auto* t = static_cast<PyTupleObj*>(src);
+                    if (t->length == n) {
+                        for (std::uint32_t i = 0; i < n; ++i) {
+                            tup->items[i] = t->items[i];
+                            if (t->items[i].tag == Tag::Obj) rt.incref(t->items[i].as.obj);
+                        }
+                        ok = true;
+                    }
+                } else if (src->tag == ObjTag::Str) {
+                    auto* s = static_cast<PyStrObj*>(src);
+                    if (s->length == n) {
+                        for (std::uint32_t i = 0; i < n; ++i) {
+                            auto* ch = rt.new_str(std::string_view(s->data() + i, 1));
+                            tup->items[i] = Value::object(reinterpret_cast<PyObj*>(ch));
+                        }
+                        ok = true;
+                    }
+                }
+            }
+            if (!ok) {
+                rt.decref(reinterpret_cast<PyObj*>(tup));
+                raise_builtin(rt.type_value_error, "cannot unpack sequence to requested length");
+                return false;
+            }
+            out = Value::object(reinterpret_cast<PyObj*>(tup));
+            return true;
+        }
+        case NativeHelper::UnboundCheck: {
+            raise_builtin(rt.type_runtime_error,
+                          "local variable referenced before assignment (UnboundLocalError)");
+            return false;
+        }
+        case NativeHelper::DelSubscript: {
+            if (args[0].tag == Tag::Obj && args[0].as.obj &&
+                args[0].as.obj->tag == ObjTag::Dict) {
+                if (!dict_del(static_cast<PyDictObj*>(args[0].as.obj), args[1])) {
+                    raise_builtin(rt.type_key_error, "del: key not found");
+                    return false;
+                }
+                out = Value::none();
+                return true;
+            }
+            if (args[0].tag == Tag::Obj && args[0].as.obj &&
+                args[0].as.obj->tag == ObjTag::List) {
+                auto* l = static_cast<PyListObj*>(args[0].as.obj);
+                std::int64_t idx = 0;
+                if (!as_i64(args[1], idx) || idx < 0 || idx >= static_cast<std::int64_t>(l->length)) {
+                    raise_builtin(rt.type_index_error, "del index out of range");
+                    return false;
+                }
+                if (l->items[idx].tag == Tag::Obj) rt.decref(l->items[idx].as.obj);
+                std::memmove(l->items + idx, l->items + idx + 1,
+                             sizeof(Value) * (l->length - idx - 1));
+                l->length--;
+                out = Value::none();
+                return true;
+            }
+            raise_builtin(rt.type_type_error, "del target does not support deletion");
+            return false;
+        }
+        case NativeHelper::DelAttr: {
+            // subset: attribute deletion unsupported (documented)
+            raise_builtin(rt.type_not_implemented_error, "del attr is outside the subset");
+            return false;
+        }
+        case NativeHelper::IsInstance: {
+            // args: [exc_value, type_name_str]
+            if (args[0].tag == Tag::Obj && args[0].as.obj &&
+                args[0].as.obj->tag == ObjTag::Instance) {
+                auto* inst = static_cast<PyInstanceObj*>(args[0].as.obj);
+                std::uint32_t sym = 0;
+                if (args[1].tag == Tag::Int) {
+                    sym = static_cast<std::uint32_t>(args[1].as.i);
+                } else if (args[1].tag == Tag::Obj && args[1].as.obj &&
+                           args[1].as.obj->tag == ObjTag::Str) {
+                    sym = global_symbols().intern(
+                        static_cast<PyStrObj*>(args[1].as.obj)->view());
+                }
+                out = Value::boolean(rt.exception_matches(inst, sym));
+                return true;
+            }
+            out = Value::boolean(false);
+            return true;
+        }
+        case NativeHelper::GetCurrentException: {
+            // Hand the pending exception to the handler (ownership transfers
+            // into the destination register).
+            out = take_pending();
+            return true;
+        }
+        case NativeHelper::FormatValue: {
+            stdx::small_vector<char, 128> buf;
+            rt.str_into(args[0], buf);
+            out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                std::string_view(buf.data(), buf.size()))));
+            return true;
+        }
+        case NativeHelper::NextIterator: {
+            Value it = args[0];
+            bool more = false;
+            if (!iter_check(it, more)) return false;
+            if (!more) {
+                raise_builtin(rt.type_stop_iter, "");
+                return false;
+            }
+            return iter_next(it, out);
+        }
+        default:
+            break;
+    }
+    raise_builtin(rt.type_not_implemented_error, "native helper not implemented");
+    return false;
+}
+
+// =============================================================================
+// The dispatch loop
+// =============================================================================
+#define VM_LOAD() cur = &f.unit->code[f.pc]
+#define VM_DISPATCH() goto* dispatch[cur->op]
+ExecStatus Vm::exec_frame(Frame& f) noexcept {
+    Runtime& rt = Runtime::instance();
+    // Computed-goto dispatch table (Tier 0 core). Note: initialized once
+    // per call — GCC folds it into rodata after inlining analysis.
+    const void* const dispatch[] = {
+        &&L_LOAD_CONST, &&L_MOVE, &&L_PY_BINOP, &&L_PY_UNOP, &&L_PY_CMP,
+        &&L_LOAD_GLOBAL, &&L_STORE_GLOBAL, &&L_LOAD_ATTR, &&L_STORE_ATTR,
+        &&L_LOAD_INDEX, &&L_STORE_INDEX, &&L_NEW_LIST, &&L_NEW_TUPLE,
+        &&L_NEW_DICT, &&L_LIST_APPEND, &&L_CALL, &&L_CALL_KW, &&L_NATIVE,
+        &&L_ITER, &&L_ITER_CHECK, &&L_ITER_NEXT, &&L_YIELD, &&L_JUMP,
+        &&L_JUMP_IF_FALSE, &&L_JUMP_IF_TRUE, &&L_RETURN, &&L_RAISE,
+        &&L_TRY_BEGIN, &&L_TRY_END, &&L_GET_EXC,
+    };
+    Value* const regs = f.regs;
+    // [watchdog] detect the dict-count corruption at instruction granularity
+    const Instr* cur = &f.unit->code[0];   // single rebinding instruction cursor
+    // Exception handlers from the scheduled try-range table.
+    for (const TryRange& r : f.unit->try_ranges) {
+        Frame::Handler h;
+        h.try_pc_start = r.start_pc;
+        h.try_pc_end = r.end_pc;
+        h.handler_pc = r.handler_pc;
+        f.handlers.push_back(h);
+    }
+    // Register write helper (ownership discipline).
+    auto write_reg = [&](std::uint32_t r, Value v) noexcept {
+        Value& slot = regs[r];
+        if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+        slot = v;
+    };
+    auto write_reg_owned = [&](std::uint32_t r, Value v) noexcept {
+        Value& slot = regs[r];
+        if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+        slot = v;
+        if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    };
+    // Move semantics: transfer ownership from source register.
+    auto move_reg = [&](std::uint32_t dst, std::uint32_t src) noexcept {
+        Value& dslot = regs[dst];
+        Value v = regs[src];
+        if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);   // src keeps its ref
+        if (dslot.tag == Tag::Obj && dslot.as.obj) rt.decref(dslot.as.obj);
+        dslot = v;
+    };
+#define RAISE_CHECK(expr)                       \
+    do {                                        \
+        if (!(expr)) [[unlikely]] {             \
+            if (unwind_to_handler(f)) {         \
+                VM_LOAD();                      \
+                VM_DISPATCH();                  \
+            }                                   \
+            return ExecStatus::Raised;          \
+        }                                       \
+    } while (0)
+    VM_LOAD();
+    VM_DISPATCH();
+L_LOAD_CONST: {
+    const Value& c = f.unit->constants[cur->imm];
+    write_reg_owned(cur->dst, c);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_MOVE: {
+    move_reg(cur->dst, cur->a);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_PY_BINOP: {
+    Value a = regs[cur->a];
+    Value b = regs[cur->b];
+    Value out;
+    bool ok = false;
+    switch (static_cast<BinOpKind>(cur->imm)) {
+        case BinOpKind::Add: {
+            // str + str, list + list fast paths
+            if (a.tag == Tag::Obj && b.tag == Tag::Obj && a.as.obj && b.as.obj &&
+                a.as.obj->tag == ObjTag::Str && b.as.obj->tag == ObjTag::Str) {
+                auto* sa = static_cast<PyStrObj*>(a.as.obj);
+                auto* sb = static_cast<PyStrObj*>(b.as.obj);
+                stdx::small_vector<char, 128> buf;
+                buf.reserve(sa->length + sb->length);
+                for (std::uint32_t i = 0; i < sa->length; ++i) buf.push_back(sa->data()[i]);
+                for (std::uint32_t i = 0; i < sb->length; ++i) buf.push_back(sb->data()[i]);
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                ok = true;
+                break;
+            }
+            if (a.tag == Tag::Obj && b.tag == Tag::Obj && a.as.obj && b.as.obj &&
+                a.as.obj->tag == ObjTag::List && b.as.obj->tag == ObjTag::List) {
+                auto* la = static_cast<PyListObj*>(a.as.obj);
+                auto* lb = static_cast<PyListObj*>(b.as.obj);
+                auto* merged = rt.new_list(la->length + lb->length);
+                for (std::uint32_t i = 0; i < la->length; ++i) list_push(merged, la->items[i]);
+                for (std::uint32_t i = 0; i < lb->length; ++i) list_push(merged, lb->items[i]);
+                out = Value::object(reinterpret_cast<PyObj*>(merged));
+                ok = true;
+                break;
+            }
+            ok = values_add(a, b, out);
+            break;
+        }
+        case BinOpKind::Sub: ok = values_sub(a, b, out); break;
+        case BinOpKind::Mul: {
+            // str * int, list * int replication
+            std::int64_t n = 0;
+            if (a.tag == Tag::Obj && a.as.obj && a.as.obj->tag == ObjTag::Str &&
+                as_i64(b, n) && n >= 0) {
+                auto* s = static_cast<PyStrObj*>(a.as.obj);
+                stdx::small_vector<char, 256> buf;
+                for (std::int64_t k = 0; k < n; ++k) {
+                    for (std::uint32_t i = 0; i < s->length; ++i) buf.push_back(s->data()[i]);
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                ok = true;
+                break;
+            }
+            if (a.tag == Tag::Obj && a.as.obj && a.as.obj->tag == ObjTag::List &&
+                as_i64(b, n) && n >= 0) {
+                auto* l = static_cast<PyListObj*>(a.as.obj);
+                auto* merged = rt.new_list();
+                for (std::int64_t k = 0; k < n; ++k) {
+                    for (std::uint32_t i = 0; i < l->length; ++i) list_push(merged, l->items[i]);
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(merged));
+                ok = true;
+                break;
+            }
+            ok = values_mul(a, b, out);
+            break;
+        }
+        case BinOpKind::TrueDiv: {
+            std::int64_t yi = 0;
+            double yf = 0;
+            if ((b.tag == Tag::Int && b.as.i == 0) ||
+                (b.tag == Tag::Float && b.as.f == 0.0) ||
+                (as_i64(b, yi) && yi == 0) || (as_f64(b, yf) && yf == 0.0)) {
+                raise_builtin(rt.type_zero_div, "division by zero");
+                ok = false;
+                break;
+            }
+            ok = values_truediv(a, b, out);
+            break;
+        }
+        case BinOpKind::FloorDiv: {
+            std::int64_t yi = 0;
+            if (as_i64(b, yi) && yi == 0) {
+                raise_builtin(rt.type_zero_div, "integer division or modulo by zero");
+                ok = false;
+                break;
+            }
+            ok = values_floordiv(a, b, out);
+            break;
+        }
+        case BinOpKind::Mod: {
+            std::int64_t yi = 0;
+            double yf = 0;
+            if ((as_i64(b, yi) && yi == 0) || (as_f64(b, yf) && yf == 0.0)) {
+                raise_builtin(rt.type_zero_div, "integer division or modulo by zero");
+                ok = false;
+                break;
+            }
+            ok = values_mod(a, b, out);
+            break;
+        }
+        case BinOpKind::Pow: ok = values_pow(a, b, out); break;
+        case BinOpKind::BitAnd: case BinOpKind::BitOr: case BinOpKind::BitXor:
+            ok = values_bitop(a, b, cur->imm, out);
+            break;
+        case BinOpKind::LShift: ok = values_shift(a, b, true, out); break;
+        case BinOpKind::RShift: ok = values_shift(a, b, false, out); break;
+        case BinOpKind::MatMul:
+            ok = false;
+            break;
+    }
+    if (!ok) {
+        if (!has_pending()) {
+            raise_builtin(rt.type_type_error, "unsupported operand types");
+        }
+        RAISE_CHECK(false);
+    }
+    write_reg(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_PY_UNOP: {
+    Value a = regs[cur->a];
+    Value out;
+    bool ok = false;
+    switch (cur->imm) {
+        case 1: ok = values_neg(a, out); break;              // -
+        case 2: {                                            // ~
+            std::int64_t x = 0;
+            if (as_i64(a, x)) {
+                out = Value::integer(~x);
+                ok = true;
+            }
+            break;
+        }
+        case 3: {                                            // not
+            out = Value::boolean(!rt.truthy(a));
+            ok = true;
+            break;
+        }
+        case 4: {                                            // truth test (boolop)
+            out = Value::boolean(rt.truthy(a));
+            ok = true;
+            break;
+        }
+        case 5: {                                            // truth test value (chain)
+            out = a;
+            ok = true;
+            break;
+        }
+        default: break;
+    }
+    if (!ok) {
+        if (!has_pending()) raise_builtin(rt.type_type_error, "bad operand for unary op");
+        RAISE_CHECK(false);
+    }
+    write_reg(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_PY_CMP: {
+    Value a = regs[cur->a];
+    Value b = regs[cur->b];
+    bool result = false;
+    if (!values_compare(a, b, cur->imm, result)) {
+        if (!has_pending()) raise_builtin(rt.type_type_error, "'...' not supported between instances");
+        RAISE_CHECK(false);
+    }
+    write_reg(cur->dst, Value::boolean(result));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_LOAD_GLOBAL: {
+    Value v;
+    RAISE_CHECK(get_global(cur->imm, v));
+    write_reg_owned(cur->dst, v);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_STORE_GLOBAL: {
+    Value v = regs[cur->a];
+    std::uint32_t canary0 = program.globals->count;
+    PyStrObj* key = rt.new_str(global_symbols().text(cur->imm));
+    std::uint32_t canary1 = program.globals->count;
+    if (canary0 != canary1) {
+    }
+    RAISE_CHECK(dict_set(program.globals, Value::object(reinterpret_cast<PyObj*>(key)), v));
+    rt.decref(reinterpret_cast<PyObj*>(key));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_LOAD_ATTR: {
+    Value out;
+    RAISE_CHECK(get_attr(regs[cur->a], cur->imm, out));
+    write_reg_owned(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_STORE_ATTR: {
+    Value v = regs[cur->b];
+    RAISE_CHECK(set_attr(regs[cur->a], cur->imm, v));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_LOAD_INDEX: {
+    Value obj = regs[cur->a];
+    Value idx = regs[cur->b];
+    Value out;
+    bool ok = false;
+    if (obj.tag == Tag::Obj && obj.as.obj) {
+        std::int64_t i = 0;
+        if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
+            auto* l = static_cast<PyListObj*>(obj.as.obj);
+            std::int64_t len = static_cast<std::int64_t>(l->length);
+            std::int64_t eff = i < 0 ? i + len : i;
+            if (eff >= 0 && eff < len) {
+                out = l->items[static_cast<std::uint32_t>(eff)];
+                ok = true;
+            } else {
+                raise_builtin(rt.type_index_error, "list index out of range");
+            }
+        } else if (obj.as.obj->tag == ObjTag::Tuple && as_i64(idx, i)) {
+            auto* t = static_cast<PyTupleObj*>(obj.as.obj);
+            std::int64_t len = static_cast<std::int64_t>(t->length);
+            std::int64_t eff = i < 0 ? i + len : i;
+            if (eff >= 0 && eff < len) {
+                out = t->items[static_cast<std::uint32_t>(eff)];
+                ok = true;
+            } else {
+                raise_builtin(rt.type_index_error, "tuple index out of range");
+            }
+        } else if (obj.as.obj->tag == ObjTag::Str && as_i64(idx, i)) {
+            auto* s = static_cast<PyStrObj*>(obj.as.obj);
+            std::int64_t len = static_cast<std::int64_t>(s->length);
+            std::int64_t eff = i < 0 ? i + len : i;
+            if (eff >= 0 && eff < len) {
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(s->data() + eff, 1))));
+                ok = true;
+            } else {
+                raise_builtin(rt.type_index_error, "string index out of range");
+            }
+        } else if (obj.as.obj->tag == ObjTag::Dict) {
+            if (dict_get(static_cast<PyDictObj*>(obj.as.obj), idx, out)) {
+                ok = true;
+            } else {
+                // str keys via symbol-int normalization
+                raise_builtin(rt.type_key_error, "key not found");
+            }
+        } else if (obj.as.obj->tag == ObjTag::List && idx.tag == Tag::Obj &&
+                   idx.as.obj && idx.as.obj->tag == ObjTag::Tuple &&
+                   static_cast<PyTupleObj*>(idx.as.obj)->length == 3) {
+            // slice: (lower, upper, step) with None for omitted
+            auto* tup = static_cast<PyTupleObj*>(idx.as.obj);
+            std::int64_t len = static_cast<std::int64_t>(
+                static_cast<PyListObj*>(obj.as.obj)->length);
+            std::int64_t lo = 0, hi = len, step = 1;
+            if (tup->items[0].tag == Tag::Int) lo = tup->items[0].as.i;
+            if (tup->items[1].tag == Tag::Int) hi = tup->items[1].as.i;
+            if (tup->items[2].tag == Tag::Int) step = tup->items[2].as.i;
+            if (step == 0) {
+                raise_builtin(rt.type_value_error, "slice step cannot be zero");
+            } else {
+                auto* src = static_cast<PyListObj*>(obj.as.obj);
+                auto* result = rt.new_list();
+                if (step > 0) {
+                    if (lo < 0) lo += len;
+                    if (hi < 0) hi += len;
+                    if (lo < 0) lo = 0;
+                    if (hi > len) hi = len;
+                    for (std::int64_t k = lo; k < hi; k += step) {
+                        if (!list_push(result, src->items[static_cast<std::uint32_t>(k)])) {
+                            raise_builtin(rt.type_memory_error, "slice allocation failed");
+                            break;
+                        }
+                    }
+                } else {
+                    // negative step: defaults are lo=len-1, hi=-1
+                    if (tup->items[0].tag != Tag::Int) {
+                        lo = len - 1;
+                    } else if (lo < 0) {
+                        lo += len;
+                    }
+                    if (tup->items[1].tag != Tag::Int) {
+                        hi = -1;
+                    } else if (hi < 0) {
+                        hi += len;
+                    }
+                    if (lo > len - 1) lo = len - 1;
+                    for (std::int64_t k = lo; k > hi; k += step) {
+                        if (k >= 0 && k < len) {
+                            if (!list_push(result, src->items[static_cast<std::uint32_t>(k)])) {
+                                raise_builtin(rt.type_memory_error, "slice allocation failed");
+                                break;
+                            }
+                        }
+                    }
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(result));
+                ok = true;
+            }
+        } else if (obj.as.obj->tag == ObjTag::Str && idx.tag == Tag::Obj &&
+                   idx.as.obj && idx.as.obj->tag == ObjTag::Tuple &&
+                   static_cast<PyTupleObj*>(idx.as.obj)->length == 3) {
+            auto* tup = static_cast<PyTupleObj*>(idx.as.obj);
+            auto* src = static_cast<PyStrObj*>(obj.as.obj);
+            std::int64_t len = static_cast<std::int64_t>(src->length);
+            std::int64_t lo = 0, hi = len, step = 1;
+            if (tup->items[0].tag == Tag::Int) lo = tup->items[0].as.i;
+            if (tup->items[1].tag == Tag::Int) hi = tup->items[1].as.i;
+            if (tup->items[2].tag == Tag::Int) step = tup->items[2].as.i;
+            if (step == 0) {
+                raise_builtin(rt.type_value_error, "slice step cannot be zero");
+            } else {
+                stdx::small_vector<char, 128> buf;
+                if (step > 0) {
+                    if (lo < 0) lo += len;
+                    if (hi < 0) hi += len;
+                    if (lo < 0) lo = 0;
+                    if (hi > len) hi = len;
+                    for (std::int64_t k = lo; k < hi; k += step) {
+                        if (k >= 0 && k < len) buf.push_back(src->data()[k]);
+                    }
+                } else {
+                    if (tup->items[0].tag != Tag::Int) {
+                        lo = len - 1;
+                    } else if (lo < 0) {
+                        lo += len;
+                    }
+                    if (tup->items[1].tag != Tag::Int) {
+                        hi = -1;
+                    } else if (hi < 0) {
+                        hi += len;
+                    }
+                    if (lo > len - 1) lo = len - 1;
+                    for (std::int64_t k = lo; k > hi; k += step) {
+                        if (k >= 0 && k < len) buf.push_back(src->data()[k]);
+                    }
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(
+                    rt.new_str(std::string_view(buf.data(), buf.size()))));
+                ok = true;
+            }
+        }
+    }
+    if (!ok) {
+        if (!has_pending()) raise_builtin(rt.type_type_error, "object is not subscriptable");
+        RAISE_CHECK(false);
+    }
+    write_reg_owned(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_STORE_INDEX: {
+    Value obj = regs[cur->a];
+    Value idx = regs[cur->b];
+    Value val = regs[cur->c];
+    bool ok = false;
+    if (obj.tag == Tag::Obj && obj.as.obj) {
+        std::int64_t i = 0;
+        if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
+            auto* l = static_cast<PyListObj*>(obj.as.obj);
+            std::int64_t len = static_cast<std::int64_t>(l->length);
+            std::int64_t eff = i < 0 ? i + len : i;
+            if (eff >= 0 && eff < len) {
+                ok = list_set(l, static_cast<std::uint32_t>(eff), val);
+            } else {
+                raise_builtin(rt.type_index_error, "list assignment index out of range");
+            }
+        } else if (obj.as.obj->tag == ObjTag::Dict) {
+            Value key = idx;
+            ok = dict_set(static_cast<PyDictObj*>(obj.as.obj), key, val);
+        }
+    }
+    if (!ok) {
+        if (!has_pending()) raise_builtin(rt.type_type_error, "object does not support item assignment");
+        RAISE_CHECK(false);
+    }
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_NEW_LIST: {
+    auto* l = rt.new_list(cur->b > 0 ? cur->b : 4);
+    for (std::uint32_t i = 0; i < cur->b; ++i) {
+        if (!list_push(l, regs[cur->a + i])) {
+            raise_builtin(rt.type_memory_error, "list allocation failed");
+            RAISE_CHECK(false);
+        }
+    }
+    write_reg(cur->dst, Value::object(reinterpret_cast<PyObj*>(l)));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_NEW_TUPLE: {
+    auto* t = rt.new_tuple(cur->b);
+    for (std::uint32_t i = 0; i < cur->b; ++i) {
+        t->items[i] = regs[cur->a + i];
+        if (regs[cur->a + i].tag == Tag::Obj) rt.incref(regs[cur->a + i].as.obj);
+    }
+    write_reg(cur->dst, Value::object(reinterpret_cast<PyObj*>(t)));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_NEW_DICT: {
+    auto* d = rt.new_dict();
+    write_reg(cur->dst, Value::object(reinterpret_cast<PyObj*>(d)));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_LIST_APPEND: {
+    auto* l = static_cast<PyListObj*>(regs[cur->a].as.obj);
+    Value v = regs[cur->b];
+    RAISE_CHECK(l != nullptr);
+    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    RAISE_CHECK(list_push(l, v));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_CALL: {
+    Value callee = regs[cur->a];
+    Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
+    Value out;
+    RAISE_CHECK(call_value(callee, args, cur->c, out));
+    write_reg(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_CALL_KW: {
+    Value callee = regs[cur->a];
+    Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
+    std::uint32_t kwnode = cur->imm >> 16;
+    PyTupleObj* kw_names = kwnode < f.unit->n_registers &&
+                                   regs[kwnode].tag == Tag::Obj &&
+                                   regs[kwnode].as.obj &&
+                                   regs[kwnode].as.obj->tag == ObjTag::Tuple
+                               ? static_cast<PyTupleObj*>(regs[kwnode].as.obj)
+                               : nullptr;
+    std::uint32_t nkw = kw_names ? kw_names->length : 0;
+    Value out;
+    RAISE_CHECK(call_value_kw(callee, args, cur->c, kw_names, nkw, out));
+    write_reg(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_NATIVE: {
+    Value* args = cur->b > 0 ? &regs[cur->a] : nullptr;
+    Value out;
+    RAISE_CHECK(native_helper(cur->imm, args, cur->b, out));
+    write_reg(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_ITER: {
+    Value out;
+    RAISE_CHECK(get_iter(regs[cur->a], out));
+    write_reg(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_ITER_CHECK: {
+    Value it = regs[cur->a];
+    bool more = false;
+    RAISE_CHECK(iter_check(it, more));
+    write_reg(cur->dst, Value::boolean(more));
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_ITER_NEXT: {
+    Value out;
+    RAISE_CHECK(iter_next(regs[cur->a], out));
+    write_reg_owned(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_YIELD: {
+    Value v = regs[cur->a];
+    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    frame_return_ = v;
+    ++f.pc;
+    f.suspended = true;
+    return ExecStatus::Suspended;
+}
+L_JUMP: {
+    if (cur->imm <= f.pc) {
+        f.unit->backedge_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    f.pc = cur->imm;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_JUMP_IF_FALSE: {
+    if (cur->imm <= f.pc) {
+        f.unit->backedge_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool t = rt.truthy(regs[cur->a]);
+    if (!t) {
+        f.pc = cur->imm;
+    } else {
+        ++f.pc;
+    }
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_JUMP_IF_TRUE: {
+    if (cur->imm <= f.pc) {
+        f.unit->backedge_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool t = rt.truthy(regs[cur->a]);
+    if (t) {
+        f.pc = cur->imm;
+    } else {
+        ++f.pc;
+    }
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_RETURN: {
+    Value v = regs[cur->a];
+    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    frame_return_ = v;
+    return ExecStatus::Returned;
+}
+L_RAISE: {
+    Value exc = regs[cur->a];
+    if (exc.tag == Tag::Obj && exc.as.obj && exc.as.obj->tag == ObjTag::Type) {
+        // raise Class -> instantiate
+        Value inst;
+        if (!call_value(exc, nullptr, 0, inst)) {
+            return ExecStatus::Raised;
+        }
+        set_pending(inst);   // call_value returned an owned ref
+    } else {
+        if (exc.tag == Tag::Obj && exc.as.obj) rt.incref(exc.as.obj);
+        set_pending(exc);
+    }
+    if (unwind_to_handler(f)) {
+        VM_LOAD();
+        VM_DISPATCH();
+    }
+    return ExecStatus::Raised;
+}
+L_TRY_BEGIN: {
+    Frame::Handler h;
+    h.handler_pc = cur->imm;
+    // Range filled by TRY_END pairs.
+    h.try_pc_start = f.pc;
+    h.try_pc_end = 0xFFFFFFFFu;
+    // push and note: end resolved by matching TRY_END (or range table)
+    f.handlers.push_back(h);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_TRY_END: {
+    if (!f.handlers.empty()) {
+        f.handlers.back().try_pc_end = f.pc + 1;
+    }
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_GET_EXC: {
+    Value e = pending_exception_;
+    if (e.tag == Tag::Obj && e.as.obj) rt.incref(e.as.obj);
+    write_reg(cur->dst, e);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+    return ExecStatus::Raised;
+#undef VM_DISPATCH
+#undef VM_LOAD
+#undef RAISE_CHECK
+}
+// =============================================================================
+// Module & deopt entries
+// =============================================================================
+Result<Value> Vm::run_module(CodeUnit* unit) noexcept {
+    Frame f(unit);
+    ExecStatus st = exec_frame(f);
+    if (st == ExecStatus::Returned) {
+        Value v = frame_return_;
+        frame_return_ = Value::none();
+        return v;
+    }
+    if (st == ExecStatus::Suspended) {
+        return fail_msg("module toplevel cannot yield", diag_code::runtime_value_error);
+    }
+    // Uncaught exception -> Diagnostic with repr (Rule 47).
+    Value exc = take_pending();
+    stdx::small_vector<char, 128> msg;
+    Runtime& rti = Runtime::instance();
+    if (exc.tag == Tag::Obj && exc.as.obj && exc.as.obj->tag == ObjTag::Instance) {
+        auto* inst = static_cast<PyInstanceObj*>(exc.as.obj);
+        if (inst->type) {
+            std::string_view tname = global_symbols().text(inst->type->name_symbol);
+            for (char c : tname) msg.push_back(c);
+            msg.push_back(':');
+            msg.push_back(' ');
+        }
+    }
+    rti.repr_into(exc, msg);
+    msg.push_back('\0');
+    // Copy into stable storage: string_views into the stack buffer dangle
+    // once this frame returns.
+    static thread_local char stable[256];
+    std::memcpy(stable, msg.data(), msg.size() < sizeof(stable) ? msg.size() : sizeof(stable) - 1);
+    stable[msg.size() < sizeof(stable) ? msg.size() : sizeof(stable) - 1] = '\0';
+    Diagnostic d = Diagnostic::error(stable, diag_code::runtime_type_error);
+    d.fix = "Handle the exception in the program (try/except) or fix the raising site";
+    return fail(d);
+}
+bool Vm::enter_at(CodeUnit* unit, Value* regs, std::uint32_t n_regs, std::uint32_t pc,
+                  Value& out) noexcept {
+    Frame f(unit);
+    // Transfer owned refs into the frame's register file.
+    for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+        f.regs[i] = regs[i];
+    }
+    f.pc = pc;
+    ExecStatus st = exec_frame(f);
+    if (st == ExecStatus::Returned) {
+        out = frame_return_;
+        frame_return_ = Value::none();
+        return true;
+    }
+    return false;
+}
+}  // namespace abi_v1
+}  // namespace vortex::rt

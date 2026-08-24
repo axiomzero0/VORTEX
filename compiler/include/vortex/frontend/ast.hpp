@@ -32,7 +32,7 @@ using vortex::SymbolId;
 enum class ExprKind : std::uint8_t {
     Name, IntLit, FloatLit, StrLit, BoolLit, NoneLit,
     BinOp, UnaryOp, BoolOp, Compare, Call, Attribute, Subscript,
-    ListLit, TupleLit, DictLit, ListComp, Lambda, IfExp, Yield,
+    ListLit, TupleLit, DictLit, ListComp, Lambda, IfExp, Yield, SliceLit,
 };
 
 enum class StmtKind : std::uint8_t {
