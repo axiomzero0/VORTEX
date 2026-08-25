@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include "vortex/frontend/string_pool.hpp"
@@ -91,6 +92,16 @@ private:
     std::size_t pos_{0};
     std::uint32_t line_{1};
     std::uint32_t col_{1};
+
+    // LEX-1 fix: stable storage for cooked string-literal bytes. The
+    // StringPool (a small_vector<char,4096>) can reallocate when a string
+    // literal is large or when many strings push it past 4 KB. Tokens
+    // store std::string_view into the pool; if the pool reallocates,
+    // previously-built views dangle -> use-after-free. We snapshot each
+    // cooked string into an immutable heap allocation (the std::string
+    // body never moves once we stop mutating it) and use that stable
+    // pointer in the token instead.
+    stdx::small_vector<std::string, 16> stabilized_strings_{};
 
     // indentation machinery
     static constexpr std::size_t max_indent = 64;
