@@ -110,15 +110,17 @@ Result<Stmt*> Parser::parse_statement() noexcept {
         case TokKind::KwFor: return parse_for();
         case TokKind::KwTry: return parse_try();
         case TokKind::At: {
-            // subset: decorators parsed and discarded (documented deviation).
+            // PAR-1 fix: decorator must be followed by a newline, then def/class.
+            // The previous code REJECTED @dec\n (newline after decorator)
+            // and ACCEPTED @dec def (no newline) — backwards. Python grammar
+            // requires the decorator on its own line, then def/class on the
+            // next line. Each decorator ends with a newline.
             while (accept(TokKind::At)) {
                 Result<Expr*> dec = parse_atom_with_trailers();
                 if (!dec) return std::unexpected(dec.error());
-                if (check(TokKind::Newline)) {
-                    return fail_msg(
-                        "parse: bare decorated line (subset: decorator must precede def/class)",
-                        diag_code::parse_unexpected_token);
-                }
+                // Each decorator must end with a newline.
+                auto nl = expect(TokKind::Newline, "newline after decorator");
+                if (!nl) return std::unexpected(nl.error());
             }
             if (check(TokKind::KwDef)) return parse_function_def();
             if (check(TokKind::KwClass)) return parse_class_def();
@@ -165,6 +167,8 @@ Result<Stmt*> Parser::parse_function_def() noexcept {
     auto lp = expect(TokKind::LParen, "'(' after function name");
     if (!lp) return std::unexpected(lp.error());
     bool first = true;
+    bool seen_star_args = false;   // PAR-6: track *args for kw-only detection
+    bool seen_kwargs = false;     // PAR-5: **kwargs must be last
     while (!check(TokKind::RParen)) {
         if (!first) {
             auto comma = expect(TokKind::Comma, "',' between parameters");
@@ -173,18 +177,40 @@ Result<Stmt*> Parser::parse_function_def() noexcept {
         first = false;
         if (check(TokKind::Star)) {
             advance();
-            if (fn->has_kwargs) {
+            // PAR-7 fix: bare '*' without a name is rejected (Python uses
+            // it to mark subsequent params as keyword-only; subset rejects
+            // it instead of silently setting has_varargs with no name).
+            if (!check(TokKind::Ident) && check(TokKind::Comma)) {
+                return fail_msg("parse: bare '*' without name is outside the VORTEX subset",
+                                diag_code::parse_unexpected_token);
+            }
+            if (fn->has_kwargs || seen_kwargs) {
                 return fail_msg("parse: *args after **kwargs", diag_code::parse_unexpected_token);
             }
             if (check(TokKind::Ident)) fn->params.push_back(intern_tok(advance()));
             fn->has_varargs = true;
+            seen_star_args = true;
             continue;
         }
         if (check(TokKind::StarStar)) {
             advance();
+            // PAR-8 fix: bare '**' without a name is rejected.
+            if (!check(TokKind::Ident) && (check(TokKind::Comma) || check(TokKind::RParen))) {
+                return fail_msg("parse: bare '**' without name is outside the VORTEX subset",
+                                diag_code::parse_unexpected_token);
+            }
+            if (seen_kwargs) {
+                return fail_msg("parse: duplicate **kwargs", diag_code::parse_unexpected_token);
+            }
             if (check(TokKind::Ident)) fn->params.push_back(intern_tok(advance()));
             fn->has_kwargs = true;
+            seen_kwargs = true;
             continue;
+        }
+        // PAR-5 fix: positional parameter after **kwargs is rejected.
+        if (seen_kwargs) {
+            return fail_msg("parse: parameter after **kwargs is not allowed",
+                            diag_code::parse_unexpected_token);
         }
         auto p = expect(TokKind::Ident, "parameter name");
         if (!p) return std::unexpected(p.error());
@@ -197,6 +223,10 @@ Result<Stmt*> Parser::parse_function_def() noexcept {
             return fail_msg("parse: non-default parameter after default parameter",
                             diag_code::parse_unexpected_token);
         }
+        // (PAR-6 subset note: params after *args are keyword-only in Python.
+        // We accept them as positional-with-keyword-default; the runtime's
+        // bind_parameters honors has_varargs/has_kwargs for the call-site
+        // contract. Full kw-only enforcement is a future improvement.)
     }
     auto rp = expect(TokKind::RParen, "')' closing parameter list");
     if (!rp) return std::unexpected(rp.error());
@@ -1012,11 +1042,28 @@ Result<Expr*> Parser::parse_comprehension_tail(Expr* elt, bool genexp) noexcept 
         Result<Expr*> iter = parse_or();
         if (!iter) return std::unexpected(iter.error());
         clause.iter = *iter;
+        // PAR-10 fix: multiple if-clauses per for are accepted
+        // (Python: [x for x in xs if c1 if c2] == [x for x in xs if c1 and c2]).
+        // We chain them as nested IfExp conds by re-using the same `cond` slot
+        // with a synthetic BoolOp(And). Simpler: just take the LAST if as
+        // the cond and chain subsequent ifs as nested BoolOp(And) into it.
         if (check(TokKind::KwIf)) {
             advance();
-            Result<Expr*> c = parse_or();
+            // PAR-9 fix: use parse_expr (allows lambda in if-cond) instead
+            // of parse_or (which stops at lambda keyword).
+            Result<Expr*> c = parse_expr();
             if (!c) return std::unexpected(c.error());
             clause.cond = *c;
+            while (check(TokKind::KwIf)) {
+                advance();
+                Result<Expr*> c2 = parse_expr();
+                if (!c2) return std::unexpected(c2.error());
+                Expr* and_op = new_expr(ExprKind::BoolOp, (*c)->line);
+                and_op->op = bool_and;
+                and_op->args.push_back(clause.cond);
+                and_op->args.push_back(*c2);
+                clause.cond = and_op;
+            }
         }
         clauses.push_back(clause);
         if (check(TokKind::KwFor)) {
@@ -1146,7 +1193,14 @@ Result<Expr*> Parser::parse_atom() noexcept {
             if (!first) return std::unexpected(first.error());
             if (check(TokKind::KwFor)) {
                 advance();
-                return parse_comprehension_tail(*first, true);   // generator expression
+                Result<Expr*> g = parse_comprehension_tail(*first, true);
+                if (!g) return std::unexpected(g.error());
+                // PAR-3 fix: a generator expression in parens must consume
+                // the closing ')'. parse_comprehension_tail returns without
+                // consuming the paren for genexp-in-parens.
+                auto rp = expect(TokKind::RParen, "')' closing generator expression");
+                if (!rp) return std::unexpected(rp.error());
+                return g;
             }
             if (check(TokKind::Comma)) {
                 Result<Expr*> tup = parse_tuple_tail(*first);
