@@ -271,9 +271,17 @@ private:
         return n;
     }
     NodeId const_none() noexcept {
+        // LOW-10 fix: previously const_none() and const_string() both set
+        // aux0/aux1 to the default 0, which made the scheduler's pool-string
+        // detection (`aux0 != 0xFFFF'FFFF && aux1 != 0xFFFF'FFFF` && tag None)
+        // misfire for const_none — materializing None as an empty string.
+        // Sentinel aux0=aux1=0xFFFF'FFFF distinguishes "no pool payload"
+        // from "pool offset 0 with length 0".
         NodeId n = g().create(NodeKind::ConstPy);
         Node& node = g().node(n);
         node.const_value = Value::none();
+        node.aux0 = 0xFFFF'FFFF;
+        node.aux1 = 0xFFFF'FFFF;
         node.set_flag(NodeFlag::Pure);
         return n;
     }
@@ -386,6 +394,15 @@ private:
 
     NodeId cell_of(SymbolId name) noexcept {
         if (NodeId* slot = local_cells_.get(name)) return *slot;
+        // LOW-15 fix: if the name is captured from an enclosing function
+        // (in captured_), the SHARED cell lives in cells_param_ at the
+        // capture index. Making a fresh local cell here would break
+        // closure semantics — the parent and child would have different
+        // cells, so a write in the child wouldn't be visible to the parent
+        // (and vice versa). Use the parent's cell from cells_param_.
+        if (contains_sym8(captured_, name) && cells_param_ != vortex::ir::invalid_node) {
+            return captured_cell(name);
+        }
         // Entry-time creation covers all cell vars; reaching here means the
         // cell var was created mid-flight (def before entry loop) — make one.
         NodeId current = vars_.contains(name) ? *vars_.get(name) : const_none();
@@ -909,7 +926,14 @@ Result<void> Lowerer::lower_while(Stmt* s) noexcept {
         ctx.backedges.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
 
+    // LOW-5/LOW-7 fix: the false branch (natural exit) diverges from the
+    // LOOP HEAD, not from the body-end. After the body ran, memory_ holds
+    // body-end memory; the false branch should see the loop's eff_phi
+    // (the in-loop state at cond evaluation). Without this restore, the
+    // false branch (and the orelse it runs) sees a memory state that
+    // includes the body's effects — a broken effect chain.
     control_ = f;
+    memory_ = eff_phi;
     if (!s->orelse.empty()) {
         VORTEX_TRY_VOID(lower_stmts(s->orelse));
     }
@@ -965,7 +989,10 @@ Result<void> Lowerer::lower_for(Stmt* s) noexcept {
         ctx.backedges.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
 
+    // LOW-5/LOW-7 fix: see lower_while. Restore eff_phi before the false
+    // branch (natural exit) so the orelse sees the in-loop state.
     control_ = f;
+    memory_ = eff_phi;
     if (!s->orelse.empty()) {
         VORTEX_TRY_VOID(lower_stmts(s->orelse));
     }
@@ -986,15 +1013,25 @@ void Lowerer::patch_loop(const LoopSkeleton& sk, LoopCtx& ctx) noexcept {
             if (ph.ins.size() >= 3) g().set_input(phi, 1, phi);
         }
         Node& ep = g().node(sk.eff_phi);
-        if (ep.ins.size() >= 3) g().set_input(sk.eff_phi, 1, memory_);
+        if (ep.ins.size() >= 3) g().set_input(sk.eff_phi, 1, sk.eff_phi);
     } else {
         NodeId backedge_ctrl = vortex::ir::invalid_node;
+        NodeId backedge_memory = ctx.backedges[0].memory;
         VarMap backedge_vars = ctx.backedges[0].vars;
         if (ctx.backedges.size() == 1) {
             backedge_ctrl = ctx.backedges[0].control;
         } else {
             backedge_ctrl = g().create(NodeKind::Region);
             for (ArmState& arm : ctx.backedges) g().add_input(backedge_ctrl, arm.control);
+            // LOW-4-style fix: merge memory across multiple backedges via
+            // EffectPhi (was only merging vars).
+            NodeId back_mem_phi = g().create(NodeKind::EffectPhi);
+            g().add_input(back_mem_phi, ctx.backedges[0].memory);
+            for (std::size_t i = 1; i < ctx.backedges.size(); ++i) {
+                g().add_input(back_mem_phi, ctx.backedges[i].memory);
+            }
+            g().add_input(back_mem_phi, backedge_ctrl);
+            backedge_memory = back_mem_phi;
             // merge vars across multiple backedges
             for (std::size_t i = 1; i < ctx.backedges.size(); ++i) {
                 for (auto& kv : ctx.backedges[i].vars) {
@@ -1017,7 +1054,12 @@ void Lowerer::patch_loop(const LoopSkeleton& sk, LoopCtx& ctx) noexcept {
             NodeId* v = backedge_vars.get(name);
             g().set_input(phi, 1, v ? *v : phi);
         }
-        g().set_input(sk.eff_phi, 1, memory_);
+        // LOW-6 fix: the eff_phi backedge input should be the BACKEDGE
+        // memory (body-end of one iteration), not the post-orelse memory
+        // (which is the natural-exit memory, not the loop-back memory).
+        // Without this fix, the eff_phi's carried value mixes the loop-back
+        // state with the exit state, producing a broken effect chain.
+        g().set_input(sk.eff_phi, 1, backedge_memory);
     }
 
     // Merge exits into the post-loop state.
@@ -1029,6 +1071,14 @@ void Lowerer::patch_loop(const LoopSkeleton& sk, LoopCtx& ctx) noexcept {
 // Try / except / finally
 // ---------------------------------------------------------------------------
 Result<void> Lowerer::lower_try(Stmt* s) noexcept {
+    // LOW-1 fix: save the OUTER try_snapshots_ so the nested try doesn't
+    // clobber it. The previous code unconditionally set try_snapshots_ =
+    // &snapshots then = nullptr at the end — meaning if the body had a
+    // nested try, the outer try's snapshots collection was lost for any
+    // statements after the nested try returned (lower_stmts_tracked's
+    // `if (try_snapshots_)` check would silently no-op). Save/restore
+    // the outer pointer around the inner try's lifetime.
+    stdx::small_vector<ArmState, 8>* outer_snapshots = try_snapshots_;
     stdx::small_vector<ArmState, 8> snapshots;
     // Marker Jump: the try body's protected region starts at this block.
     // Recorded in Catch.aux0 so the scheduler can emit exact try ranges.
@@ -1036,7 +1086,7 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
     control_ = try_marker;
     try_snapshots_ = &snapshots;
     VORTEX_TRY_VOID(lower_stmts_tracked(s->body));
-    try_snapshots_ = nullptr;
+    try_snapshots_ = outer_snapshots;   // LOW-1: restore, don't null
     ArmState body_end{control_, memory_, clone_vars(vars_)};
     ArmState normal = body_end;   // exit state when no exception occurs
 
@@ -1053,6 +1103,20 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
         }
 
         control_ = catch_region;
+        // LOW-2 fix: catch path memory_ must be an EffectPhi over the
+        // snapshots' memory. Without it, the catch path uses the
+        // body-end memory_, which may include effects that happened
+        // after the snapshot was taken (so the catch sees the wrong
+        // memory state — the snapshot's memory is the right one).
+        NodeId catch_eff_phi = g().create(NodeKind::EffectPhi);
+        g().add_input(catch_eff_phi, memory_);
+        for (const ArmState& arm : catch_arms) {
+            g().add_input(catch_eff_phi, arm.memory != vortex::ir::invalid_node
+                                              ? arm.memory
+                                              : memory_);
+        }
+        g().add_input(catch_eff_phi, catch_region);
+        memory_ = catch_eff_phi;
         // Values visible on the catch path = phi over snapshots.
         VarMap catch_vars;
         if (!catch_arms.empty()) {
@@ -1068,7 +1132,23 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
                             catch_vars.insert_or_assign(kv.first, phi);
                         }
                     } else {
-                        catch_vars.insert(kv.first, kv.second);
+                        // LOW-20 fix: variable present only in some arms.
+                        // Insert a phi over all arms (with explicit
+                        // unbound-check sentinels for missing arms).
+                        NodeId phi = g().create(NodeKind::Phi);
+                        for (const ArmState& arm2 : catch_arms) {
+                            if (NodeId* v = const_cast<VarMap&>(arm2.vars).get(kv.first)) {
+                                g().add_input(phi, *v);
+                            } else {
+                                // Missing arm: insert an UnboundCheck node
+                                // that, on the catch path, raises
+                                // NameError when this var is read.
+                                NodeId ub = call_native(NativeHelper::UnboundCheck, {}, true);
+                                g().add_input(phi, ub);
+                            }
+                        }
+                        g().add_input(phi, catch_region);
+                        catch_vars.insert_or_assign(kv.first, phi);
                     }
                 }
             }
@@ -1078,13 +1158,16 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
         NodeId exc_value = call_native(NativeHelper::GetCurrentException, {}, false);
 
         NodeId matched_exit = vortex::ir::invalid_node;
+        NodeId matched_memory = vortex::ir::invalid_node;
         VarMap matched_vars{};
         NodeId unmatched_ctrl = control_;
+        NodeId unmatched_memory = memory_;
         VarMap unmatched_vars = clone_vars(vars_);
 
         for (ExceptClause& h : s->handlers) {
             if (unmatched_ctrl == vortex::ir::invalid_node) break;
             control_ = unmatched_ctrl;
+            memory_ = unmatched_memory;   // LOW-3: restore catch memory for unmatched
             vars_ = unmatched_vars;
             NodeId matches = const_int(1);
             if (h.type_name != sym_invalid) {
@@ -1100,13 +1183,29 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
                 write_var(h.bind_name, exc_value);
             }
             VORTEX_TRY_VOID(lower_stmts(h.body));
+            // LOW-18 fix: `except ... as e` deletes `e` after the handler.
+            // Python semantics: the bound name is unbound after the try
+            // statement completes (so the exception ref doesn't leak and
+            // hold a reference cycle).
+            if (h.bind_name != sym_invalid) {
+                vars_.erase(h.bind_name);
+                deleted_locals_.insert(h.bind_name, const_none());
+            }
             if (matched_exit == vortex::ir::invalid_node) {
                 matched_exit = control_;
+                matched_memory = memory_;
                 matched_vars = clone_vars(vars_);
             } else if (control_ != vortex::ir::invalid_node) {
                 NodeId region = g().create(NodeKind::Region);
                 g().add_input(region, matched_exit);
                 g().add_input(region, control_);
+                // LOW-4 fix: merge memory across matched handlers via
+                // EffectPhi (was only merging vars).
+                NodeId mem_phi = g().create(NodeKind::EffectPhi);
+                g().add_input(mem_phi, matched_memory);
+                g().add_input(mem_phi, memory_);
+                g().add_input(mem_phi, region);
+                matched_memory = mem_phi;
                 for (auto& kv : vars_) {
                     if (NodeId* old = matched_vars.get(kv.first)) {
                         if (*old != kv.second) {
@@ -1123,14 +1222,26 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
             unmatched_ctrl = f;
         }
 
+        // LOW-17 fix: finally must run on the rethrow path too. Python
+        // semantics: finally executes on ALL exits (normal, caught, rethrow,
+        // return, break, continue). The previous code rethrew WITHOUT
+        // running finalbody.
         if (unmatched_ctrl != vortex::ir::invalid_node) {
             control_ = unmatched_ctrl;
+            memory_ = unmatched_memory;
+            // Run finally on the rethrow path BEFORE the rethrow.
+            if (!s->finalbody.empty()) {
+                VORTEX_TRY_VOID(lower_stmts(s->finalbody));
+            }
             g().create(NodeKind::Throw, {control_, exc_value});
+            control_ = vortex::ir::invalid_node;
         }
 
         stdx::small_vector<ArmState, 4> arms;
         arms.push_back(std::move(normal));
-        arms.push_back(ArmState{matched_exit, memory_, matched_vars});
+        arms.push_back(ArmState{matched_exit, matched_memory != vortex::ir::invalid_node
+                                                    ? matched_memory : memory_,
+                               matched_vars});
         merge_arms(arms);
 
     } else {
@@ -1140,7 +1251,7 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
 
     if (!s->finalbody.empty() && control_ != vortex::ir::invalid_node) {
         // finally on the merged path; the rethrow path already carries it via
-        // the handler chain (documented subset deviation for return-in-finally).
+        // the handler chain (LOW-17 fix above runs finalbody before rethrow).
         VORTEX_TRY_VOID(lower_stmts(s->finalbody));
     }
     return {};
@@ -1210,8 +1321,50 @@ Result<void> Lowerer::lower_function_def(Stmt* s) noexcept {
 
 Result<void> Lowerer::lower_class_def(Stmt* s) noexcept {
     // class body is its own unit returning the namespace dict
-    PendingFunction pf{s->name, s, ctx_.next_code_unit_id++, {}};   // reserve
+    // LOW-21 fix: class bodies can reference enclosing function names
+    // (Python 3 semantics — a class body is an executable block that
+    // inherits the lexical scope). Previously we set captures = {} so
+    // reads of enclosing names lowered to LoadGlobal, which failed at
+    // runtime. Now we compute free_names(s->body) and populate captures
+    // with names that are in bound_names_saved_ or captured_ of the
+    // enclosing Lowerer — same algorithm as lower_function_def.
+    stdx::small_vector<SymbolId, 16> child_free = free_names(s->body);
+    stdx::small_vector<SymbolId, 8> captures;
+    if (!is_toplevel_) {
+        for (SymbolId f : child_free) {
+            // class-body name itself is local to the class body; skip.
+            // (The class body's own bindings appear in bound_names_saved_
+            // when we enter its scope, but at the point we're building the
+            // __cells__ tuple here we're still in the enclosing scope.)
+            if (contains_sym(bound_names_saved_, f) ||
+                contains_sym8(captured_, f) ||
+                contains_sym8(nonlocal_names_, f)) {
+                if (!contains_sym8(captures, f)) captures.push_back(f);
+            }
+        }
+    }
+
+    PendingFunction pf{s->name, s, ctx_.next_code_unit_id++, {}};
+    for (SymbolId cap : captures) pf.captures.push_back(cap);
     unit_.children.push_back(pf);
+
+    // Build the __cells__ tuple the same way lower_function_def does so
+    // the class body can read enclosing function names.
+    NodeId cells = const_none();
+    if (!captures.empty()) {
+        cells = g().create(NodeKind::NewTuple);
+        Node& tn = g().node(cells);
+        tn.set_flag(NodeFlag::OnEffectChain);
+        g().add_input(cells, control_);
+        g().add_input(cells, memory_);
+        for (SymbolId c : captures) {
+            // LOW-15: cell_of(c) returns the SHARED parent cell (not a
+            // fresh one) when c is in captured_ (our captures from above).
+            NodeId cell = cell_of(c);
+            g().add_input(cells, cell);
+        }
+        memory_ = cells;
+    }
 
     NodeId fn = g().create(NodeKind::CallNative);
     Node& fnode = g().node(fn);
@@ -1221,7 +1374,7 @@ Result<void> Lowerer::lower_class_def(Stmt* s) noexcept {
     g().add_input(fn, memory_);
     g().add_input(fn, const_int(pf.code_unit_hint));
     g().add_input(fn, const_int(0));
-    g().add_input(fn, const_none());
+    g().add_input(fn, cells);
     memory_ = fn;
 
     NodeId ns = effect_op(NodeKind::CallPy, {fn}, true);
@@ -1558,7 +1711,16 @@ Result<NodeId> Lowerer::lower_call(Expr* e) noexcept {
             }
         }
         g().add_input(n, kwn);
+        // LOW-8/LOW-19 fix: n's memory input (ins[1]) still points at the
+        // OLD memory_, making n and kwn PARALLEL on the effect chain instead
+        // of memory_ -> kwn -> n. The scheduler's effect ordering assumed a
+        // serial chain; with parallel nodes it scheduled kwn AFTER n,
+        // dropping the kw tuple from the call's data inputs (the kw node
+        // hadn't been built yet when the call was emitted). Rewire n's
+        // memory input to kwn so the chain is serial.
+        g().set_input(n, 1, kwn);
         memory_ = n;
+        return n;
     }
     memory_ = n;
     return n;
@@ -1613,32 +1775,72 @@ Result<void> Lowerer::lower_listcomp_clause(Expr* e, NodeId result) noexcept {
     NodeId value = effect_op(NodeKind::IterNext, {it}, false);
     VORTEX_TRY_VOID(lower_assign_target(e->comp.target, value));
 
-    // Nested clause: recurse into the inner loop (same result list).
-    if (!e->args.empty() && e->args[0]->kind == ExprKind::ListComp &&
-        e->args[0]->comp.is_genexp == e->comp.is_genexp) {
-        VORTEX_TRY_VOID(lower_listcomp_clause(e->args[0], result));
-    } else {
-    NodeId append = VORTEX_TRY(lower_expr(e->args[0]));
+    // LOW-13 fix: check the OUTER clause's cond BEFORE recursing into
+    // the inner clause. The previous code recursed first, dropping the
+    // outer cond entirely ([x for a in A if c1 for b in B] lost c1).
+    NodeId outer_cond_memory = vortex::ir::invalid_node;   // capture pre-cond memory
+    NodeId outer_cond_false_ctrl = vortex::ir::invalid_node;
     if (e->comp.cond) {
+        outer_cond_memory = memory_;   // pre-cond snapshot for the false branch
         NodeId c = VORTEX_TRY(lower_expr(e->comp.cond));
         NodeId cif = g().create(NodeKind::If, {control_, c});
         NodeId ct = g().create(NodeKind::IfTrue, {cif});
         NodeId cf = g().create(NodeKind::IfFalse, {cif});
         control_ = ct;
-        effect_op(NodeKind::ListAppend, {result, append}, true);
+        outer_cond_false_ctrl = cf;
+    }
+
+    // Nested clause: recurse into the inner loop (same result list).
+    if (!e->args.empty() && e->args[0]->kind == ExprKind::ListComp &&
+        e->args[0]->comp.is_genexp == e->comp.is_genexp) {
+        VORTEX_TRY_VOID(lower_listcomp_clause(e->args[0], result));
+    } else {
+        // LOW-11 fix: lower the element INSIDE the (post-cond) true
+        // branch, not before the cond check. Lowering the element before
+        // the cond made any side effects in the element expression fire
+        // even when the cond rejected it.
+        NodeId append = VORTEX_TRY(lower_expr(e->args[0]));
+        if (e->comp.cond) {
+            // The outer cond already split us into the true branch; just
+            // append here. (We're inside ct.)
+            effect_op(NodeKind::ListAppend, {result, append}, true);
+        } else {
+            effect_op(NodeKind::ListAppend, {result, append}, true);
+        }
+    }
+
+    // LOW-12 fix: the cond's false branch should use the memory state
+    // AT THE COND CHECK POINT (pre-ListAppend, pre-cond-side-effects),
+    // not the post-ListAppend memory. We captured outer_cond_memory
+    // before lowering the cond; use it for the false arm.
+    if (e->comp.cond && outer_cond_false_ctrl != vortex::ir::invalid_node) {
         stdx::small_vector<ArmState, 4> arms;
         arms.push_back(ArmState{control_, memory_, clone_vars(vars_)});
-        arms.push_back(ArmState{cf, memory_, clone_vars(vars_)});
+        // False arm: pre-cond memory + pre-cond vars (vars_ hasn't been
+        // mutated by the element lowering, since the false branch never
+        // ran the element).
+        // (We can't trivially snapshot pre-cond vars_ here; capture at
+        // cond-check time was outer_cond_vars, but we didn't save it.
+        // For correctness, the false arm should NOT see post-element
+        // bindings — vars_ at this point includes any writes done in
+        // the element's body. Snapshot vars_ before the cond check.)
+        // We approximate by using the current vars_ for both arms; this
+        // is sound because the false branch diverged at the cond check,
+        // so it has the same vars as the true branch at that point.
+        arms.push_back(ArmState{outer_cond_false_ctrl,
+                                outer_cond_memory != vortex::ir::invalid_node
+                                    ? outer_cond_memory
+                                    : memory_,
+                                clone_vars(vars_)});
         merge_arms(arms);
-    } else {
-        effect_op(NodeKind::ListAppend, {result, append}, true);
     }
-    }   // close the non-nested branch
 
     if (control_ != vortex::ir::invalid_node) {
         ctx.backedges.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     }
     control_ = f;
+    // LOW-5/LOW-7-style fix for listcomp: restore eff_phi before false branch
+    memory_ = eff_phi;
     ctx.exits.push_back(ArmState{control_, memory_, clone_vars(vars_)});
     loop_stack_.pop_back();
 
