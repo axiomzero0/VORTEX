@@ -582,6 +582,7 @@ void install_builtins(Program& program) noexcept {
     }
 }
 void set_vm_for_builtins(Vm* vm) noexcept { g_vm = vm; }
+Vm* active_vm() noexcept { return g_vm; }
 PyModuleObj* load_native_module(std::uint32_t name_symbol) noexcept {
     Runtime& rt = Runtime::instance();
     std::string_view name = global_symbols().text(name_symbol);

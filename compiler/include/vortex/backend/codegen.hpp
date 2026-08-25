@@ -25,6 +25,7 @@
 #include "vortex/backend/lowering.hpp"
 #include "vortex/backend/mir.hpp"
 #include "vortex/backend/regalloc.hpp"
+#include "vortex/common/value.hpp"
 
 namespace vortex::backend {
 
@@ -48,8 +49,15 @@ struct CompiledCode {
     bool valid{false};
 };
 
-/// Entry-point signature the runtime calls: void jit(Value* regs).
-using JitEntryFn = void (*)(void* regs);
+/// Entry-point signature the runtime calls. SysV return convention for a
+/// 16-byte POD: tag word in RAX, payload in RDX — exactly what the JIT's
+/// RET path loads from home slot 0. Calling convention:
+///   RDI = Value* regs   (the Tier-0 register file — home slots)
+///   RAX (return) = result tag word
+///   RDX (return) = result payload
+/// The runtime transfers ownership of the regs array to the JIT; the JIT
+/// transfers it back via the deopt/bridge path if it can't complete.
+using JitEntryFn = vortex::Value (*)(void* regs);
 
 /// Pass 54/55 driver: lower -> allocate -> emit.
 [[nodiscard]] CompiledCode compile_unit(const ir::Graph& g, std::uint32_t unit_id,

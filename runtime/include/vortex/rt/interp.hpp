@@ -132,6 +132,11 @@ void install_builtins(Program& program) noexcept;
 /// Bind the active VM for builtins needing call-backs (map/filter/next).
 void set_vm_for_builtins(Vm* vm) noexcept;
 
+/// Access the active VM (set by set_vm_for_builtins). Used by the JIT
+/// deopt/bridge entry points (deopt.cpp, jit.cpp) to find the CodeUnit
+/// and call enter_at on guard failure / dynamic-op fallback.
+[[nodiscard]] Vm* active_vm() noexcept;
+
 /// Load a native module by name (math / time / random); null if unknown.
 [[nodiscard]] PyModuleObj* load_native_module(std::uint32_t name_symbol) noexcept;
 

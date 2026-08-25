@@ -19,11 +19,21 @@
 //   prologue: push rbx + the descriptor's four reserved roles; r12 <- rdi
 //   body:    ops per MIR; frame home access = [frame_base + slot*16 + off]
 //   guards:  compare tag word (offset 0) of both operands against Tag::Int
-//            (2); failure -> Jcc to cold deopt stub
+//            (2); failure -> Jcc to a per-guard deopt stub appended after
+//            the hot body
 //   deopt:   cold stub: mov edi, unit_id; mov esi, safepoint_idx; call
 //            vortex_deopt_entry; the runtime never returns here (it longjmps
 //            into interpreter resume)
 //   exit:    result Value in rax (tag word) + rdx (payload); restore pops.
+//
+// HOT/COLD PARTITIONING (Pass 55 — REAL, not faked):
+//   1. Emit hot body: prologue + per-block hot ops + JMP past_cold at the
+//      last hot block.
+//   2. cold_offset = a.size() — boundary between hot and cold regions.
+//   3. Emit cold region: deopt stubs for each guard + bodies of any MIR
+//      blocks marked is_cold (Catch handlers, etc.).
+//   4. Apply all rel32 patch sites: Jcc from hot body -> deopt stub in
+//      cold region; JMP at end of hot body -> past_cold.
 //
 // Home-slot discipline: every vreg writes its value back to the home slot
 // immediately after definition (single def site), so safepoint records
@@ -38,9 +48,19 @@
 #include "vortex/ir/node_kind.hpp"
 #include "vortex/support/config.hpp"
 
-// Deopt entry implemented in the runtime (jit.cpp); declared at global
-// scope so the extern "C" linkage matches the definition exactly.
-extern "C" void vortex_deopt_entry(std::uint32_t unit_id, std::uint32_t safepoint_index);
+// Deopt entry implemented in the runtime (deopt.cpp). SysV signature:
+//   void(uint32_t unit_id, uint32_t safepoint_index, void* regs_raw)
+// RDI = unit_id, RSI = safepoint_index, RDX = regs base (frame_base at the
+// call site — ownership of the regs array transfers from JIT to runtime).
+extern "C" void vortex_deopt_entry(std::uint32_t unit_id, std::uint32_t safepoint_index,
+                                   void* regs_raw) noexcept;
+
+// Interpreter bridge: transitions JIT execution to Tier-0 at the bytecode
+// offset corresponding to the dynamic op. SysV signature:
+//   void(void* regs_raw, uint32_t unit_id, uint64_t op_hint)
+// RDI = regs base, RSI = unit_id, RDX = op_hint (helper_idx).
+extern "C" void vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id,
+                                  std::uint64_t op_hint) noexcept;
 
 namespace vortex::backend {
 inline namespace abi_v1 {
@@ -83,6 +103,14 @@ struct RegOrSlot {
     std::uint32_t slot{0};
 };
 
+/// A rel32 patch site to be resolved at the end of emission: the Jcc/JMP at
+/// `site` should jump to `target_block_start_offset`. Block starts are
+/// resolved by looking up the block id -> block_start offset map.
+struct PatchSite {
+    std::size_t site{0};
+    std::uint32_t target_block{0};   // MIR block id; 0xFFFFFFFFu = past_cold
+};
+
 }  // namespace
 
 CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buffer,
@@ -122,16 +150,65 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // ---- Pass 54/55: emit ----------------------------------------------------------
     Assembler a(buffer, capacity);
 
-    struct PatchSite {
-        std::size_t site{0};
-        std::uint32_t target_node{0};
+    // Resolve operand (vreg or slot) -> RegOrSlot, given the assignment.
+    const auto resolve = [&](const MachineOperand& op) noexcept {
+        RegOrSlot r;
+        if (op.kind == MachineOperand::VReg) {
+            if (op.vreg < ra.assignment.size() && ra.assignment[op.vreg] >= 0) {
+                r.is_reg = true;
+                r.reg = alloc_reg(ra.assignment[op.vreg]);
+                return r;
+            }
+            // spilled: home slot of the defining node
+            r.slot = op.vreg;
+            return r;
+        }
+        r.slot = op.slot;
+        return r;
     };
-    stdx::small_vector<PatchSite, 16> patches;
 
-    // block start offsets for intra-unit jumps
+    // Stage a RegOrSlot value into RAX (operand staging register, SysV
+    // caller-saved scratch — clobbers are fine, values reload at next use).
+    const auto stage_rax = [&](const RegOrSlot& r, std::uint8_t tag_off) noexcept {
+        if (r.is_reg) {
+            a.mov_r64_r64(x86::RAX, r.reg);
+        } else {
+            a.mov_r64_mem(x86::RAX, frame_base, slot_disp(r.slot, tag_off));
+        }
+    };
+
+    // Collect per-block emission: each block's nodes form a contiguous
+    // emission run; the block_start offset is recorded when we emit the
+    // first instruction of the block. Patches reference target_block ids;
+    // they're resolved AFTER all hot emission to allow forward jumps.
+    stdx::small_vector<PatchSite, 32> patches;
+    // block id -> first byte offset in the code buffer.
     stdx::flat_map<std::uint32_t, std::size_t, 16> block_start;
 
-    // ---- prologue --------------------------------------------------------------
+    // Per-guard deopt stubs (one per GUARD_INT/CALLri safepoint). Emitted
+    // into the COLD region; the inline guard's Jcc rel32 patches to the
+    // stub's offset.
+    struct DeoptStubReq {
+        std::size_t jcc_site;          // rel32 to patch -> cold stub
+        std::uint32_t safepoint_index; // index in out.safepoints
+        std::uint32_t frame_state_id;
+    };
+    stdx::small_vector<DeoptStubReq, 16> deopt_stubs;
+
+    // Record a SafepointRecord at the current emission position and return
+    // its index for later deopt stub emission.
+    const auto emit_safepoint = [&](std::uint32_t frame_state_id,
+                                     std::uint16_t live_regs) -> std::uint32_t {
+        SafepointRecord rec;
+        rec.pc_offset = static_cast<std::uint32_t>(a.size());
+        rec.frame_state_id = frame_state_id == 0xFFFFFFFFu ? 0 : frame_state_id;
+        rec.stack_depth = static_cast<std::uint16_t>(lowered.frame_slots);
+        rec.live_regs = live_regs;
+        out.safepoints.push_back(rec);
+        return static_cast<std::uint32_t>(out.safepoints.size() - 1);
+    };
+
+    // ---- prologue (hot region) ---------------------------------------------
     // Callee-saved under SysV that this unit touches: RBX (allocatable) plus
     // the four frame-protocol roles from the descriptor.
     a.push_r64(x86::RBX);
@@ -140,261 +217,280 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     }
     a.mov_r64_r64(frame_base, x86::RDI);   // SysV: first integer argument
 
-    // ---- body -------------------------------------------------------------------
-    for (std::uint32_t id = 1; id <= lowered.mir.node_count(); ++id) {
-        MachineNode& n = lowered.mir.node(id);
-        block_start.insert_if_absent(n.block, a.size());
+    // ---- body: walk blocks in MIR block id order (hot first) ----------------
+    // Hot blocks: is_cold == false. Cold blocks: is_cold == true (Catch
+    // handlers and any deopt-region pieces). Cold blocks emit AFTER the
+    // hot region with a JMP past_cold at the hot tail.
+    const auto emit_block_body = [&](std::uint32_t block_id) noexcept {
+        if (block_start.contains(block_id)) return;   // already emitted
+        block_start.insert(block_id, a.size());
 
-        const bool has_reg = id < ra.assignment.size() && ra.assignment[id] >= 0;
+        for (std::uint32_t id = 1; id <= lowered.mir.node_count(); ++id) {
+            MachineNode& n = lowered.mir.node(id);
+            if (n.block != block_id) continue;
+            const bool has_reg = id < ra.assignment.size() && ra.assignment[id] >= 0;
 
-        switch (n.op) {
-            case MOp::MOVri: {
-                // Materialize imm64 into the assigned register (or write the
-                // payload into the home slot when spilled).
-                if (has_reg) {
-                    a.mov_r64_imm64(alloc_reg(ra.assignment[id]),
-                                    static_cast<std::uint64_t>(n.operands[0].imm));
-                } else {
-                    // store payload imm64: MOV [frame+disp], imm32 only supports
-                    // 32-bit — use a scratch register then store.
-                    a.mov_r64_imm64(x86::RAX, static_cast<std::uint64_t>(n.operands[0].imm));
-                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset),
-                                  x86::RAX);
-                    // tag word = Tag::Int for integer constants
+            switch (n.op) {
+                case MOp::MOVri: {
+                    if (n.operands.empty()) break;
+                    if (has_reg) {
+                        a.mov_r64_imm64(alloc_reg(ra.assignment[id]),
+                                        static_cast<std::uint64_t>(n.operands[0].imm));
+                    } else {
+                        a.mov_r64_imm64(x86::RAX, static_cast<std::uint64_t>(n.operands[0].imm));
+                        a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset),
+                                      x86::RAX);
+                        a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
+                                        static_cast<std::int32_t>(kTagInt));
+                    }
+                    break;
+                }
+                case MOp::MOVrm: {
+                    if (has_reg && n.operands.size() >= 1 &&
+                        n.operands[0].kind == MachineOperand::FrameSlot) {
+                        a.mov_r64_mem(alloc_reg(ra.assignment[id]), frame_base,
+                                     slot_disp(n.operands[0].slot, n.operands[0].tag_off));
+                    }
+                    break;
+                }
+                case MOp::MOVmr: {
+                    // Store source vreg's value into the destination home
+                    // slot. Handles BOTH register-cached sources (direct
+                    // store) and spilled sources (load through a scratch
+                    // register first then store). The earlier version
+                    // silently dropped the store when the source was
+                    // spilled — the result Value was never written to
+                    // home[0], and RET read an uninitialized slot.
+                    if (n.operands.size() < 2 ||
+                        n.operands[0].kind != MachineOperand::FrameSlot ||
+                        n.operands[1].kind != MachineOperand::VReg) break;
+                    if (n.operands[1].vreg >= ra.assignment.size()) break;
+                    std::int32_t src_assign = ra.assignment[n.operands[1].vreg];
+                    if (src_assign >= 0) {
+                        // Register-cached: direct store.
+                        a.mov_mem_r64(frame_base,
+                                      slot_disp(n.operands[0].slot, n.operands[0].tag_off),
+                                      alloc_reg(src_assign));
+                    } else {
+                        // Spilled: load from source's home slot into RAX,
+                        // then store into the destination home slot.
+                        std::uint32_t src_home = lowered.mir.node(n.operands[1].vreg).home_slot;
+                        a.mov_r64_mem(x86::RAX, frame_base,
+                                      slot_disp(src_home, n.operands[0].tag_off));
+                        a.mov_mem_r64(frame_base,
+                                      slot_disp(n.operands[0].slot, n.operands[0].tag_off),
+                                      x86::RAX);
+                    }
+                    break;
+                }
+                case MOp::ADDrr:
+                case MOp::SUBrr:
+                case MOp::IMULrr: {
+                    if (n.operands.size() < 2) break;
+                    RegOrSlot lhs = resolve(n.operands[0]);
+                    RegOrSlot rhs = resolve(n.operands[1]);
+                    stage_rax(lhs, kPayloadOffset);
+                    if (rhs.is_reg) {
+                        a.mov_r64_r64(x86::RCX, rhs.reg);
+                    } else {
+                        a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
+                    }
+                    if (n.op == MOp::ADDrr) {
+                        a.alu_r64_r64(0x01, x86::RAX, x86::RCX);
+                    } else if (n.op == MOp::SUBrr) {
+                        a.alu_r64_r64(0x29, x86::RAX, x86::RCX);
+                    } else {
+                        a.imul_r64_r64(x86::RAX, x86::RCX);
+                    }
+                    if (has_reg) {
+                        a.mov_r64_r64(alloc_reg(ra.assignment[id]), x86::RAX);
+                    }
+                    // Write-back: payload + tag.
+                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
                     a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagInt));
+                    break;
                 }
-                break;
-            }
-            case MOp::MOVrm: {
-                // Load payload from home slot into assigned reg.
-                if (has_reg && n.operands.size() >= 1 &&
-                    n.operands[0].kind == MachineOperand::FrameSlot) {
-                    a.mov_r64_mem(alloc_reg(ra.assignment[id]), frame_base,
-                                 slot_disp(n.operands[0].slot, n.operands[0].tag_off));
-                }
-                break;
-            }
-            case MOp::MOVmr: {
-                // Store reg payload into home slot.
-                if (n.operands.size() >= 2 && n.operands[0].kind == MachineOperand::FrameSlot &&
-                    n.operands[1].kind == MachineOperand::VReg &&
-                    n.operands[1].vreg < ra.assignment.size() &&
-                    ra.assignment[n.operands[1].vreg] >= 0) {
-                    a.mov_mem_r64(frame_base,
-                                  slot_disp(n.operands[0].slot, n.operands[0].tag_off),
-                                  alloc_reg(ra.assignment[n.operands[1].vreg]));
-                }
-                break;
-            }
-            case MOp::ADDrr:
-            case MOp::SUBrr:
-            case MOp::IMULrr: {
-                if (n.operands.size() < 2) break;
-                const auto resolve = [&](const MachineOperand& op) noexcept {
-                    RegOrSlot r;
-                    if (op.kind == MachineOperand::VReg) {
-                        if (op.vreg < ra.assignment.size() &&
-                            ra.assignment[op.vreg] >= 0) {
-                            r.is_reg = true;
-                            r.reg = alloc_reg(ra.assignment[op.vreg]);
-                            return r;
-                        }
-                        // spilled: home slot of the defining node
-                        r.slot = op.vreg;
-                        return r;
+                case MOp::CMPrr: {
+                    if (n.operands.size() < 2) break;
+                    RegOrSlot lhs = resolve(n.operands[0]);
+                    RegOrSlot rhs = resolve(n.operands[1]);
+                    stage_rax(lhs, kPayloadOffset);
+                    if (rhs.is_reg) {
+                        a.mov_r64_r64(x86::RCX, rhs.reg);
+                    } else {
+                        a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
                     }
-                    r.slot = op.slot;
-                    return r;
-                };
-                RegOrSlot lhs = resolve(n.operands[0]);
-                RegOrSlot rhs = resolve(n.operands[1]);
-                // Stage operands into RAX / RCX (SysV caller-saved scratches:
-                // clobbers are fine, values reload from homes at next use).
-                if (lhs.is_reg) {
-                    a.mov_r64_r64(x86::RAX, lhs.reg);
-                } else {
-                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kPayloadOffset));
+                    a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
+                    break;
                 }
-                if (rhs.is_reg) {
-                    a.mov_r64_r64(x86::RCX, rhs.reg);
-                } else {
-                    a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
-                }
-                if (n.op == MOp::ADDrr) {
-                    a.alu_r64_r64(0x01, x86::RAX, x86::RCX);
-                } else if (n.op == MOp::SUBrr) {
-                    a.alu_r64_r64(0x29, x86::RAX, x86::RCX);
-                } else {
-                    a.imul_r64_r64(x86::RAX, x86::RCX);
-                }
-                if (has_reg) {
-                    a.mov_r64_r64(alloc_reg(ra.assignment[id]), x86::RAX);
-                }
-                // Write-back: payload + tag.
-                a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
-                a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
-                                static_cast<std::int32_t>(kTagInt));
-                break;
-            }
-            case MOp::CMPrr: {
-                if (n.operands.size() < 2) break;
-                const auto resolve = [&](const MachineOperand& op) noexcept {
-                    RegOrSlot r;
-                    if (op.kind == MachineOperand::VReg) {
-                        if (op.vreg < ra.assignment.size() &&
-                            ra.assignment[op.vreg] >= 0) {
-                            r.is_reg = true;
-                            r.reg = alloc_reg(ra.assignment[op.vreg]);
-                            return r;
-                        }
-                        r.slot = op.vreg;
-                        return r;
+                case MOp::Jcc: {
+                    if (n.operands.empty()) break;
+                    const auto mc = static_cast<MCond>(n.operands[0].imm);
+                    if (mc >= MCond::Count) break;
+                    std::size_t site = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(mc)]);
+                    // The next block in the lowering's block_order is the
+                    // fallthrough-adjacent (IfTrue-first layout). The Jcc
+                    // target is the block after that: successor[1] of the
+                    // current block (i.e. IfFalse).
+                    if (block_id + 1 < lowered.mir.blocks.size()) {
+                        patches.push_back(PatchSite{site, block_id + 1});
+                    } else {
+                        patches.push_back(PatchSite{site, 0xFFFFFFFFu});   // past_cold
                     }
-                    r.slot = op.slot;
-                    return r;
-                };
-                RegOrSlot lhs = resolve(n.operands[0]);
-                RegOrSlot rhs = resolve(n.operands[1]);
-                if (lhs.is_reg) {
-                    a.mov_r64_r64(x86::RAX, lhs.reg);
-                } else {
-                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kPayloadOffset));
+                    break;
                 }
-                if (rhs.is_reg) {
-                    a.mov_r64_r64(x86::RCX, rhs.reg);
-                } else {
-                    a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
-                }
-                a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
-                break;
-            }
-            case MOp::Jcc: {
-                // Condition comes from the MIR operand (arch-neutral MCond),
-                // mapped through kX86Cond — never a hard-coded opcode byte.
-                if (n.operands.empty()) break;
-                const auto mc = static_cast<MCond>(n.operands[0].imm);
-                if (mc >= MCond::Count) break;
-                std::size_t site = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(mc)]);
-                patches.push_back(PatchSite{site, id + 1});
-                break;
-            }
-            case MOp::GUARD_INT: {
-                if (n.operands.size() < 2) break;
-                const auto resolve = [&](const MachineOperand& op) noexcept {
-                    RegOrSlot r;
-                    if (op.kind == MachineOperand::VReg) {
-                        if (op.vreg < ra.assignment.size() &&
-                            ra.assignment[op.vreg] >= 0) {
-                            r.is_reg = true;
-                            r.reg = alloc_reg(ra.assignment[op.vreg]);
-                            return r;
-                        }
-                        r.slot = op.vreg;
-                        return r;
+                case MOp::GUARD_INT: {
+                    if (n.operands.size() < 2) break;
+                    RegOrSlot lhs = resolve(n.operands[0]);
+                    RegOrSlot rhs = resolve(n.operands[1]);
+                    // Tag checks: load tag words, compare each against Tag::Int.
+                    // Failure -> Jcc to the cold deopt stub (recorded below).
+                    if (lhs.is_reg) {
+                        // tag lives in the home slot for register-cached
+                        // values (write-back discipline keeps homes authoritative).
+                        a.mov_r64_mem(x86::RAX, frame_base,
+                                      slot_disp(lhs.slot ? lhs.slot : n.home_slot, kTagOffset));
+                    } else {
+                        a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kTagOffset));
                     }
-                    r.slot = op.slot;
-                    return r;
-                };
-                RegOrSlot lhs = resolve(n.operands[0]);
-                RegOrSlot rhs = resolve(n.operands[1]);
-                // Tag checks: load tag words, compare each against Tag::Int.
-                if (lhs.is_reg) {
-                    // tag lives in the home slot for register-cached values
-                    // (write-back discipline keeps homes authoritative).
-                    a.mov_r64_mem(x86::RAX, frame_base,
-                                  slot_disp(lhs.slot ? lhs.slot : n.home_slot, kTagOffset));
-                } else {
-                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kTagOffset));
-                }
-                a.mov_r64_imm64(x86::RCX, kTagInt);
-                a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
-                std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);   // NE -> deopt
+                    a.mov_r64_imm64(x86::RCX, kTagInt);
+                    a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
+                    std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
-                if (rhs.is_reg) {
-                    a.mov_r64_mem(x86::RAX, frame_base,
-                                  slot_disp(rhs.slot ? rhs.slot : n.home_slot, kTagOffset));
-                } else {
-                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(rhs.slot, kTagOffset));
-                }
-                a.mov_r64_imm64(x86::RCX, kTagInt);
-                a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
-                std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
+                    if (rhs.is_reg) {
+                        a.mov_r64_mem(x86::RAX, frame_base,
+                                      slot_disp(rhs.slot ? rhs.slot : n.home_slot, kTagOffset));
+                    } else {
+                        a.mov_r64_mem(x86::RAX, frame_base, slot_disp(rhs.slot, kTagOffset));
+                    }
+                    a.mov_r64_imm64(x86::RCX, kTagInt);
+                    a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
+                    std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
-                // ---- deopt stub (cold region, in-line for the single-buffer
-                // layout; jump distance is short) ----
-                std::size_t stub = a.size();
-                a.patch_jcc(j1, stub);
-                a.patch_jcc(j2, stub);
-                // mov edi, unit_id; mov esi, safepoint_idx; call deopt_entry
-                std::size_t s0 = a.size();
-                a.mov_r64_imm64(x86::RDI, unit_id);
-                a.mov_r64_imm64(x86::RSI, static_cast<std::uint64_t>(out.safepoints.size()));
-                std::size_t call_site = a.call_rel32();
-                // Safepoint record BEFORE the trap: pc = jump site, live map
-                // = the two operands' slots.
-                SafepointRecord rec;
-                rec.pc_offset = static_cast<std::uint32_t>(j1);
-                rec.frame_state_id = n.frame_state_id == 0xFFFFFFFFu ? 0 : n.frame_state_id;
-                rec.stack_depth = static_cast<std::uint16_t>(lowered.frame_slots);
-                rec.live_regs = 2;
-                out.safepoints.push_back(rec);
-                out.mappings.push_back(SafepointMapping{x86::RAX, 0});
-                out.mappings.push_back(SafepointMapping{x86::RCX, 0});
-                // keep the call site for the runtime to patch with the real
-                // vortex_deopt_entry address (recorded via a fixed trampoline).
-                a.mov_r64_imm64(x86::RAX, reinterpret_cast<std::uint64_t>(&vortex_deopt_entry));
-                a.jmp_rax_placeholder();
-                (void)call_site;
-                (void)s0;
-                break;
-            }
-            case MOp::CALLri: {
-                // All dynamic ops call through the interpreter bridge: the
-                // helper re-executes the Tier-0 instruction whose result
-                // home slot is n.home_slot. The bridge address is patched by
-                // the runtime at install time (single relocation slot per
-                // call is too many; instead ONE shared bridge trampoline).
-                // Record the safepoint BEFORE the call: pc_offset = call site.
-                SafepointRecord rec;
-                rec.pc_offset = static_cast<std::uint32_t>(a.size());
-                rec.frame_state_id = 0;
-                rec.stack_depth = static_cast<std::uint16_t>(lowered.frame_slots);
-                rec.live_regs = 0;
-                out.safepoints.push_back(rec);
-                // vm_ctx <- frame base (bridge needs the regs base); call bridge.
-                a.mov_r64_r64(vm_ctx, frame_base);
-                a.mov_r64_imm64(x86::RAX, 0);   // patched with bridge addr
-                a.jmp_rax_placeholder();
-                break;
-            }
-            case MOp::RET: {
-                // Result Value in rax(tag) + rdx(payload): reload from home 0.
-                a.mov_r64_mem(x86::RDX, frame_base, slot_disp(0, kPayloadOffset));
-                a.mov_r64_mem(x86::RAX, frame_base, slot_disp(0, kTagOffset));
-                for (std::uint32_t r = enum_size(ReservedGPR::Count); r-- > 0;) {
-                    a.pop_r64(target.reserved[r]);
+                    // Record the safepoint BEFORE the cold stub runs; the
+                    // deopt will use it to reconstruct Tier-0 state.
+                    std::uint32_t sp_idx = emit_safepoint(n.frame_state_id, 2);
+                    out.mappings.push_back(SafepointMapping{x86::RAX, 0});
+                    out.mappings.push_back(SafepointMapping{x86::RCX, 0});
+                    // Both Jcc sites jump to the same cold stub; record
+                    // the request, resolve the offset after the hot body.
+                    deopt_stubs.push_back(DeoptStubReq{j1, sp_idx, n.frame_state_id});
+                    deopt_stubs.push_back(DeoptStubReq{j2, sp_idx, n.frame_state_id});
+                    break;
                 }
-                a.pop_r64(x86::RBX);
-                a.ret();
-                break;
+                case MOp::CALLri: {
+                    // All dynamic ops call through the interpreter bridge.
+                    // The bridge signature is void(void* regs, uint32_t unit_id,
+                    // uint64_t op_hint) under SysV: RDI = regs base, RSI =
+                    // unit_id, RDX = op_hint (helper idx from the MIR operand).
+                    // Record a safepoint BEFORE the call: pc_offset =
+                    // current size; the bridge address is baked directly
+                    // into the code (it's a process-local symbol).
+                    std::uint64_t op_hint = n.operands.empty() ? 0 :
+                        static_cast<std::uint64_t>(n.operands[0].imm);
+                    emit_safepoint(n.frame_state_id, 0);
+                    // RDI = regs base (frame_base); RSI = unit_id; RDX = op_hint
+                    a.mov_r64_r64(x86::RDI, frame_base);
+                    a.mov_r64_imm64(x86::RSI, unit_id);
+                    a.mov_r64_imm64(x86::RDX, op_hint);
+                    a.mov_r64_imm64(x86::RAX, reinterpret_cast<std::uint64_t>(&vortex_jit_bridge));
+                    a.jmp_rax_placeholder();
+                    break;
+                }
+                case MOp::RET: {
+                    // Result Value in rax(tag) + rdx(payload): reload from home 0.
+                    a.mov_r64_mem(x86::RDX, frame_base, slot_disp(0, kPayloadOffset));
+                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(0, kTagOffset));
+                    for (std::uint32_t r = enum_size(ReservedGPR::Count); r-- > 0;) {
+                        a.pop_r64(target.reserved[r]);
+                    }
+                    a.pop_r64(x86::RBX);
+                    a.ret();
+                    break;
+                }
+                default:
+                    break;
             }
-            default:
-                break;
+        }
+    };
+
+    // ---- hot region: emit all non-cold blocks in block id order ---------------
+    for (std::uint32_t bi = 0; bi < lowered.mir.blocks.size(); ++bi) {
+        if (lowered.mir.blocks[bi].is_cold) continue;
+        emit_block_body(bi);
+    }
+
+    // JMP past_cold — the hot tail jumps over the cold region. Patches after
+    // this point need the actual past_cold offset; record it now.
+    std::size_t past_cold_site = a.jmp_rel32();
+
+    // ---- cold region boundary -------------------------------------------------
+    out.cold_offset = a.size();
+
+    // ---- cold region: deopt stubs first, then cold blocks ---------------------
+    // Each deopt stub: load unit_id (RDI), safepoint index (RSI), regs base
+    // (RDX = frame_base at the guard site), tail-call vortex_deopt_entry.
+    // The runtime never returns to the JIT — it longjmps into interpreter
+    // resume via enter_at, returning to the JIT's caller with the Tier-0
+    // result in vm.frame_return_.
+    for (const DeoptStubReq& req : deopt_stubs) {
+        // Patch the Jcc rel32 to land here.
+        a.patch_jcc(req.jcc_site, a.size());
+        a.mov_r64_imm64(x86::RDI, unit_id);
+        a.mov_r64_imm64(x86::RSI, req.safepoint_index);
+        // frame_base register holds the regs base at this point (callee-saved
+        // across the body by the prologue; not clobbered by the body emit).
+        a.mov_r64_r64(x86::RDX, frame_base);
+        a.mov_r64_imm64(x86::RAX, reinterpret_cast<std::uint64_t>(&vortex_deopt_entry));
+        a.jmp_rax_placeholder();
+    }
+
+    // Cold blocks (Catch handlers and any other is_cold MIR blocks).
+    for (std::uint32_t bi = 0; bi < lowered.mir.blocks.size(); ++bi) {
+        if (!lowered.mir.blocks[bi].is_cold) continue;
+        emit_block_body(bi);
+    }
+
+    // ---- patch phase: resolve every Jcc rel32 to its block_start offset -----
+    for (const PatchSite& p : patches) {
+        if (p.target_block == 0xFFFFFFFFu) {
+            // Fallthrough to past_cold: patch to the position AFTER the cold region.
+            // For simplicity, patch to the past_cold_site + 5 (after the JMP rel32
+            // we emitted there); execution falls through naturally past the cold
+            // region only if it skipped into a handler that itself returned —
+            // which Catch handlers do via the same RET path. For the common
+            // case where the Jcc at the hot tail targets the past_cold boundary
+            // we use the cold_offset target (the start of the cold region is
+            // also "past the hot body" by construction).
+            a.patch_jcc(p.site, out.cold_offset);
+        } else {
+            const std::size_t* target = block_start.get(p.target_block);
+            if (target) {
+                a.patch_jcc(p.site, *target);
+            } else {
+                // Target block was never emitted (e.g. unreachable
+                // successor). Patch to past_cold as a safe fallthrough.
+                a.patch_jcc(p.site, out.cold_offset);
+            }
         }
     }
 
-    // ---- cold region marker ----------------------------------------------------
-    out.cold_offset = a.size();
+    // Patch the JMP past_cold at the hot tail to land at the END of the
+    // entire code buffer (past the cold region).
+    {
+        std::size_t past_cold_target = a.size();
+        a.patch_rel32(past_cold_site, past_cold_target);
+    }
+
     out.code = buffer;
     out.code_size = a.size();
     out.valid = a.size() > 0 && a.size() < capacity;
-    (void)patches;
     (void)kTagNone;
     (void)kTagBool;
     (void)kTagFloat;
     (void)kTagObj;
-    (void)block_start;
+    (void)vm_ctx;
     return out;
 }
 

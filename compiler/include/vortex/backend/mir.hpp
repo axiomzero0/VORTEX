@@ -176,6 +176,17 @@ struct MachineGraph {
     stdx::small_vector<MachineNode, 128> nodes{};   // node 0 reserved
     stdx::small_vector<MachineBlock, 16> blocks{};
 
+    MachineGraph() noexcept {
+        // Reserve node 0 as a sentinel so the first real create() returns
+        // id=1 — the codegen iterates `for (id=1; id <= node_count(); ++id)`
+        // and would silently skip a real node 0. Without this reservation
+        // the lowering's first MIR node (typically the entry MOVrm/MOVri)
+        // is never emitted, producing a broken prologue that reads
+        // uninitialized home slots.
+        nodes.push_back(MachineNode{});
+        nodes.back().op = MOp::RET;   // never executed; safe sentinel
+    }
+
     [[nodiscard]] std::uint32_t create_block() noexcept {
         blocks.push_back(MachineBlock{});
         blocks.back().id = static_cast<std::uint32_t>(blocks.size()) - 1;
