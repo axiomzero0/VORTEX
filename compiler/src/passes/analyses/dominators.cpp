@@ -25,17 +25,15 @@ namespace {
     stdx::small_vector<NodeId, 8> out;
     g.for_each_live([&](NodeId id) {
         const Node& n = g.node(id);
-        if (!is_leader(n.kind)) return;
-        if (id == b) return;
-        if (n.ins.empty()) return;
-        if (n.kind == NodeKind::Region || n.kind == NodeKind::Loop ||
-            n.kind == NodeKind::Catch) {
-            for (NodeId in : n.ins) {
-                if (in == b) { out.push_back(id); return; }
-            }
-            return;
-        }
-        if (n.kind == NodeKind::If && n.ins[0] == b) {
+        if (id == b || n.ins.empty()) return;
+        // If nodes are not block leaders, but they carry a block's outgoing
+        // conditional edges: an If controlled by b makes its projections
+        // successors of b. This case MUST run before the is_leader filter —
+        // the old order filtered If out first and silently dropped every
+        // conditional edge, truncating the CFG at the first branch inside
+        // any loop header (dominators then saw no loops at all).
+        if (n.kind == NodeKind::If) {
+            if (n.ins[0] != b) return;
             g.for_each_live([&](NodeId proj) {
                 const Node& p = g.node(proj);
                 if ((p.kind == NodeKind::IfTrue || p.kind == NodeKind::IfFalse) &&
@@ -43,6 +41,14 @@ namespace {
                     out.push_back(proj);
                 }
             });
+            return;
+        }
+        if (!is_leader(n.kind)) return;
+        if (n.kind == NodeKind::Region || n.kind == NodeKind::Loop ||
+            n.kind == NodeKind::Catch) {
+            for (NodeId in : n.ins) {
+                if (in == b) { out.push_back(id); return; }
+            }
             return;
         }
         if (n.ins[0] == b) out.push_back(id);

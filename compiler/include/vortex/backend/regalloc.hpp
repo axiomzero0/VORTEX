@@ -13,10 +13,12 @@
 //     reload (the reference is owned by the stack slot while cached in a
 //     register it is the register's transient copy).
 //
-// The physical register file: 10 allocatable GPRs (r12-r15 reserved by the
-// frame protocol). Every vreg's spill home is its Tier-0 frame slot, so
-// spill code is a plain MOV to [r12 + slot*16] — and the deoptimizer can
-// reconstruct state from safepoint (physreg -> slot) maps alone.
+// The physical register file is TargetDescriptor data (allocatable set +
+// frame-protocol roles): 10 allocatable GPRs on x86-64 (r12-r15 reserved by
+// the frame protocol), 24 on AArch64 (x24-x27, x18, FP/LR excluded). Every
+// vreg's spill home is its Tier-0 frame slot, so spill code is a plain MOV
+// off the frame-base register — and the deoptimizer can reconstruct state
+// from safepoint (physreg -> slot) maps alone.
 // =============================================================================
 
 #pragma once

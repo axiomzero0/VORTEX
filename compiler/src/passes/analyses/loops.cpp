@@ -21,20 +21,17 @@ namespace {
     }
 }
 
-// successors of a block (same model as dominators.cpp)
+// successors of a block (same model as dominators.cpp — including the
+// If-projection edges, which MUST be collected before the leader filter;
+// see the fix note there: dropping them truncated the CFG at the first
+// in-loop branch and hid every natural loop from the analysis)
 [[nodiscard]] stdx::small_vector<NodeId, 8> succs(const Graph& g, NodeId b) noexcept {
     stdx::small_vector<NodeId, 8> out;
     g.for_each_live([&](NodeId id) {
         const Node& n = g.node(id);
-        if (!is_leader(n.kind) || id == b || n.ins.empty()) return;
-        if (n.kind == NodeKind::Region || n.kind == NodeKind::Loop ||
-            n.kind == NodeKind::Catch) {
-            for (NodeId in : n.ins) {
-                if (in == b) { out.push_back(id); return; }
-            }
-            return;
-        }
-        if (n.kind == NodeKind::If && n.ins[0] == b) {
+        if (id == b || n.ins.empty()) return;
+        if (n.kind == NodeKind::If) {
+            if (n.ins[0] != b) return;
             g.for_each_live([&](NodeId proj) {
                 const Node& p = g.node(proj);
                 if ((p.kind == NodeKind::IfTrue || p.kind == NodeKind::IfFalse) &&
@@ -42,6 +39,14 @@ namespace {
                     out.push_back(proj);
                 }
             });
+            return;
+        }
+        if (!is_leader(n.kind)) return;
+        if (n.kind == NodeKind::Region || n.kind == NodeKind::Loop ||
+            n.kind == NodeKind::Catch) {
+            for (NodeId in : n.ins) {
+                if (in == b) { out.push_back(id); return; }
+            }
             return;
         }
         if (n.ins[0] == b) out.push_back(id);

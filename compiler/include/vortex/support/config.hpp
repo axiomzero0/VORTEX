@@ -33,8 +33,10 @@ inline constexpr std::uint32_t unroll_max_factor = 16;
 inline constexpr std::uint32_t inline_max_depth = 15;
 inline constexpr std::uint32_t inline_max_bloom_nodes = 4096;  // inlined body size cap
 inline constexpr std::uint32_t pea_max_virtual_objects = 256;
-inline constexpr std::uint32_t slp_max_packet_width = 8;       // AVX-512 lanes upper bound
 inline constexpr std::uint32_t slp_max_lookahead = 32;
+// SIMD packet width is NOT a cfg constant: passes read the live
+// TargetDescriptor's simd_width_bytes (Rule 27 — queried, never assumed).
+// With no descriptor attached to the PassContext, vectorization declines.
 inline constexpr std::uint32_t vector_max_loop_body_nodes = 128;
 inline constexpr std::uint32_t licm_max_hoisted_per_loop = 64;
 inline constexpr std::uint32_t pipeline_max_effects_tracked = 64;
@@ -55,9 +57,11 @@ inline constexpr std::uint32_t deopt_max_recompiles = 4;       // then permanent
 inline constexpr std::uint32_t deopt_burst_window = 64;        // deopts within N calls
 
 // --- Register allocation (Pass 53) ----------------------------------------------
+// The physical register file is NOT a cfg constant: it is TargetDescriptor
+// data (allocatable_gprs + the per-arch tables in backend/target.hpp).
+// cfg::regalloc_gp_registers was removed because a second, divergent copy
+// of a machine fact is exactly how ports break.
 inline constexpr std::uint32_t regalloc_max_spill_ratio_percent = 25;  // telemetry trip at >
-inline constexpr std::uint32_t regalloc_gp_registers = 13;     // usable GP regs under SysV
-inline constexpr std::uint32_t regalloc_xmm_registers = 16;
 
 // --- PGO Meter (Rule 44) ----------------------------------------------------------
 inline constexpr std::uint32_t meter_min_samples_for_speculation = 32;
@@ -67,5 +71,11 @@ inline constexpr double meter_low_confidence_ceiling = 0.60;
 
 // --- Diagnostics / misc -----------------------------------------------------------
 inline constexpr std::uint32_t max_source_errors = 32;
+
+// --- Machine facts ---------------------------------------------------------------
+// Last-resort cache line size when no probe is available (no CMake override,
+// no compiler interference constant, no CPUID/CTR_EL0 at runtime). Every
+// real path queries; this only backs the degenerate embedded case.
+inline constexpr std::uint32_t cache_line_fallback_bytes = 64;
 
 }  // namespace vortex::cfg

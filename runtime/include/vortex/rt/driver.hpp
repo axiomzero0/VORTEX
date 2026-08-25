@@ -15,6 +15,14 @@ namespace vortex::rt {
 
 inline namespace abi_v1 {
 
+/// Compilation switches the CALLER controls (opt-in optimizations live
+/// here — default-constructed options run the conservative pipeline only).
+struct CompileOptions {
+    /// Pass 33 (polyhedral loop transforms). Opt-in by design: expensive
+    /// analysis, profile-dependent payoff. Maps to OptOption::Polyhedral.
+    bool polyhedral{false};
+};
+
 struct CompileOutcome {
     bool ok{false};
     std::uint32_t units_compiled{0};
@@ -24,10 +32,12 @@ struct CompileOutcome {
 
 /// Compile `source` into `vm.program`. Diagnostics carry source locations.
 [[nodiscard]] CompileOutcome compile_program(Vm& vm, std::string_view source,
-                                             SymbolId module_name) noexcept;
+                                             SymbolId module_name,
+                                             const CompileOptions& options = {}) noexcept;
 
 /// Compile + run: the `vortex run` fast path.
-[[nodiscard]] Result<Value> run_source(Vm& vm, std::string_view source) noexcept;
+[[nodiscard]] Result<Value> run_source(Vm& vm, std::string_view source,
+                                       const CompileOptions& options = {}) noexcept;
 
 }  // namespace abi_v1
 }  // namespace vortex::rt

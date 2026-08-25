@@ -6,7 +6,9 @@
 //        chains with all-constant-type operands Vectorizable (the IR's
 //        unboxed primitives are int64/float64 registers).
 //   31b: packetization — groups independent, adjacent (node-id order)
-//        isomorphic operations into packets of cfg::slp_max_packet_width.
+//        isomorphic operations into packets sized by the TARGET's vector
+//        width (TargetDescriptor::simd_width_bytes / 8 lanes — Rule 27:
+//        queried, never assumed). No descriptor attached -> no packets.
 //   31c: dependence slicing — only packs whose members provably do not
 //        alias (pass-14 TypeGuarded markers) or are pure are kept.
 //   31d: gather/scatter fallback — mixed-type pack members route to
@@ -46,6 +48,11 @@ namespace {
 
 Result<PassResult> P31_SLPVectorization::run(Graph& g, const PassContext& c) noexcept {
     if (c.tier == TierMode::Tier1) return PassResult{};
+    // Rule 27: the vector width is a machine fact — query the descriptor or
+    // decline. (cfg::slp_max_packet_width was removed precisely because a
+    // hardcoded AVX-512 lane count is wrong on every smaller machine.)
+    if (c.target == nullptr || c.target->simd_width_bytes < 16) return PassResult{};
+    const std::uint32_t max_lanes = c.target->simd_width_bytes / 8;
     std::uint32_t before = g.live_node_count();
     std::uint32_t packets = 0;
 
@@ -80,7 +87,7 @@ Result<PassResult> P31_SLPVectorization::run(Graph& g, const PassContext& c) noe
         if (packed.contains(candidates[i])) continue;
         stdx::small_vector<NodeId, 4> packet{candidates[i]};
         for (std::size_t j = i + 1; j < candidates.size() &&
-                                   packet.size() < cfg::slp_max_packet_width; ++j) {
+                                   packet.size() < max_lanes; ++j) {
             if (packed.contains(candidates[j])) continue;
             if (!same_shape(g, candidates[i], candidates[j])) continue;
             // 31c independence: no shared inputs (checked by same_shape) and

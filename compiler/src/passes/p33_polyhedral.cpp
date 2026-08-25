@@ -1,5 +1,12 @@
 // =============================================================================
-// Pass 33 — Trace-Based Polyhedral Optimization.
+// Pass 33 — Trace-Based Polyhedral Optimization.  [OPT-IN ONLY]
+//
+// This pass NEVER runs unless the caller explicitly sets
+// OptOption::Polyhedral on the PassContext (driver flag / toolchain option).
+// Both gates enforce it: the pipeline filter skips "33_polyhedral" without
+// the flag, AND this run() self-checks so direct invocations (tests,
+// tooling) are gated identically. Rationale: the analysis is expensive and
+// its payoff is profile-dependent — wrong to impose on every compilation.
 //
 // Perfectly-nested range loops with independent index spaces transform:
 //   - INTERCHANGE: swap nest order when the inner index does not feed the
@@ -40,6 +47,9 @@ struct AccessSite {
 }  // namespace
 
 Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& c) noexcept {
+    // Opt-in contract (see file header): no explicit request, no analysis.
+    if (!c.options.has(OptOption::Polyhedral)) return PassResult{};
+
     DomTree dom = compute_dominators(g);
     LoopInfo loops = compute_loops(g, dom);
     if (loops.loops.empty()) return PassResult{};

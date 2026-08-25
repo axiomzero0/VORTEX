@@ -32,6 +32,15 @@ option(VORTEX_BUILD_TESTS      "Build the test tree"                         ON)
 option(VORTEX_BUILD_BENCH      "Build the benchmark tree"                    ON)
 option(VORTEX_WERROR           "Treat warnings as errors"                    OFF)
 
+# Cache line override (bytes): by default the target layer probes the real
+# value (CPUID CLFLUSH / CTR_EL0 / compiler interference constant). Set this
+# ONLY for targets where probing is impossible or known-wrong (e.g. some
+# emulators) — a wrong override is worse than no override.
+set(VORTEX_CACHE_LINE_BYTES "" CACHE STRING "Force cache line size in bytes (empty = probe)")
+if(VORTEX_CACHE_LINE_BYTES)
+    add_compile_definitions(VORTEX_CACHE_LINE_BYTES=${VORTEX_CACHE_LINE_BYTES})
+endif()
+
 include(cmake/CompilerWarnings.cmake)
 
 # --- Library targets ----------------------------------------------------------

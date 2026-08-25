@@ -24,8 +24,10 @@
 
 #include <cstdint>
 
+#include "vortex/backend/target.hpp"
 #include "vortex/ir/graph.hpp"
 #include "vortex/support/config.hpp"
+#include "vortex/support/flags.hpp"
 #include "vortex/support/telemetry.hpp"
 
 namespace vortex::passes {
@@ -38,12 +40,32 @@ enum class TierMode : std::uint8_t {
     Tier3,   // AOT/static: proofs only, zero guards
 };
 
+/// Opt-in optimization switches (Rule 23: named, no magic booleans).
+/// These gate transforms whose cost/risk profile makes them WRONG to run
+/// by default — the pass must be explicitly requested. A flag set here is
+/// advisory to the pipeline filter AND self-checked by the pass itself
+/// (defense in depth: direct invocations are gated identically).
+enum class OptOption : std::uint8_t {
+    /// Pass 33 — polyhedral loop transforms (interchange/skew/tiling).
+    /// Heavy analysis with profile-dependent payoff: opt-in only.
+    Polyhedral = 1 << 0,
+};
+
 /// Input evidence bundle per compilation (Rule 1's "multiple inputs").
 struct PassContext {
     TierMode tier{TierMode::Tier1};
     std::uint32_t node_budget{cfg::tier1_node_budget};
     std::uint32_t code_unit_id{0};
     Telemetry* telemetry{nullptr};
+
+    /// Opt-in optimization switches — empty by default (Rule 23).
+    Flags<OptOption> options{};
+
+    /// Target the graph is being compiled for. Machine facts (SIMD width,
+    /// register count, cache line) are QUERIED from here — never assumed
+    /// from cfg constants (Rule 27/24). Null means "no target knowledge":
+    /// target-sensitive passes (vectorization width) must decline.
+    const backend::TargetDescriptor* target{nullptr};
 
     // PGO inputs (valid when tier == Tier2):
     //   - call-site type histograms

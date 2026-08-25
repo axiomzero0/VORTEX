@@ -67,27 +67,28 @@ constexpr std::array<LoweringEntry, 14> kLoweringTable{{
     stdx::small_vector<NodeId, 8> out;
     g.for_each_live([&](NodeId id) {
         const Node& n = g.node(id);
-        if (!is_block_leader(n.kind) || id == b || n.ins.empty()) return;
+        if (id == b || n.ins.empty()) return;
+        // If nodes are not block leaders, but an If controlled by b carries
+        // b's outgoing conditional edges to its projections. Collected
+        // BEFORE the leader filter — the old order dropped these edges and
+        // truncated the MIR block graph at every in-loop branch.
+        if (n.kind == NodeKind::If) {
+            if (n.ins[0] != b) return;
+            g.for_each_live([&](NodeId proj) {
+                const Node& p = g.node(proj);
+                if ((p.kind == NodeKind::IfTrue || p.kind == NodeKind::IfFalse) &&
+                    !p.ins.empty() && p.ins[0] == id) {
+                    out.push_back(proj);
+                }
+            });
+            return;
+        }
+        if (!is_block_leader(n.kind)) return;
         if (n.kind == NodeKind::Region || n.kind == NodeKind::Loop ||
             n.kind == NodeKind::Catch) {
             for (NodeId in : n.ins) {
                 if (in == b) { out.push_back(id); return; }
             }
-            return;
-        }
-        if (n.kind == NodeKind::If && n.ins[0] == b) {
-            g.for_each_live([&](NodeId proj) {
-                const Node& p = g.node(proj);
-                if (p.kind == NodeKind::IfFalse && !p.ins.empty() && p.ins[0] == id) {
-                    out.push_back(proj);
-                }
-            });
-            g.for_each_live([&](NodeId proj) {
-                const Node& p = g.node(proj);
-                if (p.kind == NodeKind::IfTrue && !p.ins.empty() && p.ins[0] == id) {
-                    out.push_back(proj);
-                }
-            });
             return;
         }
         if (n.ins[0] == b) out.push_back(id);

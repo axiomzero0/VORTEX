@@ -1,12 +1,25 @@
 // =============================================================================
-// vortex/backend/codegen.cpp — Pass 54/55 implementation.
+// vortex/backend/codegen.cpp — Pass 54/55 implementation (x86-64 emitter).
+//
+// ARCHITECTURE CONTRACT
+//   This file is the SysV x86-64 emitter and nothing else. compile_unit()
+//   refuses to emit for any other descriptor architecture — a mismatched
+//   pair returns valid=false with zero bytes written instead of emitting
+//   garbage that happens to run on the build machine. The AArch64 emitter
+//   is a separate compilation unit with the same contract.
+//
+//   The register PARTITION (allocatable set, frame-protocol roles) comes
+//   from the TargetDescriptor — never from file-local tables. What remains
+//   local are genuine x86-64 ISA/ABI facts: REX encodings live in the
+//   Assembler, and this file picks the SysV scratch/argument registers
+//   (RAX/RCX/RDX/RDI/RSI) for operand staging.
 //
 // Emission protocol (SysV x86-64, VORTEX frame ABI):
 //   entry:  rdi = Value* regs
-//   prologue: push rbx, r12-r15 (callee-saved per ABI); mov r12, rdi
-//   body:    ops per MIR; frame home access = [r12 + slot*16 + tag_off]
+//   prologue: push rbx + the descriptor's four reserved roles; r12 <- rdi
+//   body:    ops per MIR; frame home access = [frame_base + slot*16 + off]
 //   guards:  compare tag word (offset 0) of both operands against Tag::Int
-//            (1); failure -> Jcc to cold deopt stub
+//            (2); failure -> Jcc to cold deopt stub
 //   deopt:   cold stub: mov edi, unit_id; mov esi, safepoint_idx; call
 //            vortex_deopt_entry; the runtime never returns here (it longjmps
 //            into interpreter resume)
@@ -48,6 +61,17 @@ constexpr std::uint64_t kTagInt = 2;
 constexpr std::uint64_t kTagFloat = 3;
 constexpr std::uint64_t kTagObj = 4;
 
+// MCond -> x86-64 Jcc condition nibble (two-byte 0F 8x form). Emitter-side
+// table: the neutral MIR carries no x86 encodings.
+constexpr std::uint8_t kX86Cond[enum_size(MCond::Count)] = {
+    0x04,   // EQ  (e)
+    0x05,   // NE  (ne)
+    0x0C,   // LT  (l, signed)
+    0x0D,   // GE  (ge, signed)
+    0x0E,   // LE  (le, signed)
+    0x0F,   // GT  (g, signed)
+};
+
 [[nodiscard]] std::int32_t slot_disp(std::uint32_t slot, std::int32_t off) noexcept {
     return static_cast<std::int32_t>(slot) * kValueSize + off;
 }
@@ -59,29 +83,31 @@ struct RegOrSlot {
     std::uint32_t slot{0};
 };
 
-[[nodiscard]] RegOrSlot resolve(const MachineNode& n, const MachineOperand& op,
-                                const stdx::small_vector<std::int32_t, 128>& assign) noexcept {
-    RegOrSlot r;
-    if (op.kind == MachineOperand::VReg) {
-        if (op.vreg < assign.size() && assign[op.vreg] >= 0) {
-            r.is_reg = true;
-            r.reg = static_cast<std::uint8_t>(assign[op.vreg]);
-            return r;
-        }
-        // spilled: use home slot of the defining node
-        r.slot = op.vreg;   // home slots were baked as vreg ids by lowering
-        return r;
-    }
-    r.slot = op.slot;
-    return r;
-}
-
 }  // namespace
 
 CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buffer,
                           std::size_t capacity, const TargetDescriptor& target) noexcept {
     CompiledCode out;
     out.unit_id = unit_id;
+
+    // ---- architecture gate: this emitter only speaks x86-64 -------------------
+    // Fail loudly (valid=false, zero bytes) instead of emitting code that only
+    // happens to run on the machine this compiler was built on.
+    if (target.architecture != Arch::X86_64) return out;
+    if (buffer == nullptr || capacity == 0) return out;
+
+    // Descriptor-driven register partition (the ONLY legal source).
+    const std::uint8_t frame_base = target.reserved[static_cast<std::uint32_t>(ReservedGPR::FrameBase)];
+    const std::uint8_t vm_ctx = target.reserved[static_cast<std::uint32_t>(ReservedGPR::VMContext)];
+    const std::uint32_t n_alloc = target.allocatable_gprs;
+    if (n_alloc == 0 || n_alloc > kMaxAllocatable) return out;
+
+    // Allocation index -> physical encoding, with a defensive scratch
+    // fallback for out-of-range indices (never trust derived indices).
+    const auto alloc_reg = [&](std::int32_t idx) noexcept -> std::uint8_t {
+        if (idx < 0 || static_cast<std::uint32_t>(idx) >= n_alloc) return x86::RAX;
+        return target.allocatable[static_cast<std::uint32_t>(idx)];
+    };
 
     // ---- Pass 52: lower ---------------------------------------------------------
     LoweringResult lowered = lower_to_mir(g, target);
@@ -94,18 +120,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
         linear_scan(lowered.mir, lowered.block_order, target, intervals);
 
     // ---- Pass 54/55: emit ----------------------------------------------------------
-    Assembler hot(buffer, capacity);
-    Assembler cold(buffer, capacity);   // both write the same buffer; cold is
-                                        // positioned after hot by construction
-                                        // of the two-pass emission below.
-
-    // To support the cold partition with one buffer: first pass emits hot
-    // code while RECORDING cold-region instructions as (node, patch-site
-    // list); second pass emits the cold region and patches jumps. Simplest
-    // sound layout: emit everything in one stream but order blocks hot-
-    // first — the cold flag only changes jump direction. For sub-ms compiles
-    // this single-pass layout preserves the hot/cold I-cache property.
-    Assembler& a = hot;
+    Assembler a(buffer, capacity);
 
     struct PatchSite {
         std::size_t site{0};
@@ -117,42 +132,45 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     stdx::flat_map<std::uint32_t, std::size_t, 16> block_start;
 
     // ---- prologue --------------------------------------------------------------
-    a.push_r64(PhysGPR::RBX);
-    a.push_r64(PhysGPR::R12);
-    a.push_r64(PhysGPR::R13);
-    a.push_r64(PhysGPR::R14);
-    a.push_r64(PhysGPR::R15);
-    a.mov_r64_r64(PhysGPR::R12, PhysGPR::RDI);   // frame base
+    // Callee-saved under SysV that this unit touches: RBX (allocatable) plus
+    // the four frame-protocol roles from the descriptor.
+    a.push_r64(x86::RBX);
+    for (std::uint32_t r = 0; r < enum_size(ReservedGPR::Count); ++r) {
+        a.push_r64(target.reserved[r]);
+    }
+    a.mov_r64_r64(frame_base, x86::RDI);   // SysV: first integer argument
 
     // ---- body -------------------------------------------------------------------
     for (std::uint32_t id = 1; id <= lowered.mir.node_count(); ++id) {
         MachineNode& n = lowered.mir.node(id);
         block_start.insert_if_absent(n.block, a.size());
 
+        const bool has_reg = id < ra.assignment.size() && ra.assignment[id] >= 0;
+
         switch (n.op) {
             case MOp::MOVri: {
                 // Materialize imm64 into the assigned register (or write the
                 // payload into the home slot when spilled).
-                if (id < ra.assignment.size() && ra.assignment[id] >= 0) {
-                    a.mov_r64_imm64(kAllocatableGPR[ra.assignment[id]],
+                if (has_reg) {
+                    a.mov_r64_imm64(alloc_reg(ra.assignment[id]),
                                     static_cast<std::uint64_t>(n.operands[0].imm));
                 } else {
-                    // store payload imm64: MOV [r12+disp], imm32 only supports
+                    // store payload imm64: MOV [frame+disp], imm32 only supports
                     // 32-bit — use a scratch register then store.
-                    a.mov_r64_imm64(PhysGPR::RAX, static_cast<std::uint64_t>(n.operands[0].imm));
-                    a.mov_mem_r64(PhysGPR::R12, slot_disp(n.home_slot, kPayloadOffset),
-                                  PhysGPR::RAX);
+                    a.mov_r64_imm64(x86::RAX, static_cast<std::uint64_t>(n.operands[0].imm));
+                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset),
+                                  x86::RAX);
                     // tag word = Tag::Int for integer constants
-                    a.mov_mem_imm32(PhysGPR::R12, slot_disp(n.home_slot, kTagOffset),
+                    a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagInt));
                 }
                 break;
             }
             case MOp::MOVrm: {
                 // Load payload from home slot into assigned reg.
-                if (id < ra.assignment.size() && ra.assignment[id] >= 0 &&
-                    n.operands.size() >= 1 && n.operands[0].kind == MachineOperand::FrameSlot) {
-                    a.mov_r64_mem(kAllocatableGPR[ra.assignment[id]], PhysGPR::R12,
+                if (has_reg && n.operands.size() >= 1 &&
+                    n.operands[0].kind == MachineOperand::FrameSlot) {
+                    a.mov_r64_mem(alloc_reg(ra.assignment[id]), frame_base,
                                  slot_disp(n.operands[0].slot, n.operands[0].tag_off));
                 }
                 break;
@@ -163,9 +181,9 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     n.operands[1].kind == MachineOperand::VReg &&
                     n.operands[1].vreg < ra.assignment.size() &&
                     ra.assignment[n.operands[1].vreg] >= 0) {
-                    a.mov_mem_r64(PhysGPR::R12,
+                    a.mov_mem_r64(frame_base,
                                   slot_disp(n.operands[0].slot, n.operands[0].tag_off),
-                                  kAllocatableGPR[ra.assignment[n.operands[1].vreg]]);
+                                  alloc_reg(ra.assignment[n.operands[1].vreg]));
                 }
                 break;
             }
@@ -173,94 +191,135 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
             case MOp::SUBrr:
             case MOp::IMULrr: {
                 if (n.operands.size() < 2) break;
-                const RegOrSlot dst{true,
-                                    static_cast<std::uint8_t>(
-                                        id < ra.assignment.size() && ra.assignment[id] >= 0
-                                            ? ra.assignment[id]
-                                            : 0),
-                                    0};
-                RegOrSlot lhs = resolve(n, n.operands[0], ra.assignment);
-                RegOrSlot rhs = resolve(n, n.operands[1], ra.assignment);
-                // Stage operands into RAX / RCX (clobbers are fine: they are
-                // allocatable and reloaded from homes at their next use).
+                const auto resolve = [&](const MachineOperand& op) noexcept {
+                    RegOrSlot r;
+                    if (op.kind == MachineOperand::VReg) {
+                        if (op.vreg < ra.assignment.size() &&
+                            ra.assignment[op.vreg] >= 0) {
+                            r.is_reg = true;
+                            r.reg = alloc_reg(ra.assignment[op.vreg]);
+                            return r;
+                        }
+                        // spilled: home slot of the defining node
+                        r.slot = op.vreg;
+                        return r;
+                    }
+                    r.slot = op.slot;
+                    return r;
+                };
+                RegOrSlot lhs = resolve(n.operands[0]);
+                RegOrSlot rhs = resolve(n.operands[1]);
+                // Stage operands into RAX / RCX (SysV caller-saved scratches:
+                // clobbers are fine, values reload from homes at next use).
                 if (lhs.is_reg) {
-                    a.mov_r64_r64(PhysGPR::RAX, kAllocatableGPR[lhs.reg]);
+                    a.mov_r64_r64(x86::RAX, lhs.reg);
                 } else {
-                    a.mov_r64_mem(PhysGPR::RAX, PhysGPR::R12, slot_disp(lhs.slot, kPayloadOffset));
+                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kPayloadOffset));
                 }
                 if (rhs.is_reg) {
-                    a.mov_r64_r64(PhysGPR::RCX, kAllocatableGPR[rhs.reg]);
+                    a.mov_r64_r64(x86::RCX, rhs.reg);
                 } else {
-                    a.mov_r64_mem(PhysGPR::RCX, PhysGPR::R12, slot_disp(rhs.slot, kPayloadOffset));
+                    a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
                 }
                 if (n.op == MOp::ADDrr) {
-                    a.alu_r64_r64(0x01, PhysGPR::RAX, PhysGPR::RCX);
+                    a.alu_r64_r64(0x01, x86::RAX, x86::RCX);
                 } else if (n.op == MOp::SUBrr) {
-                    a.alu_r64_r64(0x29, PhysGPR::RAX, PhysGPR::RCX);
+                    a.alu_r64_r64(0x29, x86::RAX, x86::RCX);
                 } else {
-                    a.imul_r64_r64(PhysGPR::RAX, PhysGPR::RCX);
+                    a.imul_r64_r64(x86::RAX, x86::RCX);
                 }
-                if (dst.is_reg && id < ra.assignment.size() && ra.assignment[id] >= 0) {
-                    a.mov_r64_r64(kAllocatableGPR[ra.assignment[id]], PhysGPR::RAX);
+                if (has_reg) {
+                    a.mov_r64_r64(alloc_reg(ra.assignment[id]), x86::RAX);
                 }
                 // Write-back: payload + tag.
-                a.mov_mem_r64(PhysGPR::R12, slot_disp(n.home_slot, kPayloadOffset), PhysGPR::RAX);
-                a.mov_mem_imm32(PhysGPR::R12, slot_disp(n.home_slot, kTagOffset),
+                a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
+                a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
                                 static_cast<std::int32_t>(kTagInt));
                 break;
             }
             case MOp::CMPrr: {
                 if (n.operands.size() < 2) break;
-                RegOrSlot lhs = resolve(n, n.operands[0], ra.assignment);
-                RegOrSlot rhs = resolve(n, n.operands[1], ra.assignment);
+                const auto resolve = [&](const MachineOperand& op) noexcept {
+                    RegOrSlot r;
+                    if (op.kind == MachineOperand::VReg) {
+                        if (op.vreg < ra.assignment.size() &&
+                            ra.assignment[op.vreg] >= 0) {
+                            r.is_reg = true;
+                            r.reg = alloc_reg(ra.assignment[op.vreg]);
+                            return r;
+                        }
+                        r.slot = op.vreg;
+                        return r;
+                    }
+                    r.slot = op.slot;
+                    return r;
+                };
+                RegOrSlot lhs = resolve(n.operands[0]);
+                RegOrSlot rhs = resolve(n.operands[1]);
                 if (lhs.is_reg) {
-                    a.mov_r64_r64(PhysGPR::RAX, kAllocatableGPR[lhs.reg]);
+                    a.mov_r64_r64(x86::RAX, lhs.reg);
                 } else {
-                    a.mov_r64_mem(PhysGPR::RAX, PhysGPR::R12, slot_disp(lhs.slot, kPayloadOffset));
+                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kPayloadOffset));
                 }
                 if (rhs.is_reg) {
-                    a.mov_r64_r64(PhysGPR::RCX, kAllocatableGPR[rhs.reg]);
+                    a.mov_r64_r64(x86::RCX, rhs.reg);
                 } else {
-                    a.mov_r64_mem(PhysGPR::RCX, PhysGPR::R12, slot_disp(rhs.slot, kPayloadOffset));
+                    a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
                 }
-                a.alu_r64_r64(0x39, PhysGPR::RAX, PhysGPR::RCX);
+                a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                 break;
             }
             case MOp::Jcc: {
-                // JNE rel32 to the block end (patched to the merge block by
-                // the scheduler-level branch logic; here: short forward jump
-                // placeholder that falls through — real branch fixup lands
-                // with the block-link pass).
-                std::size_t site = a.jcc_rel32(0x05 /*NE*/);
+                // Condition comes from the MIR operand (arch-neutral MCond),
+                // mapped through kX86Cond — never a hard-coded opcode byte.
+                if (n.operands.empty()) break;
+                const auto mc = static_cast<MCond>(n.operands[0].imm);
+                if (mc >= MCond::Count) break;
+                std::size_t site = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(mc)]);
                 patches.push_back(PatchSite{site, id + 1});
                 break;
             }
             case MOp::GUARD_INT: {
                 if (n.operands.size() < 2) break;
-                RegOrSlot lhs = resolve(n, n.operands[0], ra.assignment);
-                RegOrSlot rhs = resolve(n, n.operands[1], ra.assignment);
+                const auto resolve = [&](const MachineOperand& op) noexcept {
+                    RegOrSlot r;
+                    if (op.kind == MachineOperand::VReg) {
+                        if (op.vreg < ra.assignment.size() &&
+                            ra.assignment[op.vreg] >= 0) {
+                            r.is_reg = true;
+                            r.reg = alloc_reg(ra.assignment[op.vreg]);
+                            return r;
+                        }
+                        r.slot = op.vreg;
+                        return r;
+                    }
+                    r.slot = op.slot;
+                    return r;
+                };
+                RegOrSlot lhs = resolve(n.operands[0]);
+                RegOrSlot rhs = resolve(n.operands[1]);
                 // Tag checks: load tag words, compare each against Tag::Int.
                 if (lhs.is_reg) {
                     // tag lives in the home slot for register-cached values
                     // (write-back discipline keeps homes authoritative).
-                    a.mov_r64_mem(PhysGPR::RAX, PhysGPR::R12,
+                    a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(lhs.slot ? lhs.slot : n.home_slot, kTagOffset));
                 } else {
-                    a.mov_r64_mem(PhysGPR::RAX, PhysGPR::R12, slot_disp(lhs.slot, kTagOffset));
+                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kTagOffset));
                 }
-                a.mov_r64_imm64(PhysGPR::RCX, kTagInt);
-                a.alu_r64_r64(0x39, PhysGPR::RAX, PhysGPR::RCX);
-                std::size_t j1 = a.jcc_rel32(0x05);   // NE -> deopt
+                a.mov_r64_imm64(x86::RCX, kTagInt);
+                a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
+                std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);   // NE -> deopt
 
                 if (rhs.is_reg) {
-                    a.mov_r64_mem(PhysGPR::RAX, PhysGPR::R12,
+                    a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(rhs.slot ? rhs.slot : n.home_slot, kTagOffset));
                 } else {
-                    a.mov_r64_mem(PhysGPR::RAX, PhysGPR::R12, slot_disp(rhs.slot, kTagOffset));
+                    a.mov_r64_mem(x86::RAX, frame_base, slot_disp(rhs.slot, kTagOffset));
                 }
-                a.mov_r64_imm64(PhysGPR::RCX, kTagInt);
-                a.alu_r64_r64(0x39, PhysGPR::RAX, PhysGPR::RCX);
-                std::size_t j2 = a.jcc_rel32(0x05);
+                a.mov_r64_imm64(x86::RCX, kTagInt);
+                a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
+                std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
                 // ---- deopt stub (cold region, in-line for the single-buffer
                 // layout; jump distance is short) ----
@@ -269,8 +328,8 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 a.patch_jcc(j2, stub);
                 // mov edi, unit_id; mov esi, safepoint_idx; call deopt_entry
                 std::size_t s0 = a.size();
-                a.mov_r64_imm64(PhysGPR::RDI, unit_id);
-                a.mov_r64_imm64(PhysGPR::RSI, static_cast<std::uint64_t>(out.safepoints.size()));
+                a.mov_r64_imm64(x86::RDI, unit_id);
+                a.mov_r64_imm64(x86::RSI, static_cast<std::uint64_t>(out.safepoints.size()));
                 std::size_t call_site = a.call_rel32();
                 // Safepoint record BEFORE the trap: pc = jump site, live map
                 // = the two operands' slots.
@@ -280,13 +339,11 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 rec.stack_depth = static_cast<std::uint16_t>(lowered.frame_slots);
                 rec.live_regs = 2;
                 out.safepoints.push_back(rec);
-                out.mappings.push_back(
-                    SafepointMapping{static_cast<std::uint8_t>(PhysGPR::RAX), 0});
-                out.mappings.push_back(
-                    SafepointMapping{static_cast<std::uint8_t>(PhysGPR::RCX), 0});
+                out.mappings.push_back(SafepointMapping{x86::RAX, 0});
+                out.mappings.push_back(SafepointMapping{x86::RCX, 0});
                 // keep the call site for the runtime to patch with the real
                 // vortex_deopt_entry address (recorded via a fixed trampoline).
-                a.mov_r64_imm64(PhysGPR::RAX, reinterpret_cast<std::uint64_t>(&vortex_deopt_entry));
+                a.mov_r64_imm64(x86::RAX, reinterpret_cast<std::uint64_t>(&vortex_deopt_entry));
                 a.jmp_rax_placeholder();
                 (void)call_site;
                 (void)s0;
@@ -305,21 +362,20 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 rec.stack_depth = static_cast<std::uint16_t>(lowered.frame_slots);
                 rec.live_regs = 0;
                 out.safepoints.push_back(rec);
-                // mov r14, r12 (bridge needs the regs base); call bridge.
-                a.mov_r64_r64(PhysGPR::R14, PhysGPR::R12);
-                a.mov_r64_imm64(PhysGPR::RAX, 0);   // patched with bridge addr
+                // vm_ctx <- frame base (bridge needs the regs base); call bridge.
+                a.mov_r64_r64(vm_ctx, frame_base);
+                a.mov_r64_imm64(x86::RAX, 0);   // patched with bridge addr
                 a.jmp_rax_placeholder();
                 break;
             }
             case MOp::RET: {
                 // Result Value in rax(tag) + rdx(payload): reload from home 0.
-                a.mov_r64_mem(PhysGPR::RDX, PhysGPR::R12, slot_disp(0, kPayloadOffset));
-                a.mov_r64_mem(PhysGPR::RAX, PhysGPR::R12, slot_disp(0, kTagOffset));
-                a.pop_r64(PhysGPR::R15);
-                a.pop_r64(PhysGPR::R14);
-                a.pop_r64(PhysGPR::R13);
-                a.pop_r64(PhysGPR::R12);
-                a.pop_r64(PhysGPR::RBX);
+                a.mov_r64_mem(x86::RDX, frame_base, slot_disp(0, kPayloadOffset));
+                a.mov_r64_mem(x86::RAX, frame_base, slot_disp(0, kTagOffset));
+                for (std::uint32_t r = enum_size(ReservedGPR::Count); r-- > 0;) {
+                    a.pop_r64(target.reserved[r]);
+                }
+                a.pop_r64(x86::RBX);
                 a.ret();
                 break;
             }

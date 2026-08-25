@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -22,6 +23,15 @@
 namespace vortex {
 
 inline namespace abi_v1 {
+
+/// Scoped-enum cardinality: Count sentinel -> std::size_t. Scoped enums
+/// have no implicit integral conversion (the classic unary-plus trick only
+/// works on unscoped enums), so array bounds and loop limits use this.
+template <typename E>
+    requires std::is_enum_v<E>
+[[nodiscard]] consteval std::size_t enum_size(E count_sentinel) noexcept {
+    return static_cast<std::size_t>(count_sentinel);
+}
 
 template <typename E>
     requires std::is_enum_v<E>

@@ -16,6 +16,12 @@
 //      fallthrough. Parallel-move cycles go through scratch registers.
 //   5. Try ranges: [block(Catch.aux0 marker).start, Catch block start) ->
 //      handler at the Catch block start. Nested handlers nest naturally.
+//
+// Phi discipline (the nested-loop lesson): phis are REGISTERS, never
+// computations. Their inputs are materialized at the PREDECESSOR edge
+// (terminator MOVE emission + materialize_phi_source), never by a
+// recursive operand walk at the header — walking them hoists latch
+// computations into loop headers where their operands are not yet valid.
 // =============================================================================
 
 #include "vortex/pipeline/scheduler.hpp"
@@ -103,6 +109,7 @@ private:
     void emit_effect_op(NodeId id) noexcept;
     void emit_block(NodeId leader) noexcept;
     void emit_terminator(NodeId leader) noexcept;
+    void materialize_phi_source(NodeId src) noexcept;
     void dfs_post(NodeId leader, stdx::small_vector<NodeId, 64>& postorder) noexcept;
     [[nodiscard]] stdx::small_vector<NodeId, 8> successors(NodeId leader) noexcept;
 
@@ -197,13 +204,21 @@ void Scheduler::emit_value(NodeId id) noexcept {
         scheduled_.push_back(id);
     }
 
+    // Phis are REGISTERS, not computations. Their inputs are edge-specific
+    // (initial from the entry edge, carried value from the latch edge) and
+    // are materialized by the predecessor terminators' MOVE emission.
+    // Walking them here would hoist LATCH computations into the loop
+    // header, where their operands are not yet valid — the nested-while
+    // miscompile: `i = i + 1` (a latch effect) was emitted at the OUTER
+    // loop head reading the INNER loop's phi register before the inner
+    // loop ever executed. Single loops only survived because the hoisted
+    // op happened to read the (valid) outer phi.
+    if (n.kind == NodeKind::Phi || n.kind == NodeKind::EffectPhi) return;
+
     // schedule data operands first
     std::uint32_t start = 0;
     if (n.has(NodeFlag::OnEffectChain) || is_memory(n.kind)) start = 2;
     std::uint32_t n_inputs = n.ins.size();
-    if (n.kind == NodeKind::Phi || n.kind == NodeKind::EffectPhi) {
-        n_inputs = n_inputs > 0 ? n_inputs - 1 : 0;   // last input is control
-    }
     for (std::uint32_t i = start; i < n_inputs; ++i) {
         const Node& in = g_.node(n.ins[i]);
         if (is_control(in.kind)) continue;
@@ -321,6 +336,44 @@ void Scheduler::emit_value(NodeId id) noexcept {
             emit_effect_op(id);
             return;
     }
+}
+
+// Materialize a phi MOVE source at the predecessor edge (cases 3/4 of
+// emit_terminator). Constants and pass-produced PURE nodes (IV increments,
+// folded ops) have no control dependence — if nothing else scheduled them,
+// they emit here, right before the MOVE, because a phi no longer walks its
+// inputs (see emit_value). Effect-chain sources are NEVER re-emitted:
+// their computation is control-dependent (the continue-path double-add
+// regression). Phis and parameters are registers the MOVE reads directly.
+void Scheduler::materialize_phi_source(NodeId src) noexcept {
+    if (src == invalid_node) return;
+    const Node& sn = g_.node(src);
+    const bool is_const = sn.kind == NodeKind::ConstInt ||
+                          sn.kind == NodeKind::ConstFloat ||
+                          sn.kind == NodeKind::ConstPy;
+    if (is_const) {
+        emit_value(src);   // idempotent per-block LOAD_CONST
+        return;
+    }
+    if (sn.has(NodeFlag::Dead)) return;
+    if (sn.has(NodeFlag::OnEffectChain) || is_control(sn.kind)) return;
+    switch (sn.kind) {
+        case NodeKind::Phi:
+        case NodeKind::EffectPhi:
+        case NodeKind::Parameter:
+        case NodeKind::Guard:
+        case NodeKind::DeoptBarrier:
+            return;   // registers — the MOVE reads them where they live
+        default:
+            break;
+    }
+    // Unscheduled pure computation (its only user may be the phi itself):
+    // emit at this predecessor — its operands dominate the edge by
+    // construction of the dataflow that produced it.
+    for (NodeId s : scheduled_) {
+        if (s == src) return;
+    }
+    emit_value(src);
 }
 
 void Scheduler::emit_effect_op(NodeId id) noexcept {
@@ -622,13 +675,7 @@ void Scheduler::emit_terminator(NodeId leader) noexcept {
         for (NodeId phi : phis) {
             const Node& p = g_.node(phi);
             NodeId src = p.ins[1];
-            {
-                const Node& sn = g_.node(src);
-                bool is_const = sn.kind == NodeKind::ConstInt ||
-                                sn.kind == NodeKind::ConstFloat ||
-                                sn.kind == NodeKind::ConstPy;
-                if (is_const) emit_value(src);
-            }
+            materialize_phi_source(src);
             Instr mv{};
             mv.op = static_cast<std::uint16_t>(Op::MOVE);
             mv.dst = static_cast<std::uint16_t>(phi);
@@ -675,18 +722,12 @@ void Scheduler::emit_terminator(NodeId leader) noexcept {
             const Node& p = g_.node(phi);
             if (pred_index >= p.ins.size() - 1) continue;
             NodeId src = p.ins[pred_index];
-            // Materialize unscheduled CONSTANT sources in this block before
-            // the move (phi move referencing a const scheduled later = the
-            // ternary-None bug). Non-const sources must not re-emit: their
-            // computation may be control-dependent (the continue-path
-            // double-add regression).
-            {
-                const Node& sn = g_.node(src);
-                bool is_const = sn.kind == NodeKind::ConstInt ||
-                                sn.kind == NodeKind::ConstFloat ||
-                                sn.kind == NodeKind::ConstPy;
-                if (is_const) emit_value(src);
-            }
+            // Materialize unscheduled CONSTANT / pure sources in this block
+            // before the move (phi move referencing a value scheduled later
+            // = the ternary-None bug). Non-const effectful sources must not
+            // re-emit: their computation may be control-dependent (the
+            // continue-path double-add regression).
+            materialize_phi_source(src);
             Instr mv{};
             mv.op = static_cast<std::uint16_t>(Op::MOVE);
             mv.dst = static_cast<std::uint16_t>(phi);

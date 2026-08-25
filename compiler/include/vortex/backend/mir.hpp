@@ -29,9 +29,10 @@ namespace vortex::backend {
 inline namespace abi_v1 {
 
 /// Machine opcodes — arch-neutral MIR surface. Distinct sequential values
-/// (a switch must be exhaustive and unambiguous); the x86 encoding and the
-/// latency-table index are derived at emission, NOT overloaded onto the
-/// opcode value.
+/// (a switch must be exhaustive and unambiguous); the x86/ARM encoding and
+/// per-cost-class latencies are derived at emission from tables owned by
+/// the emitters and the TargetDescriptor — NEVER overloaded onto the opcode
+/// value.
 enum class MOp : std::uint8_t {
     MOVri = 1,      // dst <- imm64
     MOVrm,          // dst <- [frame slot]
@@ -63,9 +64,63 @@ enum class MOp : std::uint8_t {
     DEOPT_TRAP,
 };
 
+/// Branch predicates — arch-neutral. The machine condition encoding (x86
+/// Jcc low nibble, AArch64 cond field) is emitter-side table data; the old
+/// version of this enum carried raw x86 opcode bytes as its values, which
+/// silently leaked one ISA into the neutral MIR.
 enum class MCond : std::uint8_t {
-    E = 0x84, NE = 0x85, L = 0x8C, GE = 0x8D, LE = 0x8E, G = 0x8F,
+    EQ = 0, NE, LT, GE, LE, GT,
+    Count,   // sentinel: keeps the value space dense and future additions
+             // append-only (the dispatch-table lesson from Op).
 };
+
+/// Arch-neutral cost classification (Rule 45): maps a machine op onto the
+/// TargetDescriptor's latency row. Scheduling and peephole cost decisions
+/// go through this — never through opcode-shaped literals.
+[[nodiscard]] constexpr CostClass cost_class(MOp op) noexcept {
+    switch (op) {
+        case MOp::MOVri:
+        case MOp::MOVrr:
+            return CostClass::Move;
+        case MOp::MOVrm:
+        case MOp::VMOVUPS:
+            return CostClass::Load;
+        case MOp::MOVmr:
+            return CostClass::Store;
+        case MOp::ADDrr:
+        case MOp::SUBrr:
+        case MOp::NEGrr:
+        case MOp::CMPrr:
+        case MOp::CMPri:
+        case MOp::TESTrr:
+        case MOp::LEA:
+            return CostClass::Alu;
+        case MOp::IMULrr:
+            return CostClass::Mul;
+        case MOp::VADDrr:
+        case MOp::VPINSRQ:
+            return CostClass::VecAlu;
+        case MOp::JMP:
+        case MOp::Jcc:
+            return CostClass::Branch;
+        case MOp::CALLri:
+        case MOp::CALLrr:
+        case MOp::RET:
+            return CostClass::Call;
+        case MOp::PUSH:
+        case MOp::POP:
+            return CostClass::Move;
+        case MOp::INCREF:
+        case MOp::DECREF:
+        case MOp::GUARD_TAG:
+        case MOp::GUARD_INT:
+            return CostClass::Alu;   // tag load + compare, branch folded
+        case MOp::SAFEPOINT:
+        case MOp::DEOPT_TRAP:
+            return CostClass::Branch;
+    }
+    return CostClass::Alu;
+}
 
 /// Operand kinds: virtual register, immediate, or frame-relative memory
 /// (the Tier-0 home slot). Memory operands only reference the frame base

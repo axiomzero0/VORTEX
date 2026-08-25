@@ -74,15 +74,26 @@ using OptPipeline = std::tuple<
     P50_LateGVN,
     P51_GlobalDCE>;
 
-/// Budget-aware tier filter: Tier 1 runs only the linear-time subset.
+/// Budget-aware tier filter. Two independent gates:
+///   1. OPT-IN gate (all tiers): passes flagged OptOption in the spec only
+///      run when the caller explicitly requested them. Polyhedral
+///      (33) is the canonical example — heavy, profile-dependent, off by
+///      default in every tier.
+///   2. TIER gate: Tier 1 runs only the linear-time subset.
 struct TierFilter {
     TierMode tier{TierMode::Tier1};
-    [[nodiscard]] bool include(const char* pass_name) const noexcept {
+    explicit TierFilter(TierMode t) noexcept : tier(t) {}
+    TierFilter() = default;
+    [[nodiscard]] bool include(const char* pass_name, const PassContext& ctx) const noexcept {
+        std::string_view n(pass_name);
+        // Opt-in optimizations: never run unless requested (all tiers).
+        if (n == "33_polyhedral" && !ctx.options.has(OptOption::Polyhedral)) {
+            return false;
+        }
         if (tier != TierMode::Tier1) return true;
         // Tier 1 (budget-constrained baseline): cheap passes only. The
         // fixpoint-heavy analyses and all speculation defer to Tier 2/3 —
         // each pass additionally self-gates on the tier mode.
-        std::string_view n(pass_name);
         return n != "08_sccp" && n != "10_early_gvn" && n != "11_andersen" &&
                n != "12_cfl_alias" && n != "14_demand_alias" && n != "16_ic_mono" &&
                n != "20_spec_inline" && n != "21_partial_inline" &&
@@ -103,7 +114,7 @@ template <typename Pipeline = OptPipeline>
         [&](auto&... pass) {
             (
                 [&]() {
-                    if (!filter.include(pass.name)) return;
+                    if (!filter.include(pass.name, ctx)) return;
                     if (g.live_node_count() > ctx.node_budget) {
                         if (ctx.telemetry) {
                             ctx.telemetry->record(TelemetryEventKind::BudgetExceeded,

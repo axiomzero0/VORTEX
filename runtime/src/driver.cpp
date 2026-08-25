@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+#include "vortex/backend/target.hpp"
 #include "vortex/frontend/lowering.hpp"
 #include "vortex/frontend/parser.hpp"
 #include "vortex/passes/pass_pipeline.hpp"
@@ -18,7 +19,8 @@ namespace vortex::rt {
 inline namespace abi_v1 {
 
 CompileOutcome compile_program(Vm& vm, std::string_view source,
-                               SymbolId module_name) noexcept {
+                               SymbolId module_name,
+                               const CompileOptions& options) noexcept {
     CompileOutcome outcome;
     Runtime& rt = Runtime::instance();
 
@@ -83,6 +85,13 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
             pctx.node_budget = cfg::tier2_node_budget;
             pctx.code_unit_id = lowered.code_unit_id;
             pctx.telemetry = &vm.telemetry;
+            // Machine facts come from the probed host descriptor — never
+            // from cfg constants (Rule 24/27).
+            pctx.target = &backend::host_target();
+            // Opt-in switches (Pass 33 polyhedral is off unless requested).
+            if (options.polyhedral) {
+                pctx.options.set(passes::OptOption::Polyhedral);
+            }
             Result<void> optimized = passes::optimize(lowered.graph, pctx);
             if (!optimized) {
                 outcome.diagnostic = optimized.error();
@@ -151,9 +160,10 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
     return outcome;
 }
 
-Result<Value> run_source(Vm& vm, std::string_view source) noexcept {
+Result<Value> run_source(Vm& vm, std::string_view source,
+                         const CompileOptions& options) noexcept {
     SymbolId module_name = global_symbols().intern("__main__");
-    CompileOutcome outcome = compile_program(vm, source, module_name);
+    CompileOutcome outcome = compile_program(vm, source, module_name, options);
     if (!outcome.ok) {
         Diagnostic d = outcome.diagnostic;
         if (d.fix.empty()) {
