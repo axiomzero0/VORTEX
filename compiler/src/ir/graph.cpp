@@ -40,6 +40,11 @@ NodeId Graph::create_pure_consed(NodeKind kind, std::initializer_list<NodeId> in
                                  std::uint16_t subop) noexcept {
     // Hash-cons lookup: linear scan is fine at construction time (nodes are
     // created in the hundreds, and pass-level GVN uses its own table).
+    // TTC-5 fix: the previous dedup compared only {kind, subop, ins}. A pure
+    // node's identity also includes const_value, symbol, shape_id, and aux0
+    // — e.g. two ConstInt nodes with the same NodeKind but different payload
+    // were wrongly deduped. We now compare via Node::structurally_equal,
+    // which includes all value-numbering-key fields.
     Node probe;
     probe.kind = kind;
     probe.subop = subop;
@@ -49,10 +54,7 @@ NodeId Graph::create_pure_consed(NodeKind kind, std::initializer_list<NodeId> in
     for (std::uint32_t i = 1; i < nodes_.size(); ++i) {
         const Node& existing = nodes_[i];
         if (existing.has(NodeFlag::Dead) || !existing.has(NodeFlag::Pure)) continue;
-        if (existing.kind == kind && existing.subop == subop &&
-            existing.ins.size() == probe.ins.size() &&
-            std::memcmp(existing.ins.data(), probe.ins.data(),
-                        probe.ins.size() * sizeof(NodeId)) == 0) {
+        if (existing.structurally_equal(probe)) {
             return NodeId(i);
         }
     }

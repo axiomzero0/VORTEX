@@ -76,13 +76,25 @@ public:
     [[nodiscard]] constexpr bool operator==(const Flags&) const noexcept = default;
 
     /// Iterate set bits — returns the E value at slot `i` (i < popcount).
+    /// TTC-13: out-of-range `i` used to spin forever (loop terminated only
+    /// on `seen == i`, which never fires if i >= popcount — the bits run out
+    /// but `remaining ^ low` on a zero remaining is a no-op so the loop is
+    /// infinite). Bounds-check i against popcount and return a zero sentinel
+    /// for out-of-range callers (we cannot throw — Rule 6).
     [[nodiscard]] constexpr E at(std::size_t i) const noexcept {
+        const std::size_t total = popcount();
+        if (i >= total) [[unlikely]] {
+            // Out-of-range: return E{0} — caller is contractually required
+            // to check `i < popcount()`; this is a defensive fallback.
+            return static_cast<E>(0);
+        }
         underlying remaining = bits_;
-        for (std::size_t seen = 0;; ++seen) {
+        for (std::size_t seen = 0; seen < total; ++seen) {
             underlying low = remaining & (~remaining + 1);  // lowest set bit
             if (seen == i) return static_cast<E>(low);
             remaining ^= low;
         }
+        return static_cast<E>(0);  // unreachable if popcount() is honest
     }
     [[nodiscard]] constexpr std::size_t popcount() const noexcept {
         return static_cast<std::size_t>(__builtin_popcountll(bits_));

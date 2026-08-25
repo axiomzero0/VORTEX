@@ -113,8 +113,15 @@ public:
 
     small_vector& operator=(const small_vector& other) {
         if (this == &other) return *this;
+        // Order matters: grow_to() may relocate existing elements out of
+        // begin_ and free begin_, so it MUST run BEFORE destroy_elements()
+        // (which still needs begin_ to point at the live objects). After
+        // grow_to, begin_ points at a fresh buffer (or stays inline) and
+        // size_ is unchanged; we then destroy the stale elements at the
+        // new begin_, copy-construct fresh ones from `other`, and adjust
+        // size_. Avoids the TTC-4 destroy-then-grow_to UB pattern.
+        if (other.size_ > capacity_) [[unlikely]] { grow_to(other.size_); }
         destroy_elements();
-        reserve_for_copy(other.size_);
         copy_elements(other);
         size_ = other.size_;
         return *this;
@@ -232,14 +239,32 @@ public:
     void insert(size_type idx, const T& v) {
         VORTEX_ASSUME(idx <= size_);
         if (size_ == capacity_) [[unlikely]] { grow_to(capacity_ + 1); }
-        // Move tail one slot right (element-wise for non-trivial T).
+        // TTC-2 fix: never destroy-then-assign. For non-trivial T, every
+        // slot must be in a live state before assignment OR be placement-
+        // newed. We construct the new tail slot from the moved-out last
+        // element, then shift each slot via move-construct-from-source-then-
+        // destroy-source. The hole at idx is finally placement-newed from v.
         if (size_ > idx) {
+            // Construct a live copy of the last element at the new tail slot.
             new (begin_ + size_) T(std::move(begin_[size_ - 1]));
-            for (size_type i = size_ - 1; i > idx; --i) {
-                begin_[i] = std::move(begin_[i - 1]);
+            // Walk right-to-left: destroy begin_[i] (which was just moved-
+            // from into begin_[i+1]), then move-construct from begin_[i-1].
+            if constexpr (!std::is_trivially_destructible_v<T>) {
+                for (size_type i = size_ - 1; i > idx; --i) {
+                    begin_[i].~T();
+                    new (begin_ + i) T(std::move(begin_[i - 1]));
+                }
+                // begin_[idx] still holds its original value; we moved it
+                // to begin_[idx+1] above (when i == idx+1 fired). Destroy
+                // the stale original and placement-new from v.
+                begin_[idx].~T();
+            } else {
+                // Trivial T: classic memmove-style shift.
+                for (size_type i = size_; i > idx + 1; --i) {
+                    begin_[i - 1] = begin_[i - 2];
+                }
             }
-            begin_[idx].~T();
-            begin_[idx] = v;
+            new (begin_ + idx) T(v);
         } else {
             new (begin_ + idx) T(v);
         }
@@ -248,11 +273,21 @@ public:
 
     void erase(size_type idx) {
         VORTEX_ASSUME(idx < size_);
-        begin_[idx].~T();
-        for (size_type i = idx; i + 1 < size_; ++i) {
-            begin_[i] = std::move(begin_[i + 1]);
+        // TTC-3 fix: destroy-then-move-assign was UB for non-trivial T.
+        // Walk left-to-right: destroy begin_[i], move-construct from
+        // begin_[i+1]. The final slot is destroyed once at the end.
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            // Trivial: classic memmove-style shift.
+            for (size_type i = idx; i + 1 < size_; ++i) {
+                begin_[i] = begin_[i + 1];
+            }
+        } else {
+            for (size_type i = idx; i + 1 < size_; ++i) {
+                begin_[i].~T();
+                new (begin_ + i) T(std::move(begin_[i + 1]));
+            }
+            begin_[size_ - 1].~T();
         }
-        begin_[size_ - 1].~T();
         --size_;
     }
 

@@ -32,6 +32,11 @@ public:
         : dense_(universe), sparse_(universe, sentinel), member_count_(0) {}
 
     void insert(std::size_t v) noexcept {
+        // TTC-12: bounds-check the universe before indexing sparse_/dense_.
+        // Without this, v >= universe writes OOB into sparse_ and dense_ —
+        // silent memory corruption that ASAN catches but the project's own
+        // invariants don't.
+        if (v >= sparse_.size()) [[unlikely]] { return; }
         if (contains(v)) return;
         sparse_[v] = static_cast<std::uint32_t>(member_count_);
         dense_[member_count_++] = static_cast<std::uint32_t>(v);
@@ -101,6 +106,21 @@ public:
     }
     /// Returns true if any bit changed (classic dataflow "changed" signal).
     bool union_with(const BitVector& o) noexcept {
+        // TTC-11: bounds-check the operand. Two BitVectors with different
+        // sizes have different word counts; indexing o.words_[w] past its
+        // size is OOB. The static contract requires same size; we still
+        // belt-and-braces the bound at runtime in case a pass creates
+        // asymmetric universes (e.g. liveness vs. live-in sets).
+        if (o.bits_ != bits_ || o.words_.size() != words_.size()) [[unlikely]] {
+            const std::size_t shared = words_.size() < o.words_.size() ? words_.size() : o.words_.size();
+            bool changed = false;
+            for (std::size_t w = 0; w < shared; ++w) {
+                std::uint64_t merged = words_[w] | o.words_[w];
+                if (merged != words_[w]) changed = true;
+                words_[w] = merged;
+            }
+            return changed;
+        }
         bool changed = false;
         for (std::size_t w = 0; w < words_.size(); ++w) {
             std::uint64_t merged = words_[w] | o.words_[w];

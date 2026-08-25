@@ -418,6 +418,11 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
         case ObjTag::DictIter: {
             // Insertion-order iteration (CPython 3.7+ guarantee): repeatedly
             // select the live entry with the smallest seq >= cursor.
+            // OBJ-16 fix: skip tombstones (used=true, key.tag=None). With
+            // backward-shift deletion in dict_del, tombstones shouldn't be
+            // present in the live table, but a table may have been built
+            // before this fix shipped — defensive guard prevents the iter
+            // from returning None for deleted entries.
             auto* di = static_cast<PyDictIterObj*>(o);
             PyDictObj* dict = di->dict;
             if (di->remaining == 0 || !dict) {
@@ -429,6 +434,7 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
             for (std::uint32_t i = 0; i < dict->capacity; ++i) {
                 const DictEntry& e = dict->entries[i];
                 if (!e.used || e.seq < di->slot) continue;   // already emitted
+                if (e.key.tag == Tag::None) continue;        // tombstone
                 if (e.seq < best) {
                     best = e.seq;
                     best_slot = i;
@@ -438,7 +444,13 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
                 out = Value::none();
                 return true;
             }
+            // OBJ-15-style fix: return an OWNED reference (incref) so the
+            // caller's decref balances. Previously iter_next returned a
+            // borrowed ref from the dict's slot — the caller's slot
+            // teardown would drop the dict's only reference, freeing the
+            // value while the dict still referenced it.
             out = dict->entries[best_slot].key;
+            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
             di->slot = best + 1;   // next scan starts after this seq
             --di->remaining;
             return true;
@@ -754,7 +766,12 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
         // keys/values/items -> list
         auto* result = rt.new_list();
         for (std::uint32_t i = 0; i < d->capacity; ++i) {
+            // OBJ-7 fix: skip tombstones. used=true with key.tag=None is a
+            // tombstone from the old deletion scheme (current dict_del
+            // uses backward-shift, so this is defensive — but the table
+            // may have been built by external code with tombstones).
             if (!d->entries[i].used) continue;
+            if (d->entries[i].key.tag == Tag::None) continue;
             Value v;
                 if (kind == 0x201) v = d->entries[i].key;
             else if (kind == 0x202) v = d->entries[i].value;
@@ -765,12 +782,16 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                 if (pair->items[0].tag == Tag::Obj) rt.incref(pair->items[0].as.obj);
                 if (pair->items[1].tag == Tag::Obj) rt.incref(pair->items[1].as.obj);
                 v = Value::object(reinterpret_cast<PyObj*>(pair));
+                // For pair: list_push adopts (incref's), but we own a
+                // separate ref from new_tuple. Drop ours.
+                list_push(result, v);
+                rt.decref(reinterpret_cast<PyObj*>(pair));
+                continue;
             }
-            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
-            if (!list_push(result, v)) {
-                raise_builtin(rt.type_memory_error, "list allocation failed");
-                return false;
-            }
+            // OBJ-7 fix: the previous code incref'd v before list_push
+            // (which also incref's), leaking +1 per entry. list_push
+            // handles the incref for us; just push the borrowed value.
+            list_push(result, v);
         }
         out = Value::object(reinterpret_cast<PyObj*>(result));
         return true;
@@ -1713,7 +1734,10 @@ L_LIST_APPEND: {
     auto* l = static_cast<PyListObj*>(regs[cur->a].as.obj);
     Value v = regs[cur->b];
     RAISE_CHECK(l != nullptr);
-    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    // OBJ-5 fix: list_push adopts (it incref's v internally). The previous
+    // code incref'd here AND in list_push, leaking +1 ref per append.
+    // Drop our manual incref — list_push takes ownership of an independent
+    // reference, leaving the caller's scratch ref intact.
     RAISE_CHECK(list_push(l, v));
     ++f.pc;
     VM_LOAD();

@@ -5,6 +5,7 @@
 
 #include "vortex/rt/object.hpp"
 
+#include "vortex/rt/interp.hpp"   // PyBoundMethodObj (BoundMethod decref)
 #include "vortex/ir/node.hpp"
 
 #include <cmath>
@@ -19,6 +20,34 @@ inline namespace abi_v1 {
 namespace {
 void push_cstr(stdx::small_vector<char, 128>& out, const char* s) noexcept {
     for (const char* p = s; *p; ++p) out.push_back(*p);
+}
+
+/// OBJ-10/OBJ-18 helper: convert a BigNum to double. Uses the top two limbs
+/// (each base 2^32) as mantissa and the limb count for the binary exponent.
+/// Matches CPython's int->float conversion for numbers too large to fit
+/// in int64. Result loses precision beyond 2^53 but is the standard
+/// approach when arbitrary-precision rationals aren't available.
+double bignum_to_double(const BigNum& b) noexcept {
+    if (b.limbs.empty()) return 0.0;
+    std::uint64_t high = b.limbs.back();
+    std::uint64_t low = b.limbs.size() >= 2 ? b.limbs[b.limbs.size() - 2] : 0;
+    // Combine high (top 32 bits) and low (next 32 bits) into a 64-bit
+    // mantissa, then scale by the number of limbs below the top.
+    std::uint64_t mantissa = (high << 32) | low;
+    double m = static_cast<double>(mantissa);
+    // Each limb is 2^32. The top limb is at position (n-1)*32 bits. The
+    // mantissa we built occupies the top 64 bits, so we shift down by
+    // 32 (since we included the high limb) and up by (n-1)*32.
+    // Final exponent: (n-1)*32 bits for the high limb's position.
+    std::int64_t n = static_cast<std::int64_t>(b.limbs.size());
+    double scale = std::pow(2.0, static_cast<double>((n - 1) * 32));
+    double result = m * scale;
+    // The combined mantissa overstates by a factor of 2^32 (we counted
+    // the top limb twice: once as `high` shifted into the top of the
+    // 64-bit mantissa, and once via the `scale` factor that places the
+    // top limb at bit position (n-1)*32). Correct by dividing by 2^32.
+    result /= 4294967296.0;   // 2^32
+    return b.negative ? -result : result;
 }
 
 /// Python float repr: shortest round-trip with mandatory '.' or exponent
@@ -441,10 +470,41 @@ void Runtime::decref(PyObj* o) noexcept {
                 break;
             }
             case ObjTag::Float: case ObjTag::Bool:
-            case ObjTag::None: case ObjTag::Type: case ObjTag::NativeFn:
-            case ObjTag::Module: case ObjTag::Cell:
+            case ObjTag::None: case ObjTag::NativeFn:
                 /* region-managed: no free */
                 break;
+            // OBJ-11/12A/13 fixes: Type/Module/Cell carry owned
+            // sub-objects (dict / ns / value) that must be decref'd on
+            // the final release. Previously they fell through to the
+            // no-op default — every Type/Module/Cell instance leaked
+            // its dict / ns / value.
+            case ObjTag::Type: {
+                auto* t = static_cast<PyTypeObj*>(o);
+                if (t->dict) decref(reinterpret_cast<PyObj*>(t->dict));
+                /* region-managed: shape root is region-allocated, no free */
+                break;
+            }
+            case ObjTag::Module: {
+                auto* m = static_cast<PyModuleObj*>(o);
+                if (m->ns) decref(reinterpret_cast<PyObj*>(m->ns));
+                break;
+            }
+            case ObjTag::Cell: {
+                auto* c = static_cast<PyCellObj*>(o);
+                if (c->value.tag == Tag::Obj && c->value.as.obj) {
+                    decref(c->value.as.obj);
+                }
+                break;
+            }
+            // OBJ-bound leak fix: BoundMethod holds an incref'd receiver
+            // (see Vm::load_attr). Release it on final decref.
+            case ObjTag::BoundMethod: {
+                auto* bm = static_cast<PyBoundMethodObj*>(o);
+                if (bm->recv.tag == Tag::Obj && bm->recv.as.obj) {
+                    decref(bm->recv.as.obj);
+                }
+                break;
+            }
             case ObjTag::Str:
                 /* region-managed: no free */
                 break;
@@ -593,6 +653,11 @@ PyTupleObj* Runtime::new_tuple(std::uint32_t n) noexcept {
     t->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
     t->pad = 0;
     t->length = n;
+    t->items = nullptr;   // OBJ-1 fix: explicit init even when n=0. The struct
+                           // default {nullptr} does NOT run for heap_alloc'd
+                           // memory; without this, new_tuple(0) returned a
+                           // tuple whose items pointer was region garbage —
+                           // destroying it would free(garbage) and crash.
     if (n) {
         t->items = static_cast<Value*>(std::calloc(n, sizeof(Value)));
         std::memset(t->items, 0, sizeof(Value) * n);
@@ -859,12 +924,30 @@ bool Runtime::truthy(const Value& v) noexcept {
 }
 
 bool Runtime::eq(const Value& a, const Value& b) noexcept {
+    // OBJ-14 fix: Tag::Bool must compare equal to its integer 0/1 form
+    // (Python: True == 1, False == 0). The previous code returned false
+    // for True == 1 because tags differed. Promote either Bool operand
+    // to Int, then fall through to the numeric comparison.
+    auto is_bool_int = [](Tag t) { return t == Tag::Bool || t == Tag::Int; };
+    if ((a.tag == Tag::Bool || a.tag == Tag::Int) &&
+        (b.tag == Tag::Bool || b.tag == Tag::Int)) {
+        std::int64_t av = a.tag == Tag::Bool ? (a.as.i ? 1 : 0) : a.as.i;
+        std::int64_t bv = b.tag == Tag::Bool ? (b.as.i ? 1 : 0) : b.as.i;
+        return av == bv;
+    }
     // numeric tower equality
     if (a.tag == Tag::Int && b.tag == Tag::Int) return a.as.i == b.as.i;
     if (a.tag == Tag::Float && b.tag == Tag::Float) return a.as.f == b.as.f;
     if ((a.tag == Tag::Int && b.tag == Tag::Float) || (a.tag == Tag::Float && b.tag == Tag::Int)) {
         double x = a.tag == Tag::Int ? static_cast<double>(a.as.i) : a.as.f;
         double y = b.tag == Tag::Int ? static_cast<double>(b.as.i) : b.as.f;
+        return x == y;
+    }
+    // Bool vs Float: True == 1.0 should hold.
+    if ((a.tag == Tag::Bool && b.tag == Tag::Float) ||
+        (a.tag == Tag::Float && b.tag == Tag::Bool)) {
+        double x = a.tag == Tag::Bool ? (a.as.i ? 1.0 : 0.0) : a.as.f;
+        double y = b.tag == Tag::Bool ? (b.as.i ? 1.0 : 0.0) : b.as.f;
         return x == y;
     }
     if (a.tag != Tag::Obj || b.tag != Tag::Obj) return a.tag == b.tag && a.as.i == b.as.i;
@@ -919,7 +1002,15 @@ bool Runtime::eq(const Value& a, const Value& b) noexcept {
 std::uint32_t Runtime::hash(const Value& v) noexcept {
     switch (v.tag) {
         case Tag::None: return 2;
-        case Tag::Bool: return v.as.i ? 3 : 4;
+        // OBJ-14 fix: hash(True) must equal hash(1) and hash(False) must
+        // equal hash(0) — Python's invariant that equal values hash
+        // equal. Previously True hashed to 3 while 1 hashed to 1; dicts
+        // and sets silently broken when mixing bool/int keys.
+        case Tag::Bool: {
+            std::int64_t x = v.as.i ? 1 : 0;
+            if (x >= 0 && x <= 0xFFFFFFFFll) return static_cast<std::uint32_t>(x);
+            return fold64(static_cast<std::uint64_t>(x));
+        }
         case Tag::Int: {
             std::int64_t x = v.as.i;
             if (x >= 0 && x <= 0xFFFFFFFFll) return static_cast<std::uint32_t>(x);
@@ -1119,7 +1210,14 @@ bool list_push(PyListObj* l, Value v) noexcept {
 
 bool list_set(PyListObj* l, std::uint32_t i, Value v) noexcept {
     if (i >= l->length) return false;
-    if (l->items[i].tag == Tag::Obj) Runtime::instance().decref(l->items[i].as.obj);
+    // OBJ-4 fix: ADOPT the new value (incref) so the list owns an
+    // independent reference. list_push already adopts (it incref's);
+    // list_set used to BORROW (no incref), which made the stored
+    // reference dangle when the caller's slot was overwritten or freed.
+    // Now both list ops follow the same adopt contract.
+    Runtime& rt = Runtime::instance();
+    if (l->items[i].tag == Tag::Obj) rt.decref(l->items[i].as.obj);
+    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
     l->items[i] = v;
     return true;
 }
@@ -1129,6 +1227,13 @@ Value list_get(PyListObj* l, std::uint32_t i) noexcept {
 }
 
 static bool dict_grow(PyDictObj* d) noexcept {
+    // DICT-TOMBSTONE fix: skip tombstones (used=true, key.tag=None) when
+    // rehashing. The previous code copied tombstones to the new table,
+    // where they accumulated across grows and could eventually fill the
+    // table — at which point dict_set's probe loop had no `!e.used`
+    // termination and spun forever (the DICT-TOMBSTONE infinite loop).
+    // With tombstones dropped on grow, the new table is dense and the
+    // probe contract holds.
     if (d->capacity > 4096) {
     }
     std::uint32_t new_cap = d->capacity * 2;
@@ -1137,6 +1242,11 @@ static bool dict_grow(PyDictObj* d) noexcept {
     if (!fresh) return false;
     for (std::uint32_t i = 0; i < d->capacity; ++i) {
         if (!d->entries[i].used) continue;
+        // Skip tombstones: used=true with key.tag=None means the entry
+        // was deleted (dict_del now uses backward-shift deletion, but
+        // pre-existing tombstones from older deletes may still be present
+        // in the live table when grow is triggered).
+        if (d->entries[i].key.tag == Tag::None) continue;
         std::uint32_t h = d->entries[i].hash;
         std::uint32_t idx = h & (new_cap - 1);
         while (fresh[idx].used) idx = (idx + 1) & (new_cap - 1);
@@ -1179,6 +1289,11 @@ bool dict_set(PyDictObj* d, Value key, Value value) noexcept {
     }
 }
 bool dict_get(PyDictObj* d, const Value& key, Value& out) noexcept {
+    // OBJ-6 fix: return an OWNED reference. Callers (d.get(), the
+    // interpreter's LOAD_INDEX on dict, bi_keys/values/items) treat the
+    // out-value as owned and decref when their slot is reused. A borrowed
+    // return made the dict's entry value vanishes when the caller's slot
+    // was released — classic UAF.
     Runtime& rt = Runtime::instance();
     std::uint32_t h = rt.hash(key);
     std::uint32_t idx = h & (d->capacity - 1);
@@ -1187,36 +1302,80 @@ bool dict_get(PyDictObj* d, const Value& key, Value& out) noexcept {
         if (!e.used) return false;
         if (e.hash == h && rt.eq(e.key, key)) {
             out = e.value;
+            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
             return true;
         }
         idx = (idx + 1) & (d->capacity - 1);
     }
 }
 bool dict_del(PyDictObj* d, const Value& key) noexcept {
+    // DICT-TOMBSTONE fix: use backward-shift deletion (the standard
+    // linear-probing deletion algorithm). The previous code marked the
+    // victim slot as a tombstone (used=true, key=None) and left it in
+    // the table — probes walked past it forever and grows copied it.
+    // Backward-shift: empty the victim slot, then walk forward and shift
+    // each subsequent entry whose probe distance would shorten by moving
+    // into the new hole. After this, the table has NO tombstones.
     Runtime& rt = Runtime::instance();
     std::uint32_t h = rt.hash(key);
-    std::uint32_t idx = h & (d->capacity - 1);
+    std::uint32_t mask = d->capacity - 1;
+    std::uint32_t i = h & mask;
     for (;;) {
-        DictEntry& e = d->entries[idx];
-        if (!e.used) return false;
+        DictEntry& e = d->entries[i];
+        if (!e.used) return false;   // key not present
         if (e.hash == h && rt.eq(e.key, key)) {
+            // found victim at slot i — release its refs.
             if (e.key.tag == Tag::Obj) rt.decref(e.key.as.obj);
             if (e.value.tag == Tag::Obj) rt.decref(e.value.as.obj);
-            e.used = true;       // tombstone
             e.key = Value::none();
             e.value = Value::none();
-            // rebuild cluster to preserve probe invariants (simple full rebuild)
+            e.used = false;
+            e.hash = 0;
+            e.seq = 0;
             --d->count;
+            // backward-shift: walk forward, relocating entries that
+            // would still find their home if moved into the hole.
+            std::uint32_t hole = i;
+            std::uint32_t j = (hole + 1) & mask;
+            while (d->entries[j].used) {
+                DictEntry& je = d->entries[j];
+                std::uint32_t home = je.hash & mask;
+                // Can je move into the hole? Yes iff the hole is in
+                // [home+1 .. j] (mod capacity) — i.e., je's probe from
+                // home passes through hole on its way to j. Equivalent:
+                // hole is NOT in (j .. home) circularly.
+                // Standard formulation: relocate iff (home <= hole && hole < j) ||
+                // (j < home && (hole >= home || hole < j)) for wrapped cases.
+                bool can_relocate;
+                if (home <= j) {
+                    can_relocate = (home <= hole && hole < j);
+                } else {
+                    // home > j: probe wrapped. hole is relocatable if it's
+                    // either >= home (past wrap) or < j (before wrap).
+                    can_relocate = (hole >= home || hole < j);
+                }
+                if (!can_relocate) break;
+                d->entries[hole] = je;
+                je.key = Value::none();
+                je.value = Value::none();
+                je.used = false;
+                je.hash = 0;
+                je.seq = 0;
+                hole = j;
+                j = (j + 1) & mask;
+            }
             return true;
         }
-        idx = (idx + 1) & (d->capacity - 1);
+        i = (i + 1) & mask;
     }
 }
-// NOTE on tombstones: dict_del marks entries by used=true + key None — but a
-// later insert with key None would collide semantically. None is never a
-// valid dict key in the subset (documented), so the marker is unambiguous.
-// Probe chains survive deletion because we never clear `used` (tombstones
-// keep probes walking). Rehashing drops tombstones.
+// NOTE on tombstones: dict_del now uses backward-shift deletion (the
+// standard linear-probing deletion algorithm), which means there are NO
+// tombstones in the live table after a delete. dict_grow additionally
+// skips any pre-existing tombstone-shaped slots (used=true, key=None)
+// defensively, in case a future caller hands us a table that was
+// constructed by an older deletion scheme. Probe invariants hold without
+// rehash-on-delete because the cluster is rebuilt in-place.
 // =============================================================================
 // Box / numeric tower
 // =============================================================================
@@ -1241,12 +1400,23 @@ bool as_f64(const Value& v, double& out) noexcept {
     switch (v.tag) {
         case Tag::Int: out = static_cast<double>(v.as.i); return true;
         case Tag::Float: out = v.as.f; return true;
+        // OBJ-14 fix: Tag::Bool is an unboxed 0/1 value in v.as.i. Python
+        // treats True/False as the integers 1/0 in every numeric context
+        // (True + 1 == 2, float(True) == 1.0, hash(True) == hash(1)).
+        case Tag::Bool: out = v.as.i ? 1.0 : 0.0; return true;
         case Tag::Obj: {
             PyObj* o = v.as.obj;
             if (!o) return false;
             if (o->tag == ObjTag::Long) {
                 auto* l = static_cast<PyLongObj*>(o);
-                if (l->flags & PyLongObj::kBigFlag) return false;
+                if (l->flags & PyLongObj::kBigFlag) {
+                    // OBJ-18 fix: abs() of a bignum was rejected because
+                    // as_f64 refused to convert big longs. Convert via
+                    // a high-precision double (mantissa from top two limbs,
+                    // exponent from limb count).
+                    out = bignum_to_double(l->big);
+                    return true;
+                }
                 out = static_cast<double>(l->value);
                 return true;
             }
@@ -1266,12 +1436,19 @@ bool as_f64(const Value& v, double& out) noexcept {
 bool as_i64(const Value& v, std::int64_t& out) noexcept {
     switch (v.tag) {
         case Tag::Int: out = v.as.i; return true;
+        // OBJ-14 fix: Tag::Bool is an unboxed 0/1 in v.as.i. int(True)
+        // should yield 1, not a TypeError.
+        case Tag::Bool: out = v.as.i ? 1 : 0; return true;
         case Tag::Obj: {
             PyObj* o = v.as.obj;
             if (o && o->tag == ObjTag::Long) {
                 auto* l = static_cast<PyLongObj*>(o);
                 if (l->flags & PyLongObj::kBigFlag) return false;
                 out = l->value;
+                return true;
+            }
+            if (o && o->tag == ObjTag::Bool) {
+                out = static_cast<PyBoolObj*>(o)->value ? 1 : 0;
                 return true;
             }
             return false;
@@ -1409,21 +1586,18 @@ bool values_truediv(const Value& a, const Value& b, Value& out) noexcept {
             return true;
         },
         [](const BigNum& x, const BigNum& y, Value& o) noexcept {
+            // OBJ-10 fix: the previous bignum path computed the
+            // BigNum quotient via divmod but then ignored it and
+            // returned rem[0]/y[0] (a single-limb ratio) — wildly wrong
+            // for any multi-limb numbers. Convert both operands to
+            // double via bignum_to_double and return the IEEE 754
+            // quotient. This loses precision for huge magnitudes but
+            // matches CPython's behaviour for true_division of two ints
+            // outside the int64 range.
             if (y.is_zero()) return false;
-            BigNum rem;
-            bool dz = false;
-            BigNum q = BigNum::divmod(x, y, rem, dz);
-            if (dz) return false;
-            // approximate real quotient
-            bool fa = false, fb = false;
-            std::int64_t ia = q.try_i64(fa);
-            std::int64_t ib = y.try_i64(fb);
-            (void)ia;
-            o = fb && !y.is_zero() ? Value::real(1.0) : Value::real(0.0);
-            // fallback path: use double of numerator/denominator via strings is
-            // overkill; produce q + rem/y as double via limb ratio:
-            o = Value::real(static_cast<double>(rem.limbs.empty() ? 0 : rem.limbs[0]) /
-                            static_cast<double>(y.limbs.empty() ? 1 : y.limbs[0]));
+            double dx = bignum_to_double(x);
+            double dy = bignum_to_double(y);
+            o = Value::real(dx / dy);
             return true;
         },
         [](double x, double y, Value& o) noexcept {

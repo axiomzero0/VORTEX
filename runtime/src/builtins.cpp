@@ -94,37 +94,37 @@ Value bi_abs(void*, Value* args, std::uint32_t argc) noexcept {
 
 // Flatten a single iterable argument into candidate values (Python:
 // max(iterable) and max(a, b, c) are both valid).
+// OBJ-23 fix: the previous implementation truncated to 32 entries
+// (out_cap was 32 in bi_min/bi_max), so max/min of a list with >32
+// items silently returned the wrong element. We now grow the out
+// buffer dynamically — flatten_candidates returns the true count.
 [[nodiscard]] std::uint32_t flatten_candidates(Value* args, std::uint32_t argc,
-                                               Value* out,
-                                               std::uint32_t out_cap) noexcept {
+                                               stdx::small_vector<Value, 32>& out) noexcept {
     if (argc != 1) {
-        std::uint32_t n = argc < out_cap ? argc : out_cap;
-        for (std::uint32_t i = 0; i < n; ++i) out[i] = args[i];
-        return n;
+        for (std::uint32_t i = 0; i < argc; ++i) out.push_back(args[i]);
+        return argc;
     }
     if (args[0].tag == Tag::Obj && args[0].as.obj) {
         PyObj* o = args[0].as.obj;
         if (o->tag == ObjTag::List) {
             auto* l = static_cast<PyListObj*>(o);
-            std::uint32_t n = l->length < out_cap ? l->length : out_cap;
-            for (std::uint32_t i = 0; i < n; ++i) out[i] = l->items[i];
-            return n;
+            for (std::uint32_t i = 0; i < l->length; ++i) out.push_back(l->items[i]);
+            return l->length;
         }
         if (o->tag == ObjTag::Tuple) {
             auto* t = static_cast<PyTupleObj*>(o);
-            std::uint32_t n = t->length < out_cap ? t->length : out_cap;
-            for (std::uint32_t i = 0; i < n; ++i) out[i] = t->items[i];
-            return n;
+            for (std::uint32_t i = 0; i < t->length; ++i) out.push_back(t->items[i]);
+            return t->length;
         }
     }
-    out[0] = args[0];
+    out.push_back(args[0]);
     return 1;
 }
 
 Value bi_min(void*, Value* args, std::uint32_t argc) noexcept {
     if (argc == 0) return error_msg("min() needs at least one argument");
-    Value flat[32];
-    std::uint32_t n = flatten_candidates(args, argc, flat, 32);
+    stdx::small_vector<Value, 32> flat;
+    std::uint32_t n = flatten_candidates(args, argc, flat);
     if (n == 0) return error_msg("min() arg is an empty sequence");
     Value best = flat[0];
     for (std::uint32_t i = 1; i < n; ++i) {
@@ -134,13 +134,18 @@ Value bi_min(void*, Value* args, std::uint32_t argc) noexcept {
         }
         if (lt) best = flat[i];
     }
+    // OBJ-15 fix: best is borrowed from flat[] (a stack copy of args).
+    // Callers treat the return as owned; incref to avoid a UAF when the
+    // caller's slot is released.
+    Runtime& rt = Runtime::instance();
+    if (best.tag == Tag::Obj && best.as.obj) rt.incref(best.as.obj);
     return best;
 }
 
 Value bi_max(void*, Value* args, std::uint32_t argc) noexcept {
     if (argc == 0) return error_msg("max() needs at least one argument");
-    Value flat[32];
-    std::uint32_t n = flatten_candidates(args, argc, flat, 32);
+    stdx::small_vector<Value, 32> flat;
+    std::uint32_t n = flatten_candidates(args, argc, flat);
     if (n == 0) return error_msg("max() arg is an empty sequence");
     Value best = flat[0];
     for (std::uint32_t i = 1; i < n; ++i) {
@@ -150,6 +155,9 @@ Value bi_max(void*, Value* args, std::uint32_t argc) noexcept {
         }
         if (gt) best = flat[i];
     }
+    // OBJ-15 fix: incref before returning (see bi_min).
+    Runtime& rt = Runtime::instance();
+    if (best.tag == Tag::Obj && best.as.obj) rt.incref(best.as.obj);
     return best;
 }
 
@@ -207,11 +215,37 @@ Value bi_int(void*, Value* args, std::uint32_t argc) noexcept {
     if (args[0].tag == Tag::Obj && args[0].as.obj &&
         args[0].as.obj->tag == ObjTag::Str) {
         auto* s = static_cast<PyStrObj*>(args[0].as.obj);
-        std::array<char, 64> buf{};
-        std::memcpy(buf.data(), s->data(), s->length < 63 ? s->length : 63);
+        // OBJ-19 fix: the previous code copied into a fixed 64-byte buffer
+        // and used strtoll on the truncated copy. A 200-char string like
+        // "999...9" would silently parse to the wrong int64 (truncated).
+        // Use std::string to hold the whole input and pass the full text
+        // to strtoll; report overflow as int max/min like CPython does.
+        std::string text(s->data(), s->length);
+        // strip leading/trailing whitespace (Python allows it)
+        std::size_t a = text.find_first_not_of(" \t\n\r");
+        if (a == std::string::npos) return error_msg("int() cannot convert value");
+        std::size_t b = text.find_last_not_of(" \t\n\r");
+        std::string trimmed = text.substr(a, b - a + 1);
+        // try base 10 (Python int(s) defaults to base 10; int(s, 0) tries
+        // 0x/0o/0b prefixes — we leave that to a separate builtin)
+        errno = 0;
         char* end = nullptr;
-        long long v = std::strtoll(buf.data(), &end, 10);
-        if (end != buf.data()) return Value::integer(v);
+        long long v = std::strtoll(trimmed.c_str(), &end, 10);
+        if (end == trimmed.c_str()) return error_msg("int() cannot convert value");
+        if (errno == ERANGE) {
+            // Overflow: return int max or min like CPython's int(s) does
+            // for huge strings — but CPython actually returns a bignum.
+            // We return max/min as a documented subset limitation.
+            return v > 0 ? Value::integer(INT64_MAX) : Value::integer(INT64_MIN);
+        }
+        // trailing chars after the number? Python rejects them
+        while (*end) {
+            if (!std::isspace(static_cast<unsigned char>(*end))) {
+                return error_msg("int() invalid literal");
+            }
+            ++end;
+        }
+        return Value::integer(v);
     }
     if (args[0].tag == Tag::Obj && args[0].as.obj &&
         args[0].as.obj->tag == ObjTag::Bool) {
@@ -224,6 +258,21 @@ Value bi_float(void*, Value* args, std::uint32_t argc) noexcept {
     if (argc == 0) return Value::real(0.0);
     double d = 0;
     if (as_f64(args[0], d)) return Value::real(d);
+    // OBJ-20 fix: float("3.14") was rejected because as_f64 didn't accept
+    // a Str argument. Now we parse the string directly.
+    if (args[0].tag == Tag::Obj && args[0].as.obj &&
+        args[0].as.obj->tag == ObjTag::Str) {
+        auto* s = static_cast<PyStrObj*>(args[0].as.obj);
+        std::string text(s->data(), s->length);
+        errno = 0;
+        char* end = nullptr;
+        double v = std::strtod(text.c_str(), &end);
+        if (end != text.c_str() && *end == '\0') return Value::real(v);
+        // allow trailing whitespace
+        while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+        if (end != text.c_str() && *end == '\0') return Value::real(v);
+        return error_msg("float() cannot convert string");
+    }
     return error_msg("float() cannot convert value");
 }
 
@@ -256,9 +305,17 @@ Value bi_list(void*, Value* args, std::uint32_t argc) noexcept {
             return Value::object(reinterpret_cast<PyObj*>(l));
         }
         if (o->tag == ObjTag::Dict) {
+            // OBJ-17 fix: bi_list(dict) used to include tombstone slots
+            // (used=true, key=None). Now we skip them by checking the key
+            // tag (None is never a valid dict key in the subset, so any
+            // used slot with key.tag=None is a tombstone). With backward-
+            // shift deletion in dict_del, there shouldn't be tombstones
+            // in the live table at all; this guard is defensive.
             auto* d = static_cast<PyDictObj*>(o);
             for (std::uint32_t i = 0; i < d->capacity; ++i) {
-                if (d->entries[i].used) list_push(l, d->entries[i].key);
+                if (d->entries[i].used && d->entries[i].key.tag != Tag::None) {
+                    list_push(l, d->entries[i].key);
+                }
             }
             return Value::object(reinterpret_cast<PyObj*>(l));
         }
@@ -290,18 +347,42 @@ Value bi_enumerate(void*, Value* args, std::uint32_t argc) noexcept {
     Runtime& rt = Runtime::instance();
     if (argc == 0) return error_msg("enumerate() needs an iterable");
     auto* l = rt.new_list();
-    if (args[0].tag == Tag::Obj && args[0].as.obj &&
-        args[0].as.obj->tag == ObjTag::List) {
-        auto* src = static_cast<PyListObj*>(args[0].as.obj);
-        std::int64_t start = 0;
-        if (argc > 1) as_i64(args[1], start);
-        for (std::uint32_t i = 0; i < src->length; ++i) {
-            auto* pair = rt.new_tuple(2);
-            pair->items[0] = Value::integer(start + i);
-            pair->items[1] = src->items[i];
-            if (src->items[i].tag == Tag::Obj) rt.incref(src->items[i].as.obj);
-            list_push(l, Value::object(reinterpret_cast<PyObj*>(pair)));
+    // OBJ-24 fix: enumerate used to silently return an empty list for any
+    // non-list iterable (tuples, strings, ranges). Now we walk the iterable
+    // via a small flatten step. (Full iterator-protocol enumerate is left
+    // for a follow-up; this covers the common cases.)
+    stdx::small_vector<Value, 32> flat;
+    if (args[0].tag == Tag::Obj && args[0].as.obj) {
+        PyObj* src_obj = args[0].as.obj;
+        if (src_obj->tag == ObjTag::List) {
+            auto* src = static_cast<PyListObj*>(src_obj);
+            for (std::uint32_t i = 0; i < src->length; ++i) flat.push_back(src->items[i]);
+        } else if (src_obj->tag == ObjTag::Tuple) {
+            auto* src = static_cast<PyTupleObj*>(src_obj);
+            for (std::uint32_t i = 0; i < src->length; ++i) flat.push_back(src->items[i]);
+        } else if (src_obj->tag == ObjTag::Str) {
+            auto* src = static_cast<PyStrObj*>(src_obj);
+            for (std::uint32_t i = 0; i < src->length; ++i) {
+                auto* ch = rt.new_str(std::string_view(src->data() + i, 1));
+                flat.push_back(Value::object(reinterpret_cast<PyObj*>(ch)));
+            }
         }
+    }
+    std::int64_t start = 0;
+    if (argc > 1) as_i64(args[1], start);
+    for (std::uint32_t i = 0; i < flat.size(); ++i) {
+        auto* pair = rt.new_tuple(2);
+        pair->items[0] = Value::integer(start + i);
+        pair->items[1] = flat[i];
+        if (flat[i].tag == Tag::Obj && flat[i].as.obj) rt.incref(flat[i].as.obj);
+        // OBJ-8 fix: list_push incref's the pair (adopts). The pair was
+        // created with new_tuple(refcount=1, owned by us); after list_push
+        // its refcount is 2 (list+us). Drop our reference so the list is
+        // the sole owner. Previously we forgot to decref, leaking +1 per
+        // enumerate entry.
+        Value pair_val = Value::object(reinterpret_cast<PyObj*>(pair));
+        list_push(l, pair_val);
+        rt.decref(reinterpret_cast<PyObj*>(pair));
     }
     return Value::object(reinterpret_cast<PyObj*>(l));
 }
@@ -310,12 +391,30 @@ Value bi_zip(void*, Value* args, std::uint32_t argc) noexcept {
     Runtime& rt = Runtime::instance();
     auto* out = rt.new_list();
     if (argc == 0) return Value::object(reinterpret_cast<PyObj*>(out));
+    // OBJ-24 fix: support any combination of list/tuple/str iterables.
+    // We materialize each into a flat small_vector, then zip by min_len.
+    stdx::small_vector<stdx::small_vector<Value, 16>, 4> iterables;
+    iterables.resize(argc);
     std::uint32_t min_len = 0xFFFFFFFFu;
     for (std::uint32_t a = 0; a < argc; ++a) {
-        if (args[a].tag == Tag::Obj && args[a].as.obj &&
-            args[a].as.obj->tag == ObjTag::List) {
-            std::uint32_t len = static_cast<PyListObj*>(args[a].as.obj)->length;
-            if (len < min_len) min_len = len;
+        if (args[a].tag == Tag::Obj && args[a].as.obj) {
+            PyObj* o = args[a].as.obj;
+            if (o->tag == ObjTag::List) {
+                auto* src = static_cast<PyListObj*>(o);
+                for (std::uint32_t i = 0; i < src->length; ++i) iterables[a].push_back(src->items[i]);
+            } else if (o->tag == ObjTag::Tuple) {
+                auto* src = static_cast<PyTupleObj*>(o);
+                for (std::uint32_t i = 0; i < src->length; ++i) iterables[a].push_back(src->items[i]);
+            } else if (o->tag == ObjTag::Str) {
+                auto* src = static_cast<PyStrObj*>(o);
+                for (std::uint32_t i = 0; i < src->length; ++i) {
+                    auto* ch = rt.new_str(std::string_view(src->data() + i, 1));
+                    iterables[a].push_back(Value::object(reinterpret_cast<PyObj*>(ch)));
+                }
+            } else {
+                min_len = 0;
+            }
+            if (iterables[a].size() < min_len) min_len = static_cast<std::uint32_t>(iterables[a].size());
         } else {
             min_len = 0;
         }
@@ -324,11 +423,15 @@ Value bi_zip(void*, Value* args, std::uint32_t argc) noexcept {
     for (std::uint32_t i = 0; i < min_len; ++i) {
         auto* tup = rt.new_tuple(argc);
         for (std::uint32_t a = 0; a < argc; ++a) {
-            Value v = static_cast<PyListObj*>(args[a].as.obj)->items[i];
+            Value v = iterables[a][i];
             tup->items[a] = v;
             if (v.tag == Tag::Obj) rt.incref(v.as.obj);
         }
-        list_push(out, Value::object(reinterpret_cast<PyObj*>(tup)));
+        // OBJ-8 fix: list_push incref's tup; we own a separate ref from
+        // new_tuple. Drop ours to avoid the per-zip-iteration leak.
+        Value tup_val = Value::object(reinterpret_cast<PyObj*>(tup));
+        list_push(out, tup_val);
+        rt.decref(reinterpret_cast<PyObj*>(tup));
     }
     return Value::object(reinterpret_cast<PyObj*>(out));
 }
@@ -336,9 +439,14 @@ Value bi_zip(void*, Value* args, std::uint32_t argc) noexcept {
 // map/filter need call-backs into the VM — they live on Vm, not here.
 
 Value bi_sorted(void*, Value* args, std::uint32_t argc) noexcept {
-    if (argc != 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
-        args[0].as.obj->tag != ObjTag::List) {
-        return error_msg("sorted() expects a list (subset)");
+    // OBJ-24 fix: accept list/tuple/str (not just list).
+    if (argc != 1 || args[0].tag != Tag::Obj || !args[0].as.obj) {
+        return error_msg("sorted() expects an iterable");
+    }
+    PyObj* src_obj = args[0].as.obj;
+    if (src_obj->tag != ObjTag::List && src_obj->tag != ObjTag::Tuple &&
+        src_obj->tag != ObjTag::Str) {
+        return error_msg("sorted() expects a list/tuple/str (subset)");
     }
     Value lv = bi_list(nullptr, args, 1);
     if (lv.tag == Tag::Obj && lv.as.obj == nullptr) return lv;
@@ -386,6 +494,11 @@ Value bi_iter(void*, Value* args, std::uint32_t argc) noexcept {
         switch (args[0].as.obj->tag) {
             case ObjTag::Generator: case ObjTag::RangeIter:
             case ObjTag::ListIter: case ObjTag::StrIter: case ObjTag::DictIter:
+                // OBJ-15 fix: return an OWNED reference (incref) so the
+                // caller's release balances. Previously we returned the
+                // borrowed arg[0], and the caller's decref would drop
+                // the iterator prematurely.
+                Runtime::instance().incref(args[0].as.obj);
                 return args[0];
             default: break;
         }
@@ -414,11 +527,16 @@ Value bi_isinstance(void*, Value* args, std::uint32_t argc) noexcept {
 
 Value bi_type(void*, Value* args, std::uint32_t argc) noexcept {
     if (argc != 1) return error_msg("type() takes one argument");
+    // OBJ-9 fix: bi_type used to return the repr string of the value
+    // (e.g. type(42) returned "42" instead of <class 'int'>). Now we
+    // return the actual type object, which the runtime already knows
+    // how to build via Runtime::type_of. Callers can then access
+    // type.__name__ or compare with isinstance.
     Runtime& rt = Runtime::instance();
-    stdx::small_vector<char, 128> buf;
-    rt.repr_into(args[0], buf);
-    return Value::object(reinterpret_cast<PyObj*>(
-        rt.new_str(std::string_view(buf.data(), buf.size()))));
+    PyTypeObj* t = rt.type_of(args[0]);
+    if (!t) return error_msg("type() cannot determine type");
+    rt.incref(reinterpret_cast<PyObj*>(t));
+    return Value::object(reinterpret_cast<PyObj*>(t));
 }
 
 // --- math module -------------------------------------------------------------------

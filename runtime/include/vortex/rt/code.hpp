@@ -8,8 +8,10 @@
 //   FrameState uses, so deoptimization from JIT code rebuilds Tier-0 frames
 //   by writing FrameState values straight into register slots (Rule 4).
 //
-// Instruction encoding: fixed 12 bytes (op, dst, a, b, c, imm) — uniform
-// decode keeps the computed-goto dispatch loop tight.
+// Instruction encoding: fixed 16 bytes (op, dst, a, b, c, imm) — uniform
+// decode keeps the computed-goto dispatch loop tight. TTC-10: the previous
+// header said "12 bytes" but the static_assert (line 76) enforces 16 — five
+// 16-bit fields plus one 32-bit immediate. The header now matches reality.
 // =============================================================================
 
 #pragma once
@@ -139,7 +141,26 @@ struct Frame {
 
     explicit Frame(CodeUnit* u) noexcept : unit(u) {
         n_regs = u ? u->n_registers : 0;
-        regs = static_cast<Value*>(std::malloc(sizeof(Value) * (n_regs ? n_regs : 1)));
+        // TTC-17 fix: malloc can return nullptr under memory pressure.
+        // We used to write `for (i=0; i<n_regs; ++i) regs[i] = ...` unconditionally —
+        // a null regs dereferences, segfaults the whole VM, and the failure
+        // mode is opaque. Mark the frame as "no regs" so the destructor skips
+        // the decref loop and future dispatch can either raise an OOM-style
+        // Python exception or, lacking one, raise a clean fatal diagnostic.
+        const std::size_t bytes = sizeof(Value) * (n_regs ? n_regs : 1);
+        regs = static_cast<Value*>(std::malloc(bytes));
+        if (!regs) [[unlikely]] {
+            // OOM. The destructor checks regs before iterating; the
+            // interpreter checks `unit != nullptr && regs != nullptr`
+            // before running. Print a hard diagnostic (Rule 47) — we
+            // cannot raise a Python-level MemoryError without a frame.
+            std::fprintf(stderr,
+                         "VORTEX FATAL: Frame allocation of %zu bytes failed "
+                         "(resource exhaustion — see docs/adr/0007-resource-policy.md)\n",
+                         bytes);
+            n_regs = 0;
+            return;
+        }
         for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
     }
     ~Frame() {
