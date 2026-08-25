@@ -1,0 +1,19 @@
+# VORTEX pipeline IR fingerprint baseline.
+# Format: <case_name> = <fingerprint>
+# Drift = CI failure. Update via: vortex_regression_tests --update-golden
+# after verifying the pass change that caused the drift is correct.
+
+global_fn = live=3 edges=2 loops=0 rets=1 calls=0 allocs=0 ifs=0 regions=0 params=0 consts=1 adds=0 loads=0 stores=0
+nested_while_list = live=31 edges=68 loops=2 rets=1 calls=0 allocs=0 ifs=2 regions=0 params=1 consts=3 adds=0 loads=1 stores=0
+closures_readonly = live=11 edges=20 loops=0 rets=1 calls=0 allocs=1 ifs=0 regions=0 params=0 consts=4 adds=0 loads=0 stores=0
+try_finally = live=4 edges=3 loops=0 rets=1 calls=0 allocs=0 ifs=0 regions=0 params=0 consts=1 adds=0 loads=0 stores=0
+nested_data = live=35 edges=88 loops=2 rets=1 calls=4 allocs=2 ifs=2 regions=0 params=0 consts=1 adds=0 loads=0 stores=0
+zero_div = live=17 edges=23 loops=0 rets=2 calls=0 allocs=0 ifs=1 regions=0 params=0 consts=4 adds=0 loads=0 stores=0
+recursion = live=13 edges=27 loops=0 rets=2 calls=1 allocs=0 ifs=1 regions=0 params=1 consts=1 adds=0 loads=0 stores=0
+functions = live=5 edges=8 loops=0 rets=1 calls=0 allocs=0 ifs=0 regions=0 params=2 consts=0 adds=0 loads=0 stores=0
+try_except = live=34 edges=58 loops=0 rets=3 calls=1 allocs=0 ifs=3 regions=0 params=1 consts=6 adds=0 loads=0 stores=0
+bool_shortcircuit = live=6 edges=8 loops=0 rets=1 calls=1 allocs=0 ifs=0 regions=0 params=0 consts=2 adds=0 loads=0 stores=0
+closures = live=10 edges=20 loops=0 rets=1 calls=0 allocs=1 ifs=0 regions=0 params=0 consts=3 adds=0 loads=0 stores=0
+classes = live=12 edges=21 loops=0 rets=1 calls=0 allocs=0 ifs=0 regions=0 params=0 consts=5 adds=0 loads=0 stores=0
+generators = live=17 edges=37 loops=1 rets=1 calls=1 allocs=0 ifs=1 regions=0 params=1 consts=1 adds=0 loads=0 stores=0
+lambda = live=5 edges=7 loops=0 rets=1 calls=0 allocs=0 ifs=0 regions=0 params=1 consts=1 adds=0 loads=0 stores=0
