@@ -179,15 +179,21 @@ public:
         if (emit8(0xE9) && emit32(0)) return site;
         return k_invalid_site;
     }
+    // --- JMP rel32 (E9 cd) — single-byte opcode + 4-byte rel -------------------------------
+    // IBE-6 fix: previous code computed rel = target - (site + 4), but the
+    // JMP E9 instruction is 5 bytes total (1 opcode + 4 rel). After
+    // execution RIP = site + 5, so rel = target - (site + 5). The off-by-
+    // one made every patched JMP land 1 byte past its target. We also
+    // document the Jcc variant separately below.
     void patch_rel32(std::size_t site, std::size_t target) noexcept {
-        std::int32_t rel = static_cast<std::int32_t>(target - (site + 4));
+        std::int32_t rel = static_cast<std::int32_t>(target - (site + 5));
         std::byte* at = buffer_ + site + 1;
         for (int i = 0; i < 4; ++i) {
             at[i] = static_cast<std::byte>((static_cast<std::uint32_t>(rel) >> (8 * i)) & 0xFF);
         }
     }
 
-    // --- Jcc rel32 (0F 8x cd) — x from condition low byte ---------------------------------------
+    // --- Jcc rel32 (0F 8x cd) — two-byte opcode + 4-byte rel --------------------------------
     [[nodiscard]] std::size_t jcc_rel32(std::uint8_t cond_low) noexcept {
         std::size_t site = size();
         if (emit8(0x0F) && emit8(static_cast<std::uint8_t>(0x80 | (cond_low & 0x0F))) &&
@@ -196,8 +202,18 @@ public:
         }
         return k_invalid_site;
     }
+    // IBE-7 fix: patch_jcc must write to site+2 (the rel32 starts AFTER
+    // the two-byte 0F 8x opcode) and use rel = target - (site + 6) (the
+    // Jcc instruction is 6 bytes total; RIP = site + 6 after execution).
+    // The previous code delegated to patch_rel32, which writes to site+1
+    // (overwriting the 0x8x opcode byte) and uses rel = target - (site+4)
+    // — both the write location AND the rel formula were wrong.
     void patch_jcc(std::size_t site, std::size_t target) noexcept {
-        patch_rel32(site, target);   // same layout: opcode(2) + rel32
+        std::int32_t rel = static_cast<std::int32_t>(target - (site + 6));
+        std::byte* at = buffer_ + site + 2;
+        for (int i = 0; i < 4; ++i) {
+            at[i] = static_cast<std::byte>((static_cast<std::uint32_t>(rel) >> (8 * i)) & 0xFF);
+        }
     }
 
     // --- CALL rel32 (E8 cd) -------------------------------------------------------------------
@@ -206,9 +222,13 @@ public:
         if (emit8(0xE8) && emit32(0)) return site;
         return k_invalid_site;
     }
+    // IBE-8 fix: CALL E8 cd is 5 bytes total (1 opcode + 4 rel). After
+    // execution RIP = buffer_base + site + 5, so rel = target - (buffer_base
+    // + site + 5). The previous code used site + 4 — off by one — so the
+    // call landed 1 byte past the target.
     void patch_call(std::size_t site, std::uintptr_t target) noexcept {
         std::int32_t rel = static_cast<std::int32_t>(
-            static_cast<std::intptr_t>(target) - static_cast<std::intptr_t>(site + 4 + reinterpret_cast<std::uintptr_t>(buffer_)));
+            static_cast<std::intptr_t>(target) - static_cast<std::intptr_t>(site + 5 + reinterpret_cast<std::uintptr_t>(buffer_)));
         std::byte* at = buffer_ + site + 1;
         for (int i = 0; i < 4; ++i) {
             at[i] = static_cast<std::byte>((static_cast<std::uint32_t>(rel) >> (8 * i)) & 0xFF);

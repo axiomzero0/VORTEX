@@ -156,16 +156,32 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     Assembler a(buffer, capacity);
 
     // Resolve operand (vreg or slot) -> RegOrSlot, given the assignment.
+    // IBE-19 fix: spilled VRegs use the MIR node's home_slot (the Tier-0
+    // register index that deopt reconstructs from), NOT op.vreg (the MIR
+    // node id, which is a different namespace — node id 5 doesn't mean
+    // Tier-0 register 5). The previous code set r.slot = op.vreg, reading
+    // the wrong frame slot for spilled values and causing spurious deopts
+    // or wrong values.
     const auto resolve = [&](const MachineOperand& op) noexcept {
         RegOrSlot r;
         if (op.kind == MachineOperand::VReg) {
             if (op.vreg < ra.assignment.size() && ra.assignment[op.vreg] >= 0) {
                 r.is_reg = true;
                 r.reg = alloc_reg(ra.assignment[op.vreg]);
+                // For register-cached values, the home slot is still the
+                // authoritative source of the tag (write-back discipline).
+                // Look up the MIR node by vreg (id) to get its home_slot.
+                if (op.vreg >= 1 && op.vreg <= lowered.mir.node_count()) {
+                    r.slot = lowered.mir.node(op.vreg).home_slot;
+                }
                 return r;
             }
-            // spilled: home slot of the defining node
-            r.slot = op.vreg;
+            // spilled: home slot of the defining MIR node (NOT op.vreg).
+            if (op.vreg >= 1 && op.vreg <= lowered.mir.node_count()) {
+                r.slot = lowered.mir.node(op.vreg).home_slot;
+            } else {
+                r.slot = op.vreg;   // fallback (shouldn't happen)
+            }
             return r;
         }
         r.slot = op.slot;
@@ -364,24 +380,24 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     RegOrSlot rhs = resolve(n.operands[1]);
                     // Tag checks: load tag words, compare each against Tag::Int.
                     // Failure -> Jcc to the cold deopt stub (recorded below).
-                    if (lhs.is_reg) {
-                        // tag lives in the home slot for register-cached
-                        // values (write-back discipline keeps homes authoritative).
-                        a.mov_r64_mem(x86::RAX, frame_base,
-                                      slot_disp(lhs.slot ? lhs.slot : n.home_slot, kTagOffset));
-                    } else {
-                        a.mov_r64_mem(x86::RAX, frame_base, slot_disp(lhs.slot, kTagOffset));
-                    }
+                    // IBE-5 fix: lhs.slot and rhs.slot now carry the proper
+                    // home_slot (resolved by the resolve lambda, which looks
+                    // up the MIR node by vreg id). The previous code used
+                    // `lhs.slot ? lhs.slot : n.home_slot` — a dangerous
+                    // fallback that fired whenever lhs.slot was 0 (which
+                    // happens for slot 0 AND for the old resolve's default
+                    // for register-cached values), reading the wrong frame
+                    // slot and producing spurious deopts on valid input.
+                    // lhs.slot is now always the actual home_slot (or the
+                    // FrameSlot's explicit slot); use it directly.
+                    a.mov_r64_mem(x86::RAX, frame_base,
+                                  slot_disp(lhs.slot, kTagOffset));
                     a.mov_r64_imm64(x86::RCX, kTagInt);
                     a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                     std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
-                    if (rhs.is_reg) {
-                        a.mov_r64_mem(x86::RAX, frame_base,
-                                      slot_disp(rhs.slot ? rhs.slot : n.home_slot, kTagOffset));
-                    } else {
-                        a.mov_r64_mem(x86::RAX, frame_base, slot_disp(rhs.slot, kTagOffset));
-                    }
+                    a.mov_r64_mem(x86::RAX, frame_base,
+                                  slot_disp(rhs.slot, kTagOffset));
                     a.mov_r64_imm64(x86::RCX, kTagInt);
                     a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                     std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);

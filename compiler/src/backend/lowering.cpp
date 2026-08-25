@@ -311,7 +311,15 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                             // the node's existing id space: frame states are
                             // allocated by passes; unattached guards record
                             // the home slot instead.)
-                            out.mir.node(guard).frame_state_id = 0xFFFFFFFEu;
+                            // IBE-3 fix: use 0xFFFFFFFFu (invalid sentinel)
+                            // so codegen's emit_safepoint guard
+                            //   rec.frame_state_id = frame_state_id == 0xFFFFFFFFu ? 0 : ...;
+                            // catches the "no frame state" case and writes
+                            // frame_state_id 0 instead of indexing out of
+                            // range. The previous 0xFFFFFFFEu sentinel passed
+                            // through the guard and indexed a non-existent
+                            // FrameState at deopt time.
+                            out.mir.node(guard).frame_state_id = 0xFFFFFFFFu;
                         }
                         out.referenced_frame_states.push_back(
                             out.mir.node(guard).frame_state_id);
@@ -437,13 +445,28 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
         if (if_user != invalid_node) {
             const Node& iff = g.node(if_user);
             std::uint32_t cond = materialize(materialize, iff.ins[1], mb);
+            // IBE-2 fix: the previous code added reg(cond), reg(cond),
+            // comparing cond to itself — always equal (ZF=1), so the
+            // Jcc NE never fired and the If always fell through to
+            // IfTrue regardless of cond's actual value. Materialize a
+            // zero (False) constant and compare cond against it.
+            // The CMPrr in codegen compares PAYLOADS (kPayloadOffset),
+            // so this checks cond.payload == 0.
+            // Use MCond::EQ (jump-to-IfFalse when cond == 0 == False).
+            // The previous MCond::NE was also backwards: it jumped to
+            // IfFalse when cond was truthy. With EQ, the semantics are:
+            //   cond False (payload 0) → ZF=1 → EQ taken → IfFalse ✓
+            //   cond True (payload 1)  → ZF=0 → EQ not taken → IfTrue ✓
+            std::uint32_t zero_const = out.mir.create(MOp::MOVri, MachineRegClass::GPR, 0);
+            out.mir.node(zero_const).block = mb;
+            out.mir.add_operand(zero_const, MachineOperand::imm_op(0));
             std::uint32_t cmp = out.mir.create(MOp::CMPrr, MachineRegClass::GPR, 0);
             out.mir.node(cmp).block = mb;
             out.mir.add_operand(cmp, MachineOperand::reg(cond));
-            out.mir.add_operand(cmp, MachineOperand::reg(cond));
+            out.mir.add_operand(cmp, MachineOperand::reg(zero_const));
             std::uint32_t jcc = out.mir.create(MOp::Jcc, MachineRegClass::GPR, 0);
             out.mir.node(jcc).block = mb;
-            out.mir.add_operand(jcc, MachineOperand::cond_op(MCond::NE));
+            out.mir.add_operand(jcc, MachineOperand::cond_op(MCond::EQ));
             (void)jcc;
         }
         g.for_each_live([&](NodeId id) {

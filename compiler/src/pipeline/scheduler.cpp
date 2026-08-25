@@ -288,26 +288,38 @@ void Scheduler::emit_value(NodeId id) noexcept {
             ins(b->body, i);
             return;
         // native arithmetic on the generic Tier-0 surface
+        // IBE-1 fix: the previous code used a positional lookup
+        //   idx = n.kind - NodeKind::Add
+        // and indexed a flat table — but NodeKind has Neg in the middle
+        // (Add, Sub, Mul, Div, Mod, Pow, Neg, BitAnd, ...), so every
+        // entry past Pow was off by one: BitAnd picked up BitOr's slot,
+        // BitOr picked up BitXor's, ..., and Shr (idx 11) read past
+        // the table end and was silently dropped. Use an explicit switch
+        // so the mapping is unambiguous.
         case NodeKind::Add: case NodeKind::Sub: case NodeKind::Mul:
         case NodeKind::Div: case NodeKind::Mod: case NodeKind::Pow:
         case NodeKind::BitAnd: case NodeKind::BitOr: case NodeKind::BitXor:
         case NodeKind::Shl: case NodeKind::Shr: {
-            static const BinOpKind table[] = {
-                BinOpKind::Add, BinOpKind::Sub, BinOpKind::Mul, BinOpKind::TrueDiv,
-                BinOpKind::Mod, BinOpKind::Pow, BinOpKind::BitAnd, BinOpKind::BitOr,
-                BinOpKind::BitXor, BinOpKind::LShift, BinOpKind::RShift,
-            };
-            // kind index mapping (Add..Shr contiguous)
-            std::uint32_t kind_base = static_cast<std::uint32_t>(NodeKind::Add);
-            std::uint32_t idx = static_cast<std::uint32_t>(n.kind) - kind_base;
-            if (idx < sizeof(table) / sizeof(table[0])) {
-                i.op = static_cast<std::uint16_t>(Op::PY_BINOP);
-                i.a = static_cast<std::uint16_t>(n.ins[0]);
-                i.b = static_cast<std::uint16_t>(n.ins[1]);
-                i.imm = static_cast<std::uint32_t>(table[idx]);
-                ins(b->body, i);
-                return;
+            BinOpKind bop;
+            switch (n.kind) {
+                case NodeKind::Add:    bop = BinOpKind::Add; break;
+                case NodeKind::Sub:    bop = BinOpKind::Sub; break;
+                case NodeKind::Mul:    bop = BinOpKind::Mul; break;
+                case NodeKind::Div:    bop = BinOpKind::TrueDiv; break;
+                case NodeKind::Mod:    bop = BinOpKind::Mod; break;
+                case NodeKind::Pow:    bop = BinOpKind::Pow; break;
+                case NodeKind::BitAnd: bop = BinOpKind::BitAnd; break;
+                case NodeKind::BitOr:  bop = BinOpKind::BitOr; break;
+                case NodeKind::BitXor: bop = BinOpKind::BitXor; break;
+                case NodeKind::Shl:    bop = BinOpKind::LShift; break;
+                case NodeKind::Shr:    bop = BinOpKind::RShift; break;
+                default: return;   // unreachable
             }
+            i.op = static_cast<std::uint16_t>(Op::PY_BINOP);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
+            i.b = static_cast<std::uint16_t>(n.ins[1]);
+            i.imm = static_cast<std::uint32_t>(bop);
+            ins(b->body, i);
             return;
         }
         case NodeKind::CmpLT: case NodeKind::CmpLE: case NodeKind::CmpGT:
@@ -325,10 +337,31 @@ void Scheduler::emit_value(NodeId id) noexcept {
         }
         case NodeKind::Unbox: case NodeKind::Box:
         case NodeKind::SExt: case NodeKind::ZExt: case NodeKind::Trunc:
-        case NodeKind::BitCast: case NodeKind::I2F: case NodeKind::F2I:
-        case NodeKind::Neg: {
+        case NodeKind::BitCast: case NodeKind::I2F: case NodeKind::F2I: {
+            // Pure value-form preservation ops (no semantic change to the
+            // Tier-0 surface — these are unboxing markers for the JIT only).
             i.op = static_cast<std::uint16_t>(Op::MOVE);
             i.a = static_cast<std::uint16_t>(n.ins[0]);
+            ins(b->body, i);
+            return;
+        }
+        case NodeKind::Neg: {
+            // IBE-9 fix: Neg lowered to PY_UNOP with un_neg subop (was
+            // lowered to MOVE — a copy, not a negation — so `-x` returned x).
+            // UnOpKind constants: un_neg=1, un_invert=2, un_not=3
+            // (see frontend/parser.cpp + lowering.cpp).
+            i.op = static_cast<std::uint16_t>(Op::PY_UNOP);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
+            i.imm = 1;   // un_neg
+            ins(b->body, i);
+            return;
+        }
+        case NodeKind::Not: {
+            // IBE-10 fix: Not lowered to PY_UNOP with un_not subop (was
+            // lowered to MOVE — a copy, so `not x` returned x).
+            i.op = static_cast<std::uint16_t>(Op::PY_UNOP);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
+            i.imm = 3;   // un_not
             ins(b->body, i);
             return;
         }
