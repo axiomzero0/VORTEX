@@ -405,11 +405,18 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
         }
         case ObjTag::ListIter: {
             auto* l = static_cast<PyListIterObj*>(o);
+            // INT-3 fix: return an OWNED ref (incref). The previous code
+            // returned l->list->items[l->index++] directly — a BORROWED
+            // ref. The caller's slot teardown decrefs out, dropping the
+            // list's reference and freeing the value while the list still
+            // references it (over-decref / UAF).
             out = l->list->items[l->index++];
+            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
             return true;
         }
         case ObjTag::StrIter: {
             auto* s = static_cast<PyStrIterObj*>(o);
+            // INT-3 fix: new_str returns an owned ref already (no incref needed).
             out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
                 std::string_view(s->str->data() + s->index, 1))));
             ++s->index;
@@ -457,8 +464,14 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
         }
         case ObjTag::Generator: {
             auto* g = static_cast<PyGeneratorObj*>(o);
-            // cached by iter_check in the last register slot
+            // cached by iter_check in the last register slot.
+            // INT-3 fix: return an OWNED ref (incref). The previous code
+            // returned the cached slot value directly — a BORROWED ref.
+            // The caller's slot teardown decrefs out, dropping the
+            // generator's reference and freeing the value while the
+            // generator's frame still references it (over-decref / UAF).
             out = g->frame->regs[g->frame->n_regs > 0 ? g->frame->n_regs - 1 : 0];
+            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
             return true;
         }
         default:
@@ -553,11 +566,45 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
         }
         f.regs[var_reg] = Value::object(reinterpret_cast<PyObj*>(tup));
     }
-    // kwargs dict from kw_names
-    if (unit->has_kwargs && n_params >= 2) {
-        std::uint32_t kw_reg = unit->param_regs[plain + 1];
+    // kwargs dict from kw_names (handles def f(**kwargs) and def f(*args, **kwargs)
+    // and the partial-positional-with-kwargs case).
+    // INT-5 fix: the previous code computed kw_reg = param_regs[plain + 1],
+    // which assumed has_varargs (param_regs[plain] is varargs, [plain+1] is
+    // kwargs). When has_kwargs without has_varargs, kwargs is at param_regs[plain],
+    // not plain+1. INT-7 fix: def f(**kwargs) has n_params == 1 (just kwargs);
+    // the previous code required n_params >= 2. INT-6 fix: in the has_kwargs
+    // branch, also try to bind kwargs to matching positional params first
+    // (Python: f(a, **kwargs) called as f(a=1) binds a=1 and kwargs={}).
+    std::uint32_t kw_param_index = unit->has_varargs ? (plain + 1) : plain;
+    if (unit->has_kwargs && kw_param_index < n_params) {
+        std::uint32_t kw_reg = unit->param_regs[kw_param_index];
         PyDictObj* d = rt.new_dict();
+        // INT-6: bind matching kwargs to positional params first.
+        stdx::small_vector<bool, 8> consumed_kw(nkw, false);
         for (std::uint32_t k = 0; k < nkw && kw_names; ++k) {
+            Value key = kw_names->items[k];
+            if (key.tag != Tag::Int) continue;
+            for (std::uint32_t p = 0; p < plain; ++p) {
+                if (unit->param_names.size() > p &&
+                    unit->param_names[p] == static_cast<std::uint32_t>(key.as.i)) {
+                    // Bind this kwarg to positional param p (overrides any
+                    // positional binding — Python: kwarg wins).
+                    Value val = args[argc + k];
+                    if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                    // Decref the old positional binding if it was set.
+                    if (f.regs[unit->param_regs[p]].tag == Tag::Obj &&
+                        f.regs[unit->param_regs[p]].as.obj) {
+                        rt.decref(f.regs[unit->param_regs[p]].as.obj);
+                    }
+                    f.regs[unit->param_regs[p]] = val;
+                    consumed_kw[k] = true;
+                    break;
+                }
+            }
+        }
+        // Remaining kwargs go into the **kwargs dict.
+        for (std::uint32_t k = 0; k < nkw && kw_names; ++k) {
+            if (consumed_kw.size() > k && consumed_kw[k]) continue;
             Value key = kw_names->items[k];
             Value val = argc + k < argc + nkw ? args[argc + k] : Value::none();
             if (!dict_set(d, key, val)) {
@@ -566,8 +613,8 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
             }
         }
         f.regs[kw_reg] = Value::object(reinterpret_cast<PyObj*>(d));
-    } else if (nkw > 0 && kw_names) {
-        // match keyword names against parameter names
+    } else if (nkw > 0 && kw_names && !unit->has_kwargs) {
+        // No **kwargs declared: every kwarg must match a positional param.
         for (std::uint32_t k = 0; k < nkw; ++k) {
             Value key = kw_names->items[k];
             if (key.tag != Tag::Int) continue;
@@ -577,6 +624,11 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
                     unit->param_names[p] == static_cast<std::uint32_t>(key.as.i)) {
                     Value val = args[argc + k];
                     if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                    // Decref the old positional binding if it was set.
+                    if (f.regs[unit->param_regs[p]].tag == Tag::Obj &&
+                        f.regs[unit->param_regs[p]].as.obj) {
+                        rt.decref(f.regs[unit->param_regs[p]].as.obj);
+                    }
                     f.regs[unit->param_regs[p]] = val;
                     matched = true;
                     break;
@@ -952,6 +1004,16 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
             }
             std::uint32_t unit_id = static_cast<std::uint32_t>(args[0].as.i);
             std::uint32_t ndefaults = static_cast<std::uint32_t>(args[1].as.i);
+            // INT-11 fix: bound-check the defaults copy against argc.
+            // The previous code read args[2 + i] unconditionally for
+            // i in [0, ndefaults); if ndefaults > argc - 2 (caller passed
+            // fewer args than claimed defaults), it read past the args
+            // array. Cap ndefaults at argc - 2.
+            if (ndefaults > argc - 2) {
+                raise_builtin(rt.type_runtime_error,
+                              "MakeFunction: ndefaults exceeds available args");
+                return false;
+            }
             PyTupleObj* defaults = nullptr;
             if (ndefaults > 0) {
                 defaults = rt.new_tuple(ndefaults);
