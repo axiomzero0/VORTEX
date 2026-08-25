@@ -153,12 +153,46 @@ const char* kNestSrc =
     return (*fu).graph;
 }
 
-[[nodiscard]] bool has_interchange_hint(const Graph& g) noexcept {
-    bool hinted = false;
+/// Snapshot the (entry, backedge) pair of every Loop node, keyed by header id.
+/// Used to prove the polyhedral pass ACTUALLY rewrote the IR — not just set a
+/// hint bit on a header that nothing reads.
+struct LoopSnapshot {
+    stdx::small_vector<std::pair<NodeId, std::pair<NodeId, NodeId>>, 8> entries;
+};
+[[nodiscard]] LoopSnapshot snapshot_loops(const Graph& g) noexcept {
+    LoopSnapshot s;
     g.for_each_live([&](NodeId id) {
-        if (g.node(id).kind == NodeKind::Loop && g.node(id).aux1 == 1) hinted = true;
+        const Node& n = g.node(id);
+        if (n.kind != NodeKind::Loop) return;
+        if (n.ins.size() < 2) return;
+        s.entries.push_back({id, {n.ins[0], n.ins[1]}});
     });
-    return hinted;
+    return s;
+}
+
+/// Compare two loop snapshots by header id: returns true iff for every header
+/// present in BOTH snapshots, the (entry, backedge) pair is identical.
+[[nodiscard]] bool loops_unchanged(const LoopSnapshot& a,
+                                   const LoopSnapshot& b) noexcept {
+    for (const auto& [hdr, pair_a] : a.entries) {
+        for (const auto& [hdr_b, pair_b] : b.entries) {
+            if (hdr_b == hdr) {
+                if (pair_a != pair_b) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Find the Loop node whose entry comes from Start (the outermost loop).
+[[nodiscard]] NodeId outermost_loop(const Graph& g) noexcept {
+    NodeId found = invalid_node;
+    g.for_each_live([&](NodeId id) {
+        const Node& n = g.node(id);
+        if (n.kind != NodeKind::Loop || n.ins.size() < 2) return;
+        if (n.ins[0] == g.start()) found = id;
+    });
+    return found;
 }
 
 }  // namespace
@@ -289,20 +323,67 @@ TEST(polyhedral_pass_self_gate) {
     CHECK(ok);
     if (!ok) return;
 
+    // Snapshot the loop structure before any opt-in: both Loops' (entry,
+    // backedge) pairs. The opt-out run must not touch either.
+    LoopSnapshot before = snapshot_loops(g);
+
     passes::PassContext off;
     off.tier = passes::TierMode::Tier2;   // tier alone must NOT enable it
     passes::P33_PolyhedralOptimization p33;
     Result<passes::PassResult> r_off = p33.run(g, off);
     CHECK(r_off.has_value());
-    CHECK(!has_interchange_hint(g));   // opt-out: nothing touched
+    CHECK(!r_off->changed);                 // opt-out: pass reports no change
+    CHECK(loops_unchanged(before, snapshot_loops(g)));  // and the IR is unchanged
 
-    // Opted in: the analysis runs and records the interchange hint on the nest.
+    // Opted in: the analysis runs and ACTUALLY swaps the two Loop nodes'
+    // control-input arrays — the IR is observably different, not just a
+    // hint bit on a header that nothing reads.
     passes::PassContext on;
     on.tier = passes::TierMode::Tier2;
     on.options.set(passes::OptOption::Polyhedral);
     Result<passes::PassResult> r_on = p33.run(g, on);
     CHECK(r_on.has_value());
-    CHECK(has_interchange_hint(g));    // opted in: transform recorded
+    CHECK(r_on->changed);                   // opted in: real transformation
+    CHECK(!loops_unchanged(before, snapshot_loops(g)));  // IR was rewritten
+
+    // After the swap, exactly one Loop node has its entry edge coming from
+    // Start (the new outer loop). Before the swap, the original outer loop
+    // had Start as its entry. The point is the swap happened, not WHICH
+    // header is now outermost — but we can still assert the IR stayed valid
+    // (one outermost loop, both loops still have 2 inputs).
+    NodeId outermost = outermost_loop(g);
+    CHECK(outermost != invalid_node);
+    const Node& on_loop = g.node(outermost);
+    CHECK(on_loop.ins.size() == 2);
+}
+
+TEST(polyhedral_interchange_preserves_outermost_loop_count) {
+    // After interchange, the IR still has exactly two Loop nodes — none
+    // were created or destroyed, only their (entry, backedge) pairs were
+    // swapped. This is the IR-shape invariant of the transformation.
+    bool ok = false;
+    Graph g = lower_nested_loops(&ok);
+    CHECK(ok);
+    if (!ok) return;
+
+    std::uint32_t loops_before = 0;
+    g.for_each_live([&](NodeId id) {
+        if (g.node(id).kind == NodeKind::Loop) ++loops_before;
+    });
+
+    passes::PassContext on;
+    on.tier = passes::TierMode::Tier2;
+    on.options.set(passes::OptOption::Polyhedral);
+    passes::P33_PolyhedralOptimization p33;
+    Result<passes::PassResult> r = p33.run(g, on);
+    CHECK(r.has_value());
+    CHECK(r->changed);
+
+    std::uint32_t loops_after = 0;
+    g.for_each_live([&](NodeId id) {
+        if (g.node(id).kind == NodeKind::Loop) ++loops_after;
+    });
+    CHECK_EQ(loops_after, loops_before);   // structural preservation
 }
 
 TEST(polyhedral_end_to_end_differential) {
