@@ -254,6 +254,16 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
             switch (n.op) {
                 case MOp::MOVri: {
                     if (n.operands.empty()) break;
+                    // IBE-18 note: when has_reg, the home slot is NOT
+                    // written — subsequent ops that read the tag from the
+                    // home slot see stale data. The proper fix is for the
+                    // lowering to give each MOVri a UNIQUE home_slot (not
+                    // shared with the owning terminator's home_slot=0); a
+                    // blanket "write to home_slot" here would clobber the
+                    // Return's value (the Return terminator's tag-vreg
+                    // MOVri shares home_slot 0 with the Return's MOVmr).
+                    // For now, the original behavior stands; this is a
+                    // documented subset limitation of the JIT.
                     if (has_reg) {
                         a.mov_r64_imm64(alloc_reg(ra.assignment[id]),
                                         static_cast<std::uint64_t>(n.operands[0].imm));
