@@ -1194,6 +1194,11 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
             std::abort();                                                                  \
         }                                                                                  \
         cur = &f.unit->code[f.pc];                                                         \
+        if (::getenv("VORTEX_TRACE")) [[unlikely]] {                                       \
+            std::fprintf(stderr, "[t] pc=%u op=%u dst=%u a=%u b=%u c=%u imm=%u\n",        \
+                         f.pc, (unsigned)cur->op, cur->dst, cur->a, cur->b, cur->c,        \
+                         cur->imm);                                                        \
+        }                                                                                  \
     } while (0)
 #define VM_DISPATCH() goto* dispatch[cur->op]
 ExecStatus Vm::exec_frame(Frame& f) noexcept {
@@ -1867,6 +1872,99 @@ L_GET_EXC: {
     Value e = pending_exception_;
     if (e.tag == Tag::Obj && e.as.obj) rt.incref(e.as.obj);
     write_reg(cur->dst, e);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_LOAD_FIELD: {
+    // Pass-46 fast path: fixed-slot read. Instances read through their
+    // shape slot; dict bases read the ordinal-th live entry.
+    Value base = regs[cur->a];
+    Value out;
+    bool ok = false;
+    if (base.tag == Tag::Obj && base.as.obj) {
+        PyObj* o = base.as.obj;
+        if (o->tag == ObjTag::Instance) {
+            auto* inst = static_cast<PyInstanceObj*>(o);
+            std::uint32_t slot = cur->imm;
+            if (slot < inst->slot_capacity) {
+                out = inst->slots[slot];
+                ok = true;
+            }
+        } else if (o->tag == ObjTag::Dict) {
+            auto* d = static_cast<PyDictObj*>(o);
+            std::uint32_t want = cur->imm;
+            std::uint32_t seen = 0;
+            for (std::uint32_t si = 0; si < d->capacity; ++si) {
+                const DictEntry& e = d->entries[si];
+                if (!e.used) continue;
+                if (seen == want) { out = e.value; ok = true; break; }
+                ++seen;
+            }
+        }
+    }
+    if (!ok) {
+        raise_builtin(rt.type_attribute_error, "field slot read failed");
+        RAISE_CHECK(false);
+    }
+    write_reg_owned(cur->dst, out);
+    ++f.pc;
+    VM_LOAD();
+    VM_DISPATCH();
+}
+L_STORE_FIELD: {
+    // Pass-46 fast path: fixed-slot write. Instances write their shape
+    // slot (growing on demand); dicts overwrite the ordinal-th live
+    // entry. New-key appends stay StoreIndex (pass 46 only rewrites
+    // stores of keys already in the layout).
+    Value base = regs[cur->a];
+    Value val = regs[cur->b];
+    bool ok = false;
+    if (base.tag == Tag::Obj && base.as.obj) {
+        PyObj* o = base.as.obj;
+        if (o->tag == ObjTag::Instance) {
+            auto* inst = static_cast<PyInstanceObj*>(o);
+            std::uint32_t slot = cur->imm;
+            while (slot >= inst->slot_capacity) {
+                std::uint32_t new_cap = inst->slot_capacity * 2 + 4;
+                Value* fresh = static_cast<Value*>(std::calloc(new_cap, sizeof(Value)));
+                if (!fresh) break;
+                if (inst->slots) {
+                    std::memcpy(fresh, inst->slots, sizeof(Value) * inst->slot_capacity);
+                    std::free(inst->slots);
+                }
+                inst->slots = fresh;
+                inst->slot_capacity = new_cap;
+            }
+            if (slot < inst->slot_capacity) {
+                if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                Value& slot_ref = inst->slots[slot];
+                if (slot_ref.tag == Tag::Obj && slot_ref.as.obj) rt.decref(slot_ref.as.obj);
+                slot_ref = val;
+                ok = true;
+            }
+        } else if (o->tag == ObjTag::Dict) {
+            auto* d = static_cast<PyDictObj*>(o);
+            std::uint32_t want = cur->imm;
+            std::uint32_t seen = 0;
+            for (std::uint32_t si = 0; si < d->capacity; ++si) {
+                DictEntry& e = d->entries[si];
+                if (!e.used) continue;
+                if (seen == want) {
+                    if (e.value.tag == Tag::Obj) rt.decref(e.value.as.obj);
+                    e.value = val;
+                    if (val.tag == Tag::Obj) rt.incref(val.as.obj);
+                    ok = true;
+                    break;
+                }
+                ++seen;
+            }
+        }
+    }
+    if (!ok) {
+        raise_builtin(rt.type_attribute_error, "field slot write failed");
+        RAISE_CHECK(false);
+    }
     ++f.pc;
     VM_LOAD();
     VM_DISPATCH();

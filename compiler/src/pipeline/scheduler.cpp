@@ -366,6 +366,19 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
             i.c = static_cast<std::uint16_t>(n.ins[4]);
             ins(b->body, i);
             return;
+        case NodeKind::StoreField:
+            i.op = static_cast<std::uint16_t>(Op::STORE_FIELD);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);   // base
+            i.b = static_cast<std::uint16_t>(n.ins[3]);   // value
+            i.imm = n.aux0;                               // slot ordinal
+            ins(b->body, i);
+            return;
+        case NodeKind::LoadField:
+            i.op = static_cast<std::uint16_t>(Op::LOAD_FIELD);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
+            i.imm = n.aux0;
+            ins(b->body, i);
+            return;
         case NodeKind::NewList:
         case NodeKind::NewTuple: {
             std::uint32_t count = n.ins.size() > 2 ? n.ins.size() - 2 : 0;

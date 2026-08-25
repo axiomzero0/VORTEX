@@ -15,8 +15,10 @@ namespace vortex::passes {
 inline namespace abi_v1 {
 
 /// The full optimizing sequence (identical for every tier — Rule 1; tier
-/// differences live in PassContext, not the sequence).
+/// differences live in PassContext, not the sequence). All 49 optimization
+/// passes in spec order; frontend passes 1-2 run at graph construction.
 using OptPipeline = std::tuple<
+    // Phase 1: IR normalization & intraprocedural foundation
     P03_TrivialDCE,
     P04_LocalConstantFolding,
     P05_AlgebraicSimplification,
@@ -25,7 +27,51 @@ using OptPipeline = std::tuple<
     P08_SCCP,
     P09_RedundantStoreElimination,
     P10_EarlyGVN,
+    // Phase 2: alias & pointer analysis
+    P11_AndersenPointsTo,
+    P12_CFLReachabilityAlias,
+    P13_FlowSensitiveAlias,
+    P14_DemandDrivenAlias,
+    P15_ShapeAnalysis,
+    P16_ICMonomorphism,
+    P17_MROLinearization,
     P18_SideEffectAnalysis,
+    // Phase 3: interprocedural & speculative inlining
+    P19_CallGraphPGO,
+    P20_SpeculativeInlining,
+    P21_PartialInlining,
+    P22_RecursiveInlining,
+    P23_ClosureDevirtualization,
+    P24_GeneratorDeforestation,
+    P25_ExceptionOutlining,
+    P26_IPCP,
+    // Phase 4: loop optimizations & vectorization
+    P27_LICM,
+    P28_SpeculativeLICM,
+    P29_InductionVariables,
+    P30_LoopUnrolling,
+    P31_SLPVectorization,
+    P32_LoopVectorization,
+    P33_PolyhedralOptimization,
+    P34_SoftwarePipelining,
+    P35_LoopFusionFission,
+    P36_BoundsCheckElimination,
+    P37_NoneCheckElimination,
+    P38_GILHoisting,
+    // Phase 5: memory, allocation, escape analysis
+    P39_EscapeAnalysis,
+    P40_PartialEscapeAnalysis,
+    P41_ObjectInlining,
+    P42_RegionMemoryInference,
+    P43_RefcntOptimization,
+    P44_WriteBarrierElimination,
+    P45_StringInterning,
+    P46_DictLayoutSpecialization,
+    P47_BoxUnboxElimination,
+    P48_TLABSizing,
+    // Phase 6: late optimizations & backend preparation
+    P49_SpeculativeEffectReordering,
+    P50_LateGVN,
     P51_GlobalDCE>;
 
 /// Budget-aware tier filter: Tier 1 runs only the linear-time subset.
@@ -33,9 +79,17 @@ struct TierFilter {
     TierMode tier{TierMode::Tier1};
     [[nodiscard]] bool include(const char* pass_name) const noexcept {
         if (tier != TierMode::Tier1) return true;
-        // Tier 1: skip the fixpoint-heavy analyses (budget).
+        // Tier 1 (budget-constrained baseline): cheap passes only. The
+        // fixpoint-heavy analyses and all speculation defer to Tier 2/3 —
+        // each pass additionally self-gates on the tier mode.
         std::string_view n(pass_name);
-        return n != "08_sccp" && n != "10_early_gvn";
+        return n != "08_sccp" && n != "10_early_gvn" && n != "11_andersen" &&
+               n != "12_cfl_alias" && n != "14_demand_alias" && n != "16_ic_mono" &&
+               n != "20_spec_inline" && n != "21_partial_inline" &&
+               n != "22_recursive_inline" && n != "26_ipcp" && n != "28_spec_licm" &&
+               n != "30_unroll" && n != "31_slp" && n != "32_loop_vec" &&
+               n != "33_polyhedral" && n != "34_sw_pipeline" && n != "40_pea" &&
+               n != "49_effect_reorder" && n != "50_late_gvn";
     }
 };
 

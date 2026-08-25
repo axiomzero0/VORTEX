@@ -61,6 +61,8 @@ enum class Op : std::uint16_t {
     TRY_BEGIN,        // imm=handler pc
     TRY_END,          // closes innermost TRY_BEGIN
     GET_EXC,          // dst=current exception (owned ref)
+    LOAD_FIELD,       // dst, a=base, imm=slot        (pass 46 fast path)
+    STORE_FIELD,      // a=base, b=value, imm=slot    (pass 46 fast path)
 };
 
 struct Instr {
