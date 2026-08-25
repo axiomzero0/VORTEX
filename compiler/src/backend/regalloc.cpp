@@ -264,11 +264,49 @@ RegAllocResult linear_scan(MachineGraph& mir,
         }
     }
 
-    // Map piece assignments onto vreg assignment (piece wins if any piece
-    // holds a register — codegen reloads at boundaries).
+    // Map piece assignments onto vreg assignment.
+    //
+    // Soundness: if ANY piece of a vreg spilled, the whole vreg must
+    // read/write through home slots — otherwise the codegen (which
+    // queries a single physreg per vreg) would use a stale register
+    // value at the boundary where the piece was evicted. The previous
+    // version overwrote `out.assignment[p.vreg]` with each piece's
+    // assignment, so the LAST piece won and earlier spills were
+    // silently discarded. That was unsound.
+    //
+    // The current rule: a vreg gets a physreg ONLY if every piece of
+    // that vreg was assigned the SAME physreg. If pieces disagree (e.g.
+    // piece 1 in R1, piece 2 in R2 because of eviction across a loop
+    // header), the vreg spills to home. The codegen then reads/writes
+    // home slots uniformly — no per-piece move insertion required.
+    //
+    // This loses the loop-boundary register-reuse optimization (the
+    // whole point of splitting), but it's SOUND. Per-piece assignment
+    // with move insertion at piece boundaries is a future improvement
+    // that requires the codegen to query assignments by (vreg, position),
+    // not just by vreg.
+    stdx::flat_map<std::uint32_t, std::int32_t, 64> first_assignment;
+    stdx::flat_map<std::uint32_t, bool, 64> any_spill;
     for (const Piece& p : pieces) {
-        if (p.assigned >= 0) {
-            out.assignment[p.vreg] = p.assigned;
+        if (p.assigned < 0) {
+            any_spill.insert_or_assign(p.vreg, true);
+        } else {
+            const std::int32_t* cur = first_assignment.get(p.vreg);
+            if (!cur) {
+                first_assignment.insert(p.vreg, p.assigned);
+            } else if (*cur != p.assigned) {
+                // Pieces disagree: spill the whole vreg.
+                any_spill.insert_or_assign(p.vreg, true);
+            }
+        }
+    }
+    for (const Piece& p : pieces) {
+        const bool* spill = any_spill.get(p.vreg);
+        if (spill && *spill) {
+            out.assignment[p.vreg] = -1;   // spilled: read/write home
+        } else {
+            const std::int32_t* a = first_assignment.get(p.vreg);
+            if (a) out.assignment[p.vreg] = *a;
         }
     }
     // Spilled vregs keep assignment -1; their operands read/write home slots.

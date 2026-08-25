@@ -102,6 +102,14 @@ struct CodeUnit {
     void* jit_metadata{nullptr};             // deopt tables, owned by backend
     std::uint32_t deopt_count{0};            // telemetry (Rule 26)
 
+    // --- JIT safepoint → Tier-0 resume-point map (Rule 4) ---------------------
+    // Indexed by the safepoint_index that the JIT's deopt stub passes to
+    // vortex_deopt_entry / vortex_jit_bridge. Each entry is the Tier-0
+    // bytecode offset at which to resume interpretation after a guard
+    // failure or a dynamic-op fallback. Populated by the runtime when
+    // JIT code is installed; zero entries means "no JIT installed".
+    stdx::small_vector<std::uint32_t, 16> safepoint_pcs{};
+
     ~CodeUnit() {
         Runtime& rt = Runtime::instance();
         for (Value& v : constants) {

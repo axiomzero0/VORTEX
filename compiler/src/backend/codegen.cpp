@@ -49,18 +49,23 @@
 #include "vortex/support/config.hpp"
 
 // Deopt entry implemented in the runtime (deopt.cpp). SysV signature:
-//   void(uint32_t unit_id, uint32_t safepoint_index, void* regs_raw)
+//   vortex::Value(uint32_t unit_id, uint32_t safepoint_index, void* regs_raw)
 // RDI = unit_id, RSI = safepoint_index, RDX = regs base (frame_base at the
 // call site — ownership of the regs array transfers from JIT to runtime).
-extern "C" void vortex_deopt_entry(std::uint32_t unit_id, std::uint32_t safepoint_index,
-                                   void* regs_raw) noexcept;
+// Returns: RAX = result tag word, RDX = result payload (16-byte POD
+// return convention). The deopt stub tail-calls this function so its
+// return value propagates directly to the JIT's caller.
+extern "C" vortex::Value vortex_deopt_entry(std::uint32_t unit_id,
+                                             std::uint32_t safepoint_index,
+                                             void* regs_raw) noexcept;
 
 // Interpreter bridge: transitions JIT execution to Tier-0 at the bytecode
 // offset corresponding to the dynamic op. SysV signature:
-//   void(void* regs_raw, uint32_t unit_id, uint64_t op_hint)
+//   vortex::Value(void* regs_raw, uint32_t unit_id, uint64_t op_hint)
 // RDI = regs base, RSI = unit_id, RDX = op_hint (helper_idx).
-extern "C" void vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id,
-                                  std::uint64_t op_hint) noexcept;
+// Returns: RAX = result tag word, RDX = result payload.
+extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id,
+                                            std::uint64_t op_hint) noexcept;
 
 namespace vortex::backend {
 inline namespace abi_v1 {
@@ -329,14 +334,27 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     const auto mc = static_cast<MCond>(n.operands[0].imm);
                     if (mc >= MCond::Count) break;
                     std::size_t site = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(mc)]);
-                    // The next block in the lowering's block_order is the
-                    // fallthrough-adjacent (IfTrue-first layout). The Jcc
-                    // target is the block after that: successor[1] of the
-                    // current block (i.e. IfFalse).
-                    if (block_id + 1 < lowered.mir.blocks.size()) {
-                        patches.push_back(PatchSite{site, block_id + 1});
+                    // The Jcc target is the NON-fallthrough successor of
+                    // this block. The lowering lays out blocks true-arm-
+                    // first (IfTrue is fallthrough-adjacent after If),
+                    // so succs[0] = IfTrue (fallthrough) and succs[1] =
+                    // IfFalse (jump target). Read the real successor
+                    // from the MIR block's succs vector — hard-coding
+                    // `block_id + 1` was wrong (it pointed at IfTrue,
+                    // creating a degenerate "always jump into the body
+                    // that we just fell through to" branch).
+                    const auto& succs = lowered.mir.blocks[block_id].succs;
+                    if (succs.size() >= 2) {
+                        patches.push_back(PatchSite{site, succs[1]});
+                    } else if (succs.size() == 1) {
+                        // Single successor (unconditional-ish Jcc): patch
+                        // to the only successor.
+                        patches.push_back(PatchSite{site, succs[0]});
                     } else {
-                        patches.push_back(PatchSite{site, 0xFFFFFFFFu});   // past_cold
+                        // No successor recorded: patch to past_cold as a
+                        // safe fallback (will fall through the cold
+                        // region's RET path).
+                        patches.push_back(PatchSite{site, 0xFFFFFFFFu});
                     }
                     break;
                 }

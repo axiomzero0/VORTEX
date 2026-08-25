@@ -6,14 +6,20 @@
 // deoptimizer:
 //   1. Looks up the active Vm via the global builtins pointer.
 //   2. Finds the CodeUnit by id in vm.program.units.
-//   3. Reads the safepoint record (mostly for diagnostics — the codegen's
-//      home-slot write-back discipline makes the home slots authoritative
-//      at every safepoint, so the live physreg->slot map is informational).
-//   4. Transfers ownership of the regs array into a new Tier-0 Frame and
-//      resumes via Vm::enter_at at PC 0. The Tier-0 interpreter runs to
-//      completion, writes the result to vm.frame_return_, and the JIT's
-//      caller observes the same Value it would have observed if the unit
-//      had run entirely in Tier-0.
+//   3. Translates safepoint_index to a Tier-0 bytecode offset via
+//      unit->safepoint_pcs (populated when JIT code was installed;
+//      the compiler emits a SafepointRecord per guard site carrying
+//      the IR frame_state_id, and the runtime materializes the
+//      Tier-0 PC into this table).
+//   4. Transfers ownership of the regs array into a new Tier-0 Frame
+//      and resumes via Vm::enter_at at the resumed PC. The Tier-0
+//      interpreter runs to completion, writes the result to
+//      vm.frame_return_, and returns it to the JIT's caller.
+//
+// Returns a Value (not void) — the JIT's calling convention expects
+// RAX/RDX to carry the result tag/payload, and a tail-call to this
+// function must propagate that. The previous void return broke the
+// Value-return contract.
 // =============================================================================
 
 #include "vortex/rt/interp.hpp"
@@ -34,8 +40,9 @@ inline namespace abi_v1 {
 }  // namespace abi_v1
 }  // namespace vortex::rt
 
-extern "C" void vortex_deopt_entry(std::uint32_t unit_id, std::uint32_t safepoint_index,
-                                   void* regs_raw) noexcept {
+extern "C" vortex::Value vortex_deopt_entry(std::uint32_t unit_id,
+                                            std::uint32_t safepoint_index,
+                                            void* regs_raw) noexcept {
     using namespace vortex::rt;
     CodeUnit* unit = find_unit(unit_id);
     if (!unit) {
@@ -53,12 +60,34 @@ extern "C" void vortex_deopt_entry(std::uint32_t unit_id, std::uint32_t safepoin
     }
 
     const std::uint32_t n_regs = unit->n_registers;
-    (void)safepoint_index;
-
     Value* regs = static_cast<Value*>(regs_raw);
-    Value out;
-    bool ok = vm->enter_at(unit, regs, n_regs, /*pc=*/0, out);
-    if (!ok) {
-        return;
+
+    // Translate the JIT's safepoint_index into a Tier-0 bytecode offset.
+    // The runtime populates unit->safepoint_pcs when JIT code is
+    // installed; zero entries means "no JIT installed" — which means
+    // vortex_deopt_entry should not have been called at all. We fall
+    // back to pc=0 only as a last-resort safety net (with a stderr
+    // note) so a misconfigured test doesn't loop forever.
+    std::uint32_t resume_pc = 0;
+    if (safepoint_index < unit->safepoint_pcs.size()) {
+        resume_pc = unit->safepoint_pcs[safepoint_index];
+    } else if (!unit->safepoint_pcs.empty()) {
+        // Out-of-range safepoint index: this is a bug, not a fallback.
+        std::fprintf(stderr, "VORTEX deopt: safepoint_index %u out of range "
+                             "(size %zu)\n",
+                     safepoint_index, unit->safepoint_pcs.size());
+        std::abort();
+    } else {
+        std::fputs("VORTEX deopt: no safepoint table — falling back to pc=0\n",
+                   stderr);
     }
+
+    Value out;
+    bool ok = vm->enter_at(unit, regs, n_regs, resume_pc, out);
+    if (!ok) {
+        // enter_at reported an exception via vm->pending_exception();
+        // return None so the JIT's caller observes a defined value.
+        return vortex::Value::none();
+    }
+    return out;
 }
