@@ -99,26 +99,40 @@ LoopInfo compute_loops(const Graph& g, const DomTree& dom) noexcept {
     }
 
     // Nesting depth: loop L depth = 1 + depth of innermost enclosing loop.
-    for (auto& l : info.loops) {
-        std::uint32_t d = 1;
-        for (auto& other : info.loops) {
-            if (&other == &l) continue;
-            // other encloses l iff other.header is in l.blocks and l.header
-            // is NOT in other.blocks (strictly outer).
-            bool other_has_header = false;
-            for (NodeId m : other.blocks) {
-                if (m == l.header) { other_has_header = true; break; }
+    // PASS-14 fix: the previous single-pass computation was order-dependent
+    // — when an inner loop was processed BEFORE its enclosing loop, it read
+    // the un-initialized depth (defaulting to 1, computed-then-overwritten
+    // as 1+1=2 instead of 2+1=3). Iterate to fixpoint so depth values
+    // propagate from outer to inner regardless of the iteration order.
+    bool depth_changed = true;
+    std::uint32_t fixpoint_iters = 0;
+    while (depth_changed && fixpoint_iters < 32) {   // bounded fixpoint
+        depth_changed = false;
+        ++fixpoint_iters;
+        for (auto& l : info.loops) {
+            std::uint32_t d = 1;
+            for (auto& other : info.loops) {
+                if (&other == &l) continue;
+                // other encloses l iff other.header is in l.blocks and l.header
+                // is NOT in other.blocks (strictly outer).
+                bool other_has_header = false;
+                for (NodeId m : other.blocks) {
+                    if (m == l.header) { other_has_header = true; break; }
+                }
+                bool l_has_other_header = false;
+                for (NodeId m : l.blocks) {
+                    if (m == other.header) { l_has_other_header = true; break; }
+                }
+                if (other_has_header && !l_has_other_header) {
+                    std::uint32_t od = other.depth ? other.depth : 1;
+                    if (od + 1 > d) d = od + 1;
+                }
             }
-            bool l_has_other_header = false;
-            for (NodeId m : l.blocks) {
-                if (m == other.header) { l_has_other_header = true; break; }
-            }
-            if (other_has_header && !l_has_other_header) {
-                std::uint32_t od = other.depth ? other.depth : 1;
-                if (od + 1 > d) d = od + 1;
+            if (d != l.depth) {
+                l.depth = d;
+                depth_changed = true;
             }
         }
-        l.depth = d;
     }
     return info;
 }

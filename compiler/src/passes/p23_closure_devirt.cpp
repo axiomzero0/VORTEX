@@ -26,21 +26,41 @@ Result<PassResult> P23_ClosureDevirtualization::run(Graph& g, const PassContext&
 
     // map: cell node -> initial value node (from MakeCell)
     stdx::flat_map<NodeId, NodeId, 16> cell_init;
+    // PASS-5 fix: track which cells are EVER written via CellSet. A cell
+    // that's written can't have its CellGet forwarded to the initial
+    // value — the actual value at CellGet time depends on the program
+    // order of CellSet/CellGet. The previous code forwarded unconditionally,
+    // miscompiling any case where CellSet changes the cell value before
+    // CellGet reads it.
+    stdx::flat_map<NodeId, bool, 16> cell_has_set;
     g.for_each_live([&](NodeId id) {
         const Node& n = g.node(id);
         if (n.kind != NodeKind::CallNative) return;
-        if (static_cast<NativeHelper>(n.subop) != NativeHelper::MakeCell) return;
-        if (n.ins.size() < 3) return;
-        cell_init.insert(n.id, n.ins[2]);
+        const auto helper = static_cast<NativeHelper>(n.subop);
+        if (helper == NativeHelper::MakeCell) {
+            if (n.ins.size() < 3) return;
+            cell_init.insert(n.id, n.ins[2]);
+        } else if (helper == NativeHelper::CellSet) {
+            if (n.ins.size() >= 3) {
+                cell_has_set.insert_or_assign(n.ins[2], true);
+            }
+        }
     });
 
-    // CellGet(cell) where cell is in-unit MakeCell -> forward initial value.
+    // CellGet(cell) where cell is in-unit MakeCell -> forward initial value
+    // ONLY if there are NO CellSets to that cell anywhere (otherwise the
+    // cell's value at CellGet time depends on intervening CellSets).
     g.for_each_live([&](NodeId id) {
         Node& n = g.node(id);
         if (n.kind != NodeKind::CallNative) return;
         if (static_cast<NativeHelper>(n.subop) != NativeHelper::CellGet) return;
         if (n.ins.size() < 3) return;
         NodeId cell = n.ins[2];
+        // PASS-5: skip forwarding if any CellSet writes to this cell.
+        if (const bool* has_set = cell_has_set.get(cell)) {
+            (void)has_set;
+            return;
+        }
         if (const NodeId* init = cell_init.get(cell)) {
             g.replace_all_uses(id, *init);
             g.kill(id);

@@ -53,6 +53,15 @@ Result<PassResult> P13_FlowSensitiveAlias::run(Graph& g, const PassContext& c) n
                 std::uint64_t key = store_key(n);
                 if (key == 0) return;
                 if (NodeId* prev = live_stores.get(key)) {
+                    // PASS-4 fix: rewire effect-chain consumers of the
+                    // killed store to the killed store's effect input
+                    // BEFORE killing. Same pattern as p09 — without this
+                    // rewire, the verifier reports "live node consumes
+                    // dead node" on the effect chain.
+                    Node& killed = g.node(*prev);
+                    if (killed.ins.size() >= 2 && killed.ins[1] != vortex::ir::invalid_node) {
+                        g.replace_all_uses(*prev, killed.ins[1]);
+                    }
                     g.kill(*prev);
                     changed = true;
                 }

@@ -57,8 +57,25 @@ Result<PassResult> P28_SpeculativeLICM::run(Graph& g, const PassContext& c) noex
             if (n.ins.size() >= 4) fs.values.push_back(n.ins[3]);
             gn.aux1 = g.add_frame_state(fs);
             gn.set_flag(NodeFlag::OnEffectChain);
-            g.add_input(guard, n.ins[0]);
-            g.add_input(guard, n.ins[2]);
+            // PASS-9 fix: the guard needs BOTH operands as inputs so the
+            // deopt stub can reconstruct the operands' values at the
+            // safepoint. The previous code added only n.ins[2] (operand a),
+            // missing n.ins[3] (operand b) — so the deopt path couldn't
+            // replay the operation on Tier-0. Also wire the PyBinary's
+            // control input to the guard so the guard actually gates the
+            // operation (without this, the PyBinary stays in the loop and
+            // the guard is decorative).
+            g.add_input(guard, n.ins[0]);   // control
+            g.add_input(guard, n.ins[2]);   // operand a
+            if (n.ins.size() >= 4) {
+                g.add_input(guard, n.ins[3]);   // operand b
+            }
+            // Rewire the PyBinary's control input to the guard, so the
+            // guard gates the operation. (Memory input stays the same —
+            // the guard is a pure control gate.)
+            if (n.ins.size() >= 1) {
+                g.set_input(id, 0, guard);
+            }
             ++guarded_hoists;
         });
     }

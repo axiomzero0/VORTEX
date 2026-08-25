@@ -48,10 +48,26 @@ Result<PassResult> P43_RefcntOptimization::run(Graph& g, const PassContext& c) n
 
     // Redundant CellSet round-trips: CellSet(cell, v) immediately followed
     // by CellGet(cell) with no other Cell use — the get forwards to v.
+    // PASS-6 fix: the previous code forwarded CellGet to the last CellSet's
+    // value, IGNORING intervening CallPy / other CallNative ops that could
+    // have called a function which captured the cell and wrote to it
+    // (CellSet inside another function). That's a miscompilation.
+    // Fix: clear last_set whenever we see an intervening effect (CallPy,
+    // any CallNative other than MakeCell/CellGet/CellSet, or any
+    // OnEffectChain node that might escape the cell) — conservative but
+    // sound.
     stdx::flat_map<NodeId, NodeId, 16> last_set;
     g.for_each_live([&](NodeId id) {
         Node& n = g.node(id);
-        if (n.kind != NodeKind::CallNative) return;
+        if (n.kind != NodeKind::CallNative) {
+            // Any non-CallNative effect (CallPy, StoreIndex, etc.) could
+            // call user code that writes to a captured cell. Clear all
+            // tracked CellSet values to be safe.
+            if (n.has(NodeFlag::OnEffectChain) || n.has(NodeFlag::MayCall)) {
+                last_set.clear();
+            }
+            return;
+        }
         auto helper = static_cast<NativeHelper>(n.subop);
         if (helper == NativeHelper::CellSet && n.ins.size() >= 3) {
             last_set.insert_or_assign(n.ins[2], n.ins[3]);
@@ -61,7 +77,17 @@ Result<PassResult> P43_RefcntOptimization::run(Graph& g, const PassContext& c) n
                 g.kill(id);
                 ++eliminated;
             }
+        } else if (helper == NativeHelper::ImportModule || helper == NativeHelper::MakeClass) {
+            // PASS-6: intervening ImportModule / MakeClass could call user
+            // code (module init, __init_subclass__) that writes to captured
+            // cells. Clear all tracked CellSet values. CallPy is caught
+            // earlier by the OnEffectChain/MayCall flag check on non-
+            // CallNative nodes.
+            last_set.clear();
         }
+        // MakeCell, GetCurrentException, IsInstance, etc. don't write to
+        // cells (they create new ones or read non-cell state) — last_set
+        // stays intact.
     });
 
     PassResult r = result_of(g, before);

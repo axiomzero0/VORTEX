@@ -28,6 +28,19 @@ Result<PassResult> P09_RedundantStoreElimination::run(Graph& g, const PassContex
         if (n.kind == NodeKind::StoreGlobal) {
             std::uint64_t key = 0x100000000ull + n.symbol;
             if (NodeId* prev = last_store.get(key)) {
+                // PASS-3 fix: g.kill(*prev) drops the previous store but
+                // leaves its effect-chain consumers (the new store's
+                // ins[1], plus any intervening effect op's ins[1]) pointing
+                // at a dead node — broken effect chain. Rewire first:
+                // replace_all_uses(*prev, prev's effect input) makes every
+                // consumer of the killed store (data and effect) point at
+                // the killed store's own effect input, bypassing the dead
+                // node. StoreGlobal has no data consumers, so this only
+                // rewires effect-chain links.
+                Node& killed = g.node(*prev);
+                if (killed.ins.size() >= 2 && killed.ins[1] != vortex::ir::invalid_node) {
+                    g.replace_all_uses(*prev, killed.ins[1]);
+                }
                 g.kill(*prev);
                 changed = true;
             }
