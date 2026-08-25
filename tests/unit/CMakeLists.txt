@@ -5,7 +5,8 @@ add_executable(vortex_unit_tests
     support_test.cpp
     ir_test.cpp
     frontend_test.cpp
+    lang_test.cpp
 )
-target_link_libraries(vortex_unit_tests PRIVATE vortex_compiler)
+target_link_libraries(vortex_unit_tests PRIVATE vortex_compiler vortex_runtime)
 vortex_set_target_flags(vortex_unit_tests)
 add_test(NAME unit COMMAND vortex_unit_tests)

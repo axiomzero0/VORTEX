@@ -20,6 +20,8 @@ add_library(vortex_compiler STATIC
     src/frontend/parser.cpp
     src/frontend/lowering.cpp
     src/pipeline/scheduler.cpp
+    src/passes/core_passes.cpp
+    src/passes/pipeline.cpp
 )
 
 target_include_directories(vortex_compiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/runtime/include)

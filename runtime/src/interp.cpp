@@ -140,6 +140,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                         auto* bm = static_cast<PyBoundMethodObj*>(
                             std::malloc(sizeof(PyBoundMethodObj)));
                         bm->tag = ObjTag::BoundMethod;
+                        bm->flags = 0;
                         bm->refcount = 1;
                         bm->func = out;
                         bm->recv = obj;
@@ -171,6 +172,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
             if (name) {
                 auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
                 bm->tag = ObjTag::BoundMethod;
+                bm->flags = 0;
                 bm->refcount = 1;
                 bm->func = Value::integer(0x100 + (sym == "append" ? 0 : 1));  // marker
                 bm->recv = obj;
@@ -186,6 +188,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
             if (sym == "get" || sym == "keys" || sym == "values" || sym == "items") {
                 auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
                 bm->tag = ObjTag::BoundMethod;
+                bm->flags = 0;
                 bm->refcount = 1;
                 bm->func = Value::integer(0x200 + (sym == "get" ? 0 : sym == "keys" ? 1
                                                   : sym == "values" ? 2 : 3));
@@ -209,6 +212,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                 if (sym == m.name) {
                     auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
                     bm->tag = ObjTag::BoundMethod;
+                    bm->flags = 0;
                     bm->refcount = 1;
                     bm->func = Value::integer(static_cast<std::int64_t>(m.kind));
                     bm->recv = obj;
@@ -280,11 +284,15 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
             case ObjTag::StrIter:
             case ObjTag::DictIter:
             case ObjTag::Generator:
+                // Identity: return an OWNED reference (the register slot will
+                // take ownership; the source register keeps its own).
+                if (obj.tag == Tag::Obj && obj.as.obj) rt.incref(obj.as.obj);
                 out = obj;
                 return true;
             case ObjTag::List: {
                 auto* li = static_cast<PyListIterObj*>(std::malloc(sizeof(PyListIterObj)));
                 li->tag = ObjTag::ListIter;
+                li->flags = 0;
                 li->refcount = 1;
                 li->list = static_cast<PyListObj*>(obj.as.obj);
                 li->index = 0;
@@ -294,6 +302,7 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
             case ObjTag::Str: {
                 auto* si = static_cast<PyStrIterObj*>(std::malloc(sizeof(PyStrIterObj)));
                 si->tag = ObjTag::StrIter;
+                si->flags = 0;
                 si->refcount = 1;
                 si->str = static_cast<PyStrObj*>(obj.as.obj);
                 si->index = 0;
@@ -303,6 +312,7 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
             case ObjTag::Dict: {
                 auto* di = static_cast<PyDictIterObj*>(std::malloc(sizeof(PyDictIterObj)));
                 di->tag = ObjTag::DictIter;
+                di->flags = 0;
                 di->refcount = 1;
                 di->dict = static_cast<PyDictObj*>(obj.as.obj);
                 di->slot = 0;   // seq cursor (insertion order)
@@ -359,7 +369,14 @@ bool Vm::iter_check(Value& it, bool& more) noexcept {
             // cache the value inside the generator (values tuple-less: use a
             // small heap slot via the frame's first scratch register)
             if (has) {
-                g->frame->regs[g->frame->n_regs > 0 ? g->frame->n_regs - 1 : 0] = out;
+                // OWNED reference into the cache slot: incref the new value,
+                // decref whatever was cached before (frame teardown decrefs
+                // every slot exactly once). The old code stored a borrowed
+                // ref -> refcount underflow -> premature free -> UAF.
+                Value& slot =
+                    g->frame->regs[g->frame->n_regs > 0 ? g->frame->n_regs - 1 : 0];
+                if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+                slot = out;   // `out` is an owned ref (L_YIELD incref); transfer
                 more = true;
             } else {
                 more = false;
@@ -632,6 +649,7 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
             if (unit->is_generator) {
                 auto* gen = static_cast<PyGeneratorObj*>(std::malloc(sizeof(PyGeneratorObj)));
                 gen->tag = ObjTag::Generator;
+                gen->flags = 0;
                 gen->refcount = 1;
                 gen->frame = new Frame(unit);
                 gen->code_unit_id = fn->code_unit_id;
@@ -1164,7 +1182,19 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
 // =============================================================================
 // The dispatch loop
 // =============================================================================
-#define VM_LOAD() cur = &f.unit->code[f.pc]
+#define VM_LOAD()                                                            \
+    do {                                                                     \
+        if (f.pc >= f.unit->code.size()) [[unlikely]] {                       \
+            std::fprintf(stderr, "VORTEX FATAL: pc %u out of range (unit %s, "\
+                         "%zu instrs)\n", f.pc,                                            \
+                         f.unit->name != 0xFFFFFFFFu                                       \
+                             ? global_symbols().text(f.unit->name).data()                  \
+                             : "?",                                                        \
+                         f.unit->code.size());                                             \
+            std::abort();                                                                  \
+        }                                                                                  \
+        cur = &f.unit->code[f.pc];                                                         \
+    } while (0)
 #define VM_DISPATCH() goto* dispatch[cur->op]
 ExecStatus Vm::exec_frame(Frame& f) noexcept {
     Runtime& rt = Runtime::instance();
@@ -1180,6 +1210,17 @@ ExecStatus Vm::exec_frame(Frame& f) noexcept {
         &&L_TRY_BEGIN, &&L_TRY_END, &&L_GET_EXC,
     };
     Value* const regs = f.regs;
+    auto chk_reg = [&](std::uint32_t r, const char* what) noexcept {
+        if (r >= f.n_regs) [[unlikely]] {
+            std::fprintf(stderr, "VORTEX FATAL: %s reg %u >= %u (unit %s pc %u)\n", what, r,
+                         f.n_regs,
+                         f.unit->name != 0xFFFFFFFFu
+                             ? global_symbols().text(f.unit->name).data()
+                             : "?",
+                         f.pc);
+            std::abort();
+        }
+    };
     // [watchdog] detect the dict-count corruption at instruction granularity
     const Instr* cur = &f.unit->code[0];   // single rebinding instruction cursor
     // Exception handlers from the scheduled try-range table.
@@ -1192,6 +1233,15 @@ ExecStatus Vm::exec_frame(Frame& f) noexcept {
     }
     // Register write helper (ownership discipline).
     auto write_reg = [&](std::uint32_t r, Value v) noexcept {
+        if (r >= f.n_regs) [[unlikely]] {
+            std::fprintf(stderr, "VORTEX FATAL: reg write %u >= %u (unit %s pc %u)\n",
+                         r, f.n_regs,
+                         f.unit->name != 0xFFFFFFFFu
+                             ? global_symbols().text(f.unit->name).data()
+                             : "?",
+                         f.pc);
+            std::abort();
+        }
         Value& slot = regs[r];
         if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
         slot = v;

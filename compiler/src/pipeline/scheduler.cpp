@@ -768,7 +768,12 @@ Result<void> Scheduler::run() noexcept {
                         diag_code::graph_verify_dominance);
     }
 
-    // Try ranges: [marker block start, catch block start) -> catch block.
+    // Try ranges: [protected start, catch block start) -> catch block.
+    // The protected start is the try-marker block's pc, but code HOISTED
+    // above the marker (const loads, folded ops feeding the body) can also
+    // raise — so the range extends DOWN to the previous try's handler (or
+    // unit start for the outermost try). This keeps nested tries precise
+    // while covering hoisted raisers.
     g_.for_each_live([&](NodeId id) {
         const Node& n = g_.node(id);
         if (n.kind != NodeKind::Catch) return;
@@ -777,9 +782,11 @@ Result<void> Scheduler::run() noexcept {
         range.handler_pc = cb ? cb->start_pc : 0;
         range.start_pc = 0;
         range.end_pc = range.handler_pc;
-        if (n.aux0 != 0 && n.aux0 != 0xFFFF'FFFF) {
-            BlockInfo* marker = block(n.aux0);
-            if (marker) range.start_pc = marker->start_pc;
+        // Precise inner bound: the previous handler's end (nested) or 0.
+        for (const rt::TryRange& prev : unit_.try_ranges) {
+            if (prev.handler_pc > range.start_pc && prev.handler_pc < range.handler_pc) {
+                range.start_pc = prev.handler_pc;
+            }
         }
         unit_.try_ranges.push_back(range);
     });

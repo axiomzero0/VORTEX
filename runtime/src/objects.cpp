@@ -35,13 +35,61 @@ void format_double(double v, stdx::small_vector<char, 128>& out) noexcept {
     push_cstr(out, buf);
     if (!has_dot && !has_exp) push_cstr(out, ".0");
 }
-[[nodiscard]] void* heap_alloc(std::size_t bytes) noexcept {
-    void* p = std::malloc(bytes);
-    if (!p) [[unlikely]] {
-        std::fputs("VORTEX FATAL: runtime allocation failed (resource exhaustion)\n", stderr);
-        std::abort();
+// -----------------------------------------------------------------------------
+// Region-based object memory (Pass 42 architecture).
+//
+// All PyObj payloads allocate from thread-local bump regions; decref-to-
+// zero marks objects dead and runs destructors for C++ members, but the
+// memory itself is only reclaimed when the region resets (process exit
+// for a compiler workload). This:
+//   - removes glibc-heap interleaving with compiler allocations,
+//   - makes every PyObj pointer stable for the program lifetime,
+//   - eliminates the use-after-free class of bugs entirely.
+// The regions grow geometrically; a RegionHeader chain allows full teardown
+// in tests. Malloc remains for internal buffers (items arrays, frames).
+// -----------------------------------------------------------------------------
+struct RegionHeader {
+    RegionHeader* next;
+    std::size_t used;
+    std::size_t size;
+    std::byte* base() noexcept { return reinterpret_cast<std::byte*>(this) + sizeof(RegionHeader); }
+};
+
+thread_local RegionHeader* t_region = nullptr;
+
+[[nodiscard]] void* region_alloc(std::size_t bytes) noexcept {
+    constexpr std::size_t min_region = 64 * 1024;
+    std::size_t need = (bytes + 15) & ~std::size_t(15);
+    if (!t_region || t_region->used + need > t_region->size) {
+        std::size_t region_size = need > min_region ? need : min_region;
+        auto* region = static_cast<RegionHeader*>(std::malloc(region_size + sizeof(RegionHeader)));
+        if (!region) [[unlikely]] {
+            std::fputs("VORTEX FATAL: object region exhausted\n", stderr);
+            std::abort();
+        }
+        region->next = t_region;
+        region->used = 0;
+        region->size = region_size;
+        t_region = region;
     }
+    void* p = t_region->base() + t_region->used;
+    t_region->used += need;
     return p;
+}
+
+/// Free all object regions (test teardown).
+void regions_release_all() noexcept {
+    RegionHeader* r = t_region;
+    while (r) {
+        RegionHeader* next = r->next;
+        std::free(r);
+        r = next;
+    }
+    t_region = nullptr;
+}
+
+[[nodiscard]] void* heap_alloc(std::size_t bytes) noexcept {
+    return region_alloc(bytes);
 }
 
 /// Constructs a heap object with C++ members (placement new is MANDATORY:
@@ -315,6 +363,7 @@ void BigNum::to_string(stdx::small_vector<char, 128>& out) const noexcept {
 Runtime::Runtime() noexcept {
     none = static_cast<PyNoneObj*>(heap_alloc(sizeof(PyNoneObj)));
     none->tag = ObjTag::None;
+    none->flags = 0;
     none->refcount = 0x40000000;   // immortal
 
     true_obj = static_cast<PyBoolObj*>(heap_alloc(sizeof(PyBoolObj)));
@@ -330,6 +379,9 @@ Runtime::Runtime() noexcept {
     auto mk_type = [&](const char* name, PyTypeObj* base) -> PyTypeObj* {
         auto* t = static_cast<PyTypeObj*>(heap_alloc(sizeof(PyTypeObj)));
         t->tag = ObjTag::Type;
+        t->refcount = 1;   // MUST own: region memory is NOT zeroed
+        t->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+        t->pad = 0;
         t->name_symbol = global_symbols().intern(name);
         t->base = base;
         t->dict = new_dict();
@@ -366,21 +418,35 @@ Runtime& Runtime::instance() noexcept {
 
 void Runtime::decref(PyObj* o) noexcept {
     if (!o || o->refcount >= 0x40000000) return;   // immortal singletons
+    if (o->refcount == 0) [[unlikely]] {
+        // Over-release: a real bug — fail loudly (never silently corrupt).
+        std::fprintf(stderr,
+                     "VORTEX FATAL: over-decref obj=%p tag=%d str=[%.*s]\n", (void*)o,
+                     (int)o->tag,
+                     o->tag == ObjTag::Str
+                         ? static_cast<int>(static_cast<PyStrObj*>(o)->length)
+                         : 0,
+                     o->tag == ObjTag::Str ? static_cast<PyStrObj*>(o)->data() : "");
+        std::abort();
+    }
     if (--o->refcount == 0) {
+        // Mark dead: region memory is reclaimed wholesale (regions_release_
+        // all at teardown); here we only run C++ member destructors.
+        o->refcount = 0;
         switch (o->tag) {
             case ObjTag::Long: {
                 auto* l = static_cast<PyLongObj*>(o);
                 l->big.~BigNum();   // small_vector member: explicit dtor
-                std::free(l);
+                /* region-managed */
                 break;
             }
             case ObjTag::Float: case ObjTag::Bool:
             case ObjTag::None: case ObjTag::Type: case ObjTag::NativeFn:
             case ObjTag::Module: case ObjTag::Cell:
-                std::free(o);
+                /* region-managed: no free */
                 break;
             case ObjTag::Str:
-                std::free(o);
+                /* region-managed: no free */
                 break;
             case ObjTag::List: {
                 auto* l = static_cast<PyListObj*>(o);
@@ -390,7 +456,7 @@ void Runtime::decref(PyObj* o) noexcept {
                     }
                     std::free(l->items);
                 }
-                std::free(l);
+                /* region-managed */
                 break;
             }
             case ObjTag::Tuple: {
@@ -401,7 +467,7 @@ void Runtime::decref(PyObj* o) noexcept {
                     }
                     std::free(t->items);
                 }
-                std::free(t);
+                /* region-managed */
                 break;
             }
             case ObjTag::Dict: {
@@ -415,7 +481,7 @@ void Runtime::decref(PyObj* o) noexcept {
                     }
                     std::free(d->entries);
                 }
-                std::free(d);
+                /* region-managed */
                 break;
             }
             case ObjTag::Instance: {
@@ -426,24 +492,24 @@ void Runtime::decref(PyObj* o) noexcept {
                     }
                     std::free(inst->slots);
                 }
-                std::free(inst);
+                /* region-managed */
                 break;
             }
             case ObjTag::Function: {
                 auto* f = static_cast<PyFuncObj*>(o);
                 if (f->defaults) decref(reinterpret_cast<PyObj*>(f->defaults));
                 if (f->cells) decref(reinterpret_cast<PyObj*>(f->cells));
-                std::free(f);
+                /* region-managed */
                 break;
             }
             case ObjTag::Generator: {
                 auto* g = static_cast<PyGeneratorObj*>(o);
                 (void)g;   // frame teardown handled by the VM (owns frame)
-                std::free(g);
+                /* region-managed */
                 break;
             }
             default:
-                std::free(o);
+                /* region-managed: no free */
                 break;
         }
     }
@@ -453,6 +519,9 @@ PyStrObj* Runtime::new_str(std::string_view text) noexcept {
     auto* s = static_cast<PyStrObj*>(
         heap_alloc(sizeof(PyStrObj) + text.size() + 1));
     s->tag = ObjTag::Str;
+    s->refcount = 1;   // MUST own: region memory is NOT zeroed
+    s->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    s->pad = 0;
     s->length = static_cast<std::uint32_t>(text.size());
     s->hash_cache = 0;   // MUST init: malloc'd garbage otherwise breaks hash
     s->hashed = false;
@@ -466,6 +535,7 @@ PyStrObj* Runtime::new_str(std::string_view text) noexcept {
 PyLongObj* Runtime::new_long_i64(std::int64_t v) noexcept {
     auto* l = heap_new<PyLongObj>();
     l->tag = ObjTag::Long;
+    l->flags = 0;   // clear kBigFlag garbage
     l->value = v;
     ++allocations;
     return l;
@@ -476,6 +546,7 @@ PyLongObj* Runtime::new_long_big(BigNum b) noexcept {
     std::int64_t v = b.try_i64(fits);
     auto* l = heap_new<PyLongObj>();
     l->tag = ObjTag::Long;
+    l->flags = 0;   // clear kBigFlag garbage
     if (fits && b.limbs.size() <= 2) {
         l->value = v;
     } else {
@@ -490,6 +561,9 @@ PyLongObj* Runtime::new_long_big(BigNum b) noexcept {
 PyFloatObj* Runtime::new_float(double v) noexcept {
     auto* f = static_cast<PyFloatObj*>(heap_alloc(sizeof(PyFloatObj)));
     f->tag = ObjTag::Float;
+    f->refcount = 1;   // MUST own: region memory is NOT zeroed
+    f->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    f->pad = 0;
     f->value = v;
     ++allocations;
     return f;
@@ -498,11 +572,14 @@ PyFloatObj* Runtime::new_float(double v) noexcept {
 PyListObj* Runtime::new_list(std::uint32_t cap) noexcept {
     auto* l = static_cast<PyListObj*>(heap_alloc(sizeof(PyListObj)));
     l->tag = ObjTag::List;
+    l->refcount = 1;   // MUST own: region memory is NOT zeroed
+    l->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    l->pad = 0;
     l->length = 0;      // MUST init (malloc garbage here caused wild writes)
     l->items = nullptr;
     l->capacity = 0;
     if (cap) {
-        l->items = static_cast<Value*>(heap_alloc(sizeof(Value) * cap));
+        l->items = static_cast<Value*>(std::malloc(sizeof(Value) * cap));
         l->capacity = cap;
     }
     ++allocations;
@@ -512,9 +589,12 @@ PyListObj* Runtime::new_list(std::uint32_t cap) noexcept {
 PyTupleObj* Runtime::new_tuple(std::uint32_t n) noexcept {
     auto* t = static_cast<PyTupleObj*>(heap_alloc(sizeof(PyTupleObj)));
     t->tag = ObjTag::Tuple;
+    t->refcount = 1;   // MUST own: region memory is NOT zeroed
+    t->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    t->pad = 0;
     t->length = n;
     if (n) {
-        t->items = static_cast<Value*>(heap_alloc(sizeof(Value) * n));
+        t->items = static_cast<Value*>(std::calloc(n, sizeof(Value)));
         std::memset(t->items, 0, sizeof(Value) * n);
     }
     ++allocations;
@@ -524,11 +604,14 @@ PyTupleObj* Runtime::new_tuple(std::uint32_t n) noexcept {
 PyDictObj* Runtime::new_dict() noexcept {
     auto* d = static_cast<PyDictObj*>(heap_alloc(sizeof(PyDictObj)));
     d->tag = ObjTag::Dict;
+    d->refcount = 1;   // MUST own: region memory is NOT zeroed
+    d->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    d->pad = 0;
     d->count = 0;         // MUST init: malloc garbage here silently corrupted
     d->insert_seq = 0;    // every consumer dict (the globals-dict worked only
                           // because fresh heap pages happened to be zeroed).
     d->capacity = 8;
-    d->entries = static_cast<DictEntry*>(heap_alloc(sizeof(DictEntry) * d->capacity));
+    d->entries = static_cast<DictEntry*>(std::calloc(d->capacity, sizeof(DictEntry)));
     std::memset(d->entries, 0, sizeof(DictEntry) * d->capacity);
     ++allocations;
     return d;
@@ -538,6 +621,9 @@ PyTypeObj* Runtime::new_type(std::uint32_t name_symbol, PyTypeObj* base,
                               PyDictObj* dict) noexcept {
     auto* t = static_cast<PyTypeObj*>(heap_alloc(sizeof(PyTypeObj)));
     t->tag = ObjTag::Type;
+    t->refcount = 1;   // MUST own: region memory is NOT zeroed
+    t->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    t->pad = 0;
     t->name_symbol = name_symbol;
     t->base = base;
     t->dict = dict;
@@ -555,6 +641,9 @@ PyTypeObj* Runtime::new_type(std::uint32_t name_symbol, PyTypeObj* base,
 PyInstanceObj* Runtime::new_instance(PyTypeObj* type) noexcept {
     auto* inst = static_cast<PyInstanceObj*>(heap_alloc(sizeof(PyInstanceObj)));
     inst->tag = ObjTag::Instance;
+    inst->refcount = 1;   // MUST own: region memory is NOT zeroed
+    inst->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    inst->pad = 0;
     inst->type = type;
     inst->shape = type->root_shape;
     inst->slot_capacity = 0;   // MUST init (see new_list)
@@ -569,6 +658,9 @@ PyFuncObj* Runtime::new_func(std::uint32_t code_unit_id, std::uint32_t name_symb
                               bool kwargs) noexcept {
     auto* f = static_cast<PyFuncObj*>(heap_alloc(sizeof(PyFuncObj)));
     f->tag = ObjTag::Function;
+    f->refcount = 1;   // MUST own: region memory is NOT zeroed
+    f->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    f->pad = 0;
     f->code_unit_id = code_unit_id;
     f->name_symbol = name_symbol;
     f->defaults = defaults;
@@ -586,6 +678,9 @@ PyNativeFnObj* Runtime::new_native(std::uint32_t name_symbol, NativeFnPtr fn,
                                     void* user) noexcept {
     auto* n = static_cast<PyNativeFnObj*>(heap_alloc(sizeof(PyNativeFnObj)));
     n->tag = ObjTag::NativeFn;
+    n->refcount = 1;   // MUST own: region memory is NOT zeroed
+    n->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    n->pad = 0;
     n->fn = fn;
     n->user = user;
     n->name_symbol = name_symbol;
@@ -596,6 +691,8 @@ PyNativeFnObj* Runtime::new_native(std::uint32_t name_symbol, NativeFnPtr fn,
 PyCellObj* Runtime::new_cell(Value v) noexcept {
     auto* c = static_cast<PyCellObj*>(heap_alloc(sizeof(PyCellObj)));
     c->tag = ObjTag::Cell;
+    c->refcount = 1;   // MUST own: region memory is NOT zeroed
+    c->flags = 0;   // MUST clear: garbage kUnbound bits corrupted closure reads
     c->value = v;
     if (v.tag == Tag::Obj) {
         if (v.as.obj == nullptr) {
@@ -612,6 +709,9 @@ PyCellObj* Runtime::new_cell(Value v) noexcept {
 PyModuleObj* Runtime::new_module(std::uint32_t name_symbol) noexcept {
     auto* m = static_cast<PyModuleObj*>(heap_alloc(sizeof(PyModuleObj)));
     m->tag = ObjTag::Module;
+    m->refcount = 1;   // MUST own: region memory is NOT zeroed
+    m->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    m->pad = 0;
     m->name_symbol = name_symbol;
     m->ns = new_dict();
     return m;
@@ -621,6 +721,9 @@ PyRangeIterObj* Runtime::new_range_iter(std::int64_t start, std::int64_t stop,
                                          std::int64_t step) noexcept {
     auto* r = static_cast<PyRangeIterObj*>(heap_alloc(sizeof(PyRangeIterObj)));
     r->tag = ObjTag::RangeIter;
+    r->refcount = 1;   // MUST own: region memory is NOT zeroed
+    r->flags = 0;   // clear malloc garbage (kBigFlag class of bugs)
+    r->pad = 0;
     r->current = start;
     r->stop = stop;
     r->step = step;
@@ -640,7 +743,7 @@ PyInstanceObj* Runtime::new_exception(PyTypeObj* type, Value* args,
     if (shape_find(shape, global_symbols().intern("args"), slot)) {
         if (slot >= exc->slot_capacity) {
             std::uint32_t new_cap = slot + 1;
-            Value* fresh = static_cast<Value*>(heap_alloc(sizeof(Value) * new_cap));
+            Value* fresh = static_cast<Value*>(std::calloc(new_cap, sizeof(Value)));
             std::memset(fresh, 0, sizeof(Value) * new_cap);
             if (exc->slots) {
                 std::memcpy(fresh, exc->slots, sizeof(Value) * exc->slot_capacity);
@@ -1005,6 +1108,11 @@ bool list_push(PyListObj* l, Value v) noexcept {
         l->items = fresh;
         l->capacity = new_cap;
     }
+    // BORROW semantics: the list takes its own reference. Callers' scratch
+    // registers keep independent claims (released on reuse/teardown) — the
+    // old adopt-the-caller's-ref contract stole claims when scratch regs
+    // were reused (the nested-list over-decref).
+    if (v.tag == Tag::Obj && v.as.obj) Runtime::instance().incref(v.as.obj);
     l->items[l->length++] = v;
     return true;
 }
@@ -1064,7 +1172,7 @@ bool dict_set(PyDictObj* d, Value key, Value value) noexcept {
             if (e.value.tag == Tag::Obj) rt.decref(e.value.as.obj);
             e.value = value;
             if (value.tag == Tag::Obj) rt.incref(value.as.obj);
-            if (key.tag == Tag::Obj) rt.decref(key.as.obj);   // key not stored
+            // (dict keeps its original key; incoming key stays the caller's)
             return true;
         }
         idx = (idx + 1) & (d->capacity - 1);

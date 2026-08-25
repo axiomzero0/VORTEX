@@ -8,7 +8,9 @@
 
 #include "vortex/frontend/lowering.hpp"
 #include "vortex/frontend/parser.hpp"
+#include "vortex/passes/pass_pipeline.hpp"
 #include "vortex/pipeline/scheduler.hpp"
+#include "vortex/support/config.hpp"
 #include "vortex/support/arena.hpp"
 #include "vortex/support/symbol_table.hpp"
 
@@ -68,6 +70,24 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
         // by lowering in discovery order, so extend to match next_code_unit_id.
         while (vm.program.units.size() < lower_ctx.next_code_unit_id) {
             vm.program.units.push_back(nullptr);
+        }
+
+        // Run the optimizing pipeline (Tier 2 mode: unified passes,
+        // budget-guarded) before scheduling. The passes only remove or
+        // forward provably-dead/constant code, so execution of the
+        // optimized graph must match the unoptimized one — the
+        // differential test suite verifies this (Rule 36).
+        {
+            passes::PassContext pctx;
+            pctx.tier = passes::TierMode::Tier2;
+            pctx.node_budget = cfg::tier2_node_budget;
+            pctx.code_unit_id = lowered.code_unit_id;
+            pctx.telemetry = &vm.telemetry;
+            Result<void> optimized = passes::optimize(lowered.graph, pctx);
+            if (!optimized) {
+                outcome.diagnostic = optimized.error();
+                return outcome;
+            }
         }
 
         // Schedule to Tier-0 bytecode.

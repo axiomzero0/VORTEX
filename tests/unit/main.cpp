@@ -5,6 +5,7 @@
 #include "harness.hpp"
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // crash-safe: unbuffered
     std::size_t count = 0;
     int total_failures = 0;
     for (::vortex_test::TestCase* tc = ::vortex_test::head(); tc; tc = tc->next) {
