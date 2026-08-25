@@ -791,14 +791,36 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
             out = Value::none();
             return true;
         }
-        if (kind == 0x101) {   // pop
+        if (kind == 0x101) {   // pop([index])
             if (l->length == 0) {
                 raise_builtin(rt.type_index_error, "pop from empty list");
                 return false;
             }
-            out = l->items[l->length - 1];
+            // OBJ-22 fix: honor the optional index argument. The previous
+            // code always popped the last element, so l.pop(0) returned
+            // the last element instead of the first. Python: pop(i)
+            // removes and returns the item at index i (negative indices
+            // count from the end).
+            std::int64_t idx = static_cast<std::int64_t>(l->length) - 1;
+            if (argc >= 1) {
+                if (!as_i64(args[0], idx)) {
+                    raise_builtin(rt.type_type_error, "pop index must be an integer");
+                    return false;
+                }
+                if (idx < 0) idx += static_cast<std::int64_t>(l->length);
+            }
+            if (idx < 0 || idx >= static_cast<std::int64_t>(l->length)) {
+                raise_builtin(rt.type_index_error, "pop index out of range");
+                return false;
+            }
+            std::uint32_t u_idx = static_cast<std::uint32_t>(idx);
+            out = l->items[u_idx];
+            // incref out since the caller treats it as owned (was borrowed).
+            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            // shift remaining elements left
+            std::memmove(l->items + u_idx, l->items + u_idx + 1,
+                         sizeof(Value) * (l->length - u_idx - 1));
             l->length--;
-            out = out;
             return true;
         }
     }
@@ -1194,7 +1216,15 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
                 args[0].as.obj->tag == ObjTag::List) {
                 auto* l = static_cast<PyListObj*>(args[0].as.obj);
                 std::int64_t idx = 0;
-                if (!as_i64(args[1], idx) || idx < 0 || idx >= static_cast<std::int64_t>(l->length)) {
+                // OBJ-21 fix: accept negative index (Python: del l[-1]
+                // deletes the last element). The previous code required
+                // idx >= 0, so del l[-1] raised IndexError.
+                if (!as_i64(args[1], idx)) {
+                    raise_builtin(rt.type_index_error, "del index not an integer");
+                    return false;
+                }
+                if (idx < 0) idx += static_cast<std::int64_t>(l->length);
+                if (idx < 0 || idx >= static_cast<std::int64_t>(l->length)) {
                     raise_builtin(rt.type_index_error, "del index out of range");
                     return false;
                 }
@@ -1660,17 +1690,30 @@ L_LOAD_INDEX: {
                         lo = len - 1;
                     } else if (lo < 0) {
                         lo += len;
+                        // INT-9 fix: if lo is still negative after adding
+                        // len (very negative lo, e.g., xs[-100::-1]), clamp
+                        // to len-1 so we walk the whole list backwards.
+                        // The previous code left lo at the negative value,
+                        // causing the loop `for (k = lo; k > hi; k += step)`
+                        // to never execute (k > hi was always false).
+                        if (lo < 0) lo = len - 1;
                     }
                     if (tup->items[1].tag != Tag::Int) {
                         hi = -1;
                     } else if (hi < 0) {
                         hi += len;
+                        // INT-9: clamp hi the same way for consistency.
+                        if (hi < 0) hi = -1;
                     }
                     if (lo > len - 1) lo = len - 1;
                     for (std::int64_t k = lo; k > hi; k += step) {
                         if (k >= 0 && k < len) {
                             if (!list_push(result, src->items[static_cast<std::uint32_t>(k)])) {
                                 raise_builtin(rt.type_memory_error, "slice allocation failed");
+                                // INT-10 fix: was `break` then `ok = true` below,
+                                // masking the allocation failure as a partial slice.
+                                // Now set ok = false so the caller sees the error.
+                                ok = false;
                                 break;
                             }
                         }
@@ -1706,11 +1749,14 @@ L_LOAD_INDEX: {
                         lo = len - 1;
                     } else if (lo < 0) {
                         lo += len;
+                        // INT-9 fix: clamp very-negative lo to len-1.
+                        if (lo < 0) lo = len - 1;
                     }
                     if (tup->items[1].tag != Tag::Int) {
                         hi = -1;
                     } else if (hi < 0) {
                         hi += len;
+                        if (hi < 0) hi = -1;
                     }
                     if (lo > len - 1) lo = len - 1;
                     for (std::int64_t k = lo; k > hi; k += step) {
