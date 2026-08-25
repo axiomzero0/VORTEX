@@ -88,6 +88,10 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
             // Machine facts come from the probed host descriptor — never
             // from cfg constants (Rule 24/27).
             pctx.target = &backend::host_target();
+            // Module string pool: the only source for string-literal
+            // bytes (Rule 5). Passes that fold string constants (Pass 45)
+            // read from this pool.
+            pctx.string_pool = &(**ast).string_pool;
             // Opt-in switches (Pass 33 polyhedral is off unless requested).
             if (options.polyhedral) {
                 pctx.options.set(passes::OptOption::Polyhedral);

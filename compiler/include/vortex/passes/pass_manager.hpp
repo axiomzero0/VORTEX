@@ -61,6 +61,14 @@ struct PassContext {
     /// Opt-in optimization switches — empty by default (Rule 23).
     Flags<OptOption> options{};
 
+    /// Pointer to the module's cooked string-pool (Rule 5: pool bytes are
+    /// the only source for string-literal contents). Null when the pass
+    /// pipeline runs outside a module context (e.g., direct unit tests of
+    /// a pass with a synthetic graph). Passes that need to read string
+    /// literals (Pass 45 constant folding of str+str) MUST null-check
+    /// before indexing into the pool.
+    const stdx::small_vector<char, 4096>* string_pool{nullptr};
+
     /// Target the graph is being compiled for. Machine facts (SIMD width,
     /// register count, cache line) are QUERIED from here — never assumed
     /// from cfg constants (Rule 27/24). Null means "no target knowledge":

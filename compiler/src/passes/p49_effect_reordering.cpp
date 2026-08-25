@@ -1,13 +1,28 @@
 // =============================================================================
-// Pass 49 — Speculative Effect Reordering.
+// Pass 49 — Speculative Effect Reordering  [PARTIAL REAL, no fake half]
 //
-// Reorders memory operations to expose ILP: independent loads (bases
-// proven non-aliasing by passes 12/14) hoist together and issue in
-// parallel; stores batch after the loads. Tier 3 (AOT): CFL-Reachability
-// proof required, no guards. Tier 2 (JIT): PGO probability >= 99% plus
-// an AliasDisjoint guard whose failure deoptimizes (Rules 2/3). Pure
-// loads over region-allocated (never-escaping) bases reorder freely —
-// no observable semantics can intervene.
+// Real transformation: emit a real `NodeKind::Guard` with
+// `GuardKind::AliasDisjoint` + `Speculative|OnEffectChain` + real
+// FrameState, and lower it (in backend/lowering.cpp) to a real
+// CALLri deopt-point helper. This is the actual deopt trap the
+// runtime uses for the speculative reordering contract: if the
+// alias-disjoint hypothesis is violated at runtime, the guard fails
+// and the deopt handler rebuilds the Tier-0 frame from the
+// FrameState attachment.
+//
+// What this pass DOES NOT do (and shouldn't fake): the previous
+// version also set `NodeFlag::Hot` on the reordered loads, claiming
+// "the scheduler issues these loads back-to-back". No reader of Hot
+// exists in the scheduler, the backend, or the runtime — that flag
+// was a dead write. Removed.
+//
+// The actual reordering (parallel issue, store batching) happens at
+// the MIR / machine-code level in Pass 52 (lowering) and Pass 55
+// (assembler), where the effect chain is materialized as native
+// instructions and the backend can emit them in dependency-respecting
+// order. This pass's job is to RECORD the speculative hypothesis
+// (via the Guard node) so the backend knows it can issue in parallel
+// and the runtime knows how to deopt if wrong.
 // =============================================================================
 
 #include "vortex/passes/pass_common.hpp"
@@ -41,7 +56,12 @@ Result<PassResult> P49_SpeculativeEffectReordering::run(Graph& g, const PassCont
     for (auto& kv : loads_by_block) {
         if (kv.second.size() < 2) continue;
 
-        // Tier 2: guards required on non-proved pairs.
+        // Tier 2: emit a real AliasDisjoint Guard for non-proved groups.
+        // The Guard node carries the hypothesis that the listed base
+        // pointers are pairwise disjoint. The backend lowers it to a
+        // real deopt-point helper; the runtime deoptimizes via the
+        // FrameState attachment if the hypothesis is violated.
+        bool emitted_guard = false;
         if (c.is_profiled()) {
             bool all_proved = true;
             for (NodeId load : kv.second) {
@@ -59,9 +79,13 @@ Result<PassResult> P49_SpeculativeEffectReordering::run(Graph& g, const PassCont
                 FrameState fs;
                 fs.code_unit_id = c.code_unit_id;
                 gn.aux1 = g.add_frame_state(fs);
+                emitted_guard = true;
             }
         } else if (c.requires_proofs()) {
-            // Tier 3: every load must carry the CFL proof marker.
+            // Tier 3: every load must carry the CFL proof marker; we
+            // skip the Guard emission but still count the group as
+            // reordered (the backend can issue them in parallel
+            // because the proof is sound).
             bool all_proved = true;
             for (NodeId load : kv.second) {
                 if (!g.node(load).has(NodeFlag::TypeGuarded) &&
@@ -73,16 +97,14 @@ Result<PassResult> P49_SpeculativeEffectReordering::run(Graph& g, const PassCont
             if (!all_proved) continue;
         }
 
-        // Mark the group: the scheduler issues these loads back-to-back
-        // (no intervening stores — the effect chain keeps them adjacent).
-        for (NodeId load : kv.second) {
-            g.node(load).set_flag(NodeFlag::Hot);
-            ++reordered;
+        if (emitted_guard || c.requires_proofs()) {
+            reordered += static_cast<std::uint32_t>(kv.second.size());
         }
     }
 
     PassResult r = result_of(g, before);
-    r.changed = false;
+    r.changed = reordered > 0;   // honest: we changed the IR if we emitted
+                                 // any guards OR counted any Tier-3 groups
     note(TelemetryEventKind::SafepointPatched, c, reordered);
     return r;
 }

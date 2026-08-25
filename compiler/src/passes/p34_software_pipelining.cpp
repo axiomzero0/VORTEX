@@ -1,18 +1,32 @@
 // =============================================================================
-// Pass 34 — Software Pipelining.
+// Pass 34 — Software Pipelining  [HONEST NO-OP]
 //
-// Overlaps loop iterations to hide latency: within the loop body, the
-// instruction order is re-planned so that long-latency producers (calls,
-// loads) issue EARLY and their consumers read LATE — iteration i+1's
-// producers overlap iteration i's consumers. At the IR level the pass
-// re-pins control-dependent effect ops inside the body: an effect op whose
-// users are all in the NEXT iteration (phi backedge consumers) moves to
-// the earliest legal block (the header). Modulo-scheduling hints are
-// recorded in aux0 = initiation interval estimate.
+// Design intent: overlap loop iterations to hide latency — long-latency
+// producers (calls, loads) issue EARLY, their consumers read LATE,
+// iteration i+1's producers overlap iteration i's consumers. At the IR
+// level, the pass re-pins control-dependent effect ops inside the body
+// and records a modulo-scheduling initiation-interval hint.
+//
+// Current status: NO-OP. The previous version computed an II estimate
+// with HARDCODED latencies (calls=4, loads=2, arith=1) and wrote it to
+// `header.aux0`. The hardcoded latencies violated Rule 27 (machine
+// facts must be queried via TargetDescriptor, not assumed). Worse, the
+// scheduler does NOT read aux0 on Loop headers — no modulo-scheduling
+// ever happened. That was a fake transformation with two defects.
+//
+// Real software pipelining requires:
+//   1. A latency model queried from TargetDescriptor::latency(CostClass).
+//   2. Dependence-graph construction over the loop body.
+//   3. Modulo-scheduling: assignment of ops to stage+cycle within II.
+//   4. Generation of prologue/epilogue/kernel stages at the IR level
+//      (real node duplication, register renaming for stage k+1 vs k).
+//   5. The scheduler must lower this structure to bytecode without
+//      collapsing it back to sequential form.
+// None of that was implemented; the previous "II hint" was a dead
+// write. This honest no-op reports "no change" until the real
+// implementation lands.
 // =============================================================================
 
-#include "vortex/passes/analyses/dominators.hpp"
-#include "vortex/passes/analyses/loops.hpp"
 #include "vortex/passes/pass_common.hpp"
 #include "vortex/passes/passes_fwd.hpp"
 
@@ -22,44 +36,14 @@ inline namespace abi_v1 {
 using namespace vortex::ir;
 
 Result<PassResult> P34_SoftwarePipelining::run(Graph& g, const PassContext& c) noexcept {
-    if (c.tier != TierMode::Tier2) return PassResult{};   // needs PGO latency data
-    DomTree dom = compute_dominators(g);
-    LoopInfo loops = compute_loops(g, dom);
-
-    std::uint32_t before = g.live_node_count();
-    std::uint32_t pipelined = 0;
-
-    for (const LoopInfo::Loop& loop : loops.loops) {
-        // Estimate the initiation interval: max latency along any chain of
-        // effect ops in the body (unit latency model: calls 4, loads 2,
-        // arithmetic 1 — Rule 27: never hardcode, query via cost hooks).
-        std::uint32_t ii = 1;
-        g.for_each_live([&](NodeId id) {
-            const Node& n = g.node(id);
-            if (!n.has(NodeFlag::OnEffectChain) || n.ins.empty()) return;
-            for (NodeId blk : loop.blocks) {
-                if (n.ins[0] == blk) {
-                    std::uint32_t lat = 1;
-                    if (n.kind == NodeKind::CallPy || n.kind == NodeKind::CallDirect ||
-                        n.kind == NodeKind::GuardedDirectCall) {
-                        lat = 4;
-                    } else if (n.kind == NodeKind::LoadIndex || n.kind == NodeKind::LoadAttr) {
-                        lat = 2;
-                    }
-                    if (lat > ii) ii = lat;
-                    return;
-                }
-            }
-        });
-        Node& header = g.node(loop.header);
-        header.aux0 = ii;   // II hint for the scheduler's overlap planning
-        header.set_flag(NodeFlag::Hot);
-        ++pipelined;
-    }
-
-    PassResult r = result_of(g, before);
+    (void)g;
+    (void)c;
+    // Honest no-op: real modulo-scheduling not implemented. See file
+    // header for rationale.
+    PassResult r;
+    r.nodes_before = g.live_node_count();
+    r.nodes_after = r.nodes_before;
     r.changed = false;
-    note(TelemetryEventKind::SafepointPatched, c, pipelined);
     return r;
 }
 

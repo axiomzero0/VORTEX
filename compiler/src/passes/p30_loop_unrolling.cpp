@@ -1,16 +1,33 @@
 // =============================================================================
-// Pass 30 — Loop Unrolling with PGO-Directed Trip Counts.
+// Pass 30 — Loop Unrolling  [HONEST NO-OP]
 //
-// Unrolls loops with provably-constant trip counts (range-loops with
-// constant bounds). Factor capped by cfg::unroll_max_factor, trip count
-// and the node budget (Rule 10: growing passes run in guarded fixpoints).
-// The decision is recorded on the loop header (aux0 = factor) for the
-// scheduler's bytecode-level body duplication — IR-level duplication
-// would double phis without register context.
+// Design intent: unroll loops with provably-constant trip counts
+// (range-loops with constant bounds) by a factor capped by
+// cfg::unroll_max_factor, the trip count, and the node budget.
+//
+// Current status: NO-OP. The previous version set `header.aux0 = factor`
+// and `NodeFlag::Hot` on the loop header, claiming the scheduler would
+// do "bytecode-level body duplication" — but the scheduler does NOT
+// read aux0 on Loop headers (audited: scheduler.cpp reads aux0 only
+// for ConstPy string-pool offsets, Parameter slots, CallPy argc/kw/cls).
+// No body duplication ever happened. That was a fake transformation.
+//
+// Real IR-level full unrolling requires:
+//   1. Cloning the body nodes N times.
+//   2. Substituting each clone's IV phi with ConstInt(k).
+//   3. Chaining the effect/memory state across clones.
+//   4. Maintaining phi-rewiring for variables updated in the body.
+//   5. Killing the original Loop / GetIterCheck / backedge.
+// That's intricate IR surgery, and the for-in-range pattern lowered to
+// a complex IR shape (GetIterCheck, Iter, IterNext) makes it harder
+// still. The previous "easy route" of just tagging the header was a
+// stub; this honest no-op documents that the real surgery has not
+// been done yet.
+//
+// Until the IR-rewriting version is implemented, this pass reports
+// "no change" and emits zero IR mutations.
 // =============================================================================
 
-#include "vortex/passes/analyses/dominators.hpp"
-#include "vortex/passes/analyses/loops.hpp"
 #include "vortex/passes/pass_common.hpp"
 #include "vortex/passes/passes_fwd.hpp"
 
@@ -19,70 +36,15 @@ inline namespace abi_v1 {
 
 using namespace vortex::ir;
 
-namespace {
-
-[[nodiscard]] bool constant_trip_count(const Graph& g, NodeId loop_header,
-                                       std::int64_t& trips) noexcept {
-    NodeId check = invalid_node;
-    g.for_each_live([&](NodeId id) {
-        const Node& n = g.node(id);
-        if (n.kind == NodeKind::GetIterCheck && !n.ins.empty() && n.ins[0] == loop_header) {
-            check = id;
-        }
-    });
-    if (check == invalid_node || g.node(check).ins.size() < 3) return false;
-    NodeId it = g.node(check).ins[2];
-    const Node& iter = g.node(it);
-    if (iter.kind != NodeKind::Iter || iter.ins.size() < 3) return false;
-    NodeId range_call = iter.ins[2];
-    const Node& rc = g.node(range_call);
-    if (rc.kind != NodeKind::CallPy || rc.ins.size() < 4) return false;
-    const Node& callee = g.node(rc.ins[2]);
-    if (callee.kind != NodeKind::LoadGlobal) return false;
-    const Node& lo = g.node(rc.ins[3]);
-    if (rc.ins.size() < 5) {
-        if (lo.kind != NodeKind::ConstInt) return false;
-        trips = lo.const_value.as.i;
-        return trips >= 0 && trips <= 1024;
-    }
-    const Node& hi = g.node(rc.ins[4]);
-    if (lo.kind != NodeKind::ConstInt || hi.kind != NodeKind::ConstInt) return false;
-    trips = hi.const_value.as.i - lo.const_value.as.i;
-    return trips >= 0 && trips <= 1024;
-}
-
-}  // namespace
-
 Result<PassResult> P30_LoopUnrolling::run(Graph& g, const PassContext& c) noexcept {
-    if (c.tier == TierMode::Tier1) return PassResult{};
-    DomTree dom = compute_dominators(g);
-    LoopInfo loops = compute_loops(g, dom);
-    if (loops.loops.empty()) return PassResult{};
-
-    std::uint32_t before = g.live_node_count();
-    std::uint32_t unrolled = 0;
-
-    for (const LoopInfo::Loop& loop : loops.loops) {
-        if (budget_exceeded(g, c)) {
-            note(TelemetryEventKind::BudgetExceeded, c);
-            break;
-        }
-        std::int64_t trips = 0;
-        if (!constant_trip_count(g, loop.header, trips)) continue;
-
-        std::uint32_t factor = cfg::unroll_max_factor;
-        if (static_cast<std::int64_t>(factor) > trips) factor = static_cast<std::uint32_t>(trips);
-        if (factor < 2) continue;
-
-        Node& header = g.node(loop.header);
-        header.aux0 = factor;
-        header.set_flag(NodeFlag::Hot);
-        ++unrolled;
-    }
-
-    PassResult r = result_of(g, before);
+    (void)g;
+    (void)c;
+    // Honest no-op: real IR-level unrolling is not implemented. See
+    // file header for rationale.
+    PassResult r;
+    r.nodes_before = g.live_node_count();
+    r.nodes_after = r.nodes_before;
     r.changed = false;
-    note(TelemetryEventKind::SafepointPatched, c, unrolled);
     return r;
 }
 

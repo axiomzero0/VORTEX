@@ -727,3 +727,87 @@ TEST(jit_matches_tier0_for_int_arithmetic) {
 }
 
 #endif  // __x86_64__
+
+// --- string interning (Pass 45) real transformation --------------------------
+
+TEST(p45_folds_const_str_concat_into_one_constpy) {
+    // Build a synthetic graph with:
+    //   PyBinary(Add, ConstPy("abc"), ConstPy("def"))
+    // The pass should fold to a single ConstPy carrying the interned
+    // string "abcdef" (Tag::Obj). Anything less is a stub.
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+
+    // Pool layout: "abc" at offset 0..3, "def" at offset 3..6. The pool
+    // is supplied via PassContext::string_pool.
+    stdx::small_vector<char, 4096> pool;
+    for (char ch : std::string_view("abcdef")) pool.push_back(ch);
+
+    NodeId a = g.create(NodeKind::ConstPy);
+    Node& an = g.node(a);
+    an.const_value.tag = Tag::None;
+    an.aux0 = 0;            // offset
+    an.aux1 = 3;            // length
+    an.symbol = 0xFFFF'FFFF;
+    an.set_flag(NodeFlag::Pure);
+
+    NodeId b = g.create(NodeKind::ConstPy);
+    Node& bn = g.node(b);
+    bn.const_value.tag = Tag::None;
+    bn.aux0 = 3;
+    bn.aux1 = 3;
+    bn.symbol = 0xFFFF'FFFF;
+    bn.set_flag(NodeFlag::Pure);
+
+    NodeId bin = g.create(NodeKind::PyBinary, {start, start, a, b});
+    Node& binn = g.node(bin);
+    binn.subop = static_cast<std::uint16_t>(ir::BinOpKind::Add);
+    binn.set_flag(NodeFlag::OnEffectChain);
+
+    NodeId ret = g.create(NodeKind::Return, {start, bin});
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+
+    // Count ConstPy nodes before.
+    std::uint32_t constpy_before = 0;
+    g.for_each_live([&](NodeId id) {
+        if (g.node(id).kind == NodeKind::ConstPy) ++constpy_before;
+    });
+    CHECK_EQ(constpy_before, 2u);
+
+    passes::PassContext ctx;
+    ctx.tier = passes::TierMode::Tier2;
+    ctx.string_pool = &pool;
+    passes::P45_StringInterning p45;
+    Result<passes::PassResult> r = p45.run(g, ctx);
+    CHECK(r.has_value());
+    if (!r) return;
+    CHECK(r->changed);
+
+    // After folding: at least one new ConstPy exists carrying Tag::Obj.
+    bool found_folded = false;
+    g.for_each_live([&](NodeId id) {
+        const Node& n = g.node(id);
+        if (n.kind != NodeKind::ConstPy) return;
+        if (n.const_value.tag != Tag::Obj) return;
+        // The folded value must be a PyStrObj with view == "abcdef".
+        if (n.const_value.as.obj == nullptr) return;
+        if (n.const_value.as.obj->tag != vortex::rt::ObjTag::Str) return;
+        auto* s = static_cast<vortex::rt::PyStrObj*>(n.const_value.as.obj);
+        std::string_view sv(s->data(), s->length);
+        if (sv == std::string_view("abcdef")) found_folded = true;
+    });
+    CHECK(found_folded);
+
+    // The original PyBinary should be dead (uses replaced).
+    bool bin_still_used = false;
+    g.for_each_live([&](NodeId id) {
+        if (id == bin) return;
+        const Node& n = g.node(id);
+        for (NodeId in : n.ins) {
+            if (in == bin) bin_still_used = true;
+        }
+    });
+    CHECK(!bin_still_used);
+}
