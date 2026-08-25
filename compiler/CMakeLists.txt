@@ -71,6 +71,10 @@ add_library(vortex_compiler STATIC
     src/passes/pipeline.cpp
     src/passes/analyses/dominators.cpp
     src/passes/analyses/loops.cpp
+    src/backend/target.cpp
+    src/backend/lowering.cpp
+    src/backend/regalloc.cpp
+    src/backend/codegen.cpp
 )
 
 target_include_directories(vortex_compiler PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/runtime/include)

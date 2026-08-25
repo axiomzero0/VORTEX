@@ -157,6 +157,10 @@ public:
         return 1;
     }
 
+    void insert_if_absent(const Key& k, const Value& v) noexcept {
+        if (!contains(k)) insert(k, v);
+    }
+
     void clear() noexcept { entries_.clear(); }
     void reserve(size_type n) { entries_.reserve(n); }
 

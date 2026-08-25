@@ -1,0 +1,60 @@
+// =============================================================================
+// vortex/backend/codegen.hpp — Pass 54/55: emission, layout, deopt metadata
+//
+// Translates allocated MIR into executable machine code:
+//   - Prologue: push callee-saved, materialize r12 = regs base.
+//   - Peephole (Pass 54): MOVri + ALUrr fuse to ALU with imm32 where the
+//     constant fits; MOVrr pairs collapse; redundant stores to the same
+//     home slot within a block drop.
+//   - Hot/cold partitioning (Pass 55): cold blocks (deopt traps, handler
+//     bodies) emit into a secondary region appended after the hot body;
+//     intra-unit jumps link them by rel32 patch.
+//   - Safepoints: every call, backedge, and guard records a
+//     SafepointRecord (pc offset, frame state, live physreg->slot map) into
+//     the unit's unwind table — the .vortex_unwind section.
+//   - Deopt traps: GUARD failures jump to a cold stub that calls
+//     vortex_deopt_entry(unit_id, safepoint_index); the runtime rebuilds
+//     the Tier-0 frame and resumes via Vm::enter_at.
+// =============================================================================
+
+#pragma once
+
+#include <cstdint>
+
+#include "vortex/backend/assembler.hpp"
+#include "vortex/backend/lowering.hpp"
+#include "vortex/backend/mir.hpp"
+#include "vortex/backend/regalloc.hpp"
+
+namespace vortex::backend {
+
+inline namespace abi_v1 {
+
+/// Runtime helper functions the codegen calls (resolved by jit.cpp).
+struct HelperTable {
+    void (*binop)(void* ctx, std::uint64_t op, std::uint64_t a, std::uint64_t b) = nullptr;
+    void* ctx{nullptr};
+};
+
+/// Full backend output for one unit.
+struct CompiledCode {
+    std::byte* code{nullptr};
+    std::size_t code_size{0};
+    std::size_t cold_offset{0};   // hot region = [0, cold_offset)
+    stdx::small_vector<SafepointRecord, 16> safepoints{};
+    stdx::small_vector<SafepointMapping, 64> mappings{};   // concat per record
+    std::uint32_t frame_slots{0};
+    std::uint32_t unit_id{0};
+    bool valid{false};
+};
+
+/// Entry-point signature the runtime calls: void jit(Value* regs).
+using JitEntryFn = void (*)(void* regs);
+
+/// Pass 54/55 driver: lower -> allocate -> emit.
+[[nodiscard]] CompiledCode compile_unit(const ir::Graph& g, std::uint32_t unit_id,
+                                        std::byte* buffer, std::size_t capacity,
+                                        const TargetDescriptor& target) noexcept;
+
+}  // namespace abi_v1
+}  // namespace vortex::backend

@@ -1,0 +1,181 @@
+// =============================================================================
+// vortex/backend/mir.hpp — Machine IR: Sea of Nodes lowered to machine form
+//
+// Purpose:
+//   Pass 52's output. Every MIR node is a machine operation with a register
+//   class, at most 3 operands (std::inplace_vector semantics via stdx —
+//   Rule 19: zero heap allocation for 99% of instructions), and a home slot
+//   in the Tier-0 register file (its originating IR NodeId) — which is what
+//   makes deoptimization reconstruction free.
+//
+// Design:
+//   - Identifiers are dense u32 indices into a bump-allocated arena; no
+//     pointers in edges (Rule 15 discipline carried to the backend).
+//   - Virtual registers ARE MIR node ids: single-def SSA at machine level.
+//   - The cold flag drives Pass 55's hot/cold partitioning.
+//   - Safepoints carry the (machinePC, frameState, live vreg->physreg map)
+//     record the deoptimizer consumes.
+// =============================================================================
+
+#pragma once
+
+#include <cstdint>
+
+#include "vortex/backend/target.hpp"
+#include "vortex/stdx/small_vector.hpp"
+
+namespace vortex::backend {
+
+inline namespace abi_v1 {
+
+/// Machine opcodes — arch-neutral MIR surface. Distinct sequential values
+/// (a switch must be exhaustive and unambiguous); the x86 encoding and the
+/// latency-table index are derived at emission, NOT overloaded onto the
+/// opcode value.
+enum class MOp : std::uint8_t {
+    MOVri = 1,      // dst <- imm64
+    MOVrm,          // dst <- [frame slot]
+    MOVmr,          // [frame slot] <- src
+    MOVrr,          // dst <- src (reg-reg)
+    ADDrr,
+    SUBrr,
+    IMULrr,
+    NEGrr,
+    CMPrr,
+    CMPri,
+    TESTrr,
+    JMP,
+    Jcc,
+    CALLri,
+    CALLrr,
+    RET,
+    INCREF,
+    DECREF,
+    GUARD_TAG,
+    GUARD_INT,
+    PUSH,
+    POP,
+    LEA,
+    VADDrr,
+    VMOVUPS,
+    VPINSRQ,
+    SAFEPOINT,
+    DEOPT_TRAP,
+};
+
+enum class MCond : std::uint8_t {
+    E = 0x84, NE = 0x85, L = 0x8C, GE = 0x8D, LE = 0x8E, G = 0x8F,
+};
+
+/// Operand kinds: virtual register, immediate, or frame-relative memory
+/// (the Tier-0 home slot). Memory operands only reference the frame base
+/// — real addressing mode selection happens at emission.
+struct MachineOperand {
+    enum Kind : std::uint8_t { None = 0, VReg, Imm, FrameSlot };
+    Kind kind{None};
+    std::uint32_t vreg{0};       // VReg: MIR node id
+    std::int64_t imm{0};         // Imm payload / condition code
+    std::uint32_t slot{0};       // FrameSlot: Tier-0 register index
+    std::uint8_t tag_off{0};     // byte offset within the 16-byte Value
+
+    [[nodiscard]] static MachineOperand reg(std::uint32_t v) noexcept {
+        return MachineOperand{VReg, v, 0, 0, 0};
+    }
+    [[nodiscard]] static MachineOperand imm_op(std::int64_t i) noexcept {
+        return MachineOperand{Imm, 0, i, 0, 0};
+    }
+    [[nodiscard]] static MachineOperand slot_op(std::uint32_t s,
+                                                std::uint8_t off = 8) noexcept {
+        return MachineOperand{FrameSlot, 0, 0, s, off};
+    }
+    [[nodiscard]] static MachineOperand cond_op(MCond c) noexcept {
+        return MachineOperand{Imm, 0, static_cast<std::int64_t>(c), 0, 0};
+    }
+};
+
+struct MachineNode {
+    MOp op{MOp::MOVrr};
+    MachineRegClass rc{MachineRegClass::GPR};
+    std::uint32_t id{0};
+    std::uint32_t home_slot{0xFFFFFFFF};   // Tier-0 reg index (deopt home)
+    stdx::small_vector<MachineOperand, 3> operands{};
+    bool is_cold{false};       // Pass 55: emit into the cold partition
+    bool is_safepoint{false};  // emission records a SafepointRecord here
+    std::uint32_t frame_state_id{0xFFFFFFFF};
+    /// Block id for interval computation; 0 = entry block.
+    std::uint32_t block{0};
+    /// Position within the block (for interval ordering).
+    std::uint32_t pos{0};
+};
+
+/// A basic block in the MIR: successor indices for interval + layout.
+struct MachineBlock {
+    std::uint32_t id{0};
+    stdx::small_vector<std::uint32_t, 2> succs{};
+    std::uint32_t loop_depth{0};
+    bool is_cold{false};
+};
+
+/// The Machine IR graph: arena of nodes + blocks. Index == id.
+struct MachineGraph {
+    stdx::small_vector<MachineNode, 128> nodes{};   // node 0 reserved
+    stdx::small_vector<MachineBlock, 16> blocks{};
+
+    [[nodiscard]] std::uint32_t create_block() noexcept {
+        blocks.push_back(MachineBlock{});
+        blocks.back().id = static_cast<std::uint32_t>(blocks.size()) - 1;
+        return blocks.back().id;
+    }
+
+    [[nodiscard]] std::uint32_t create(MOp op, MachineRegClass rc,
+                                       std::uint32_t home_slot) noexcept {
+        nodes.push_back(MachineNode{});
+        MachineNode& n = nodes.back();
+        n.op = op;
+        n.rc = rc;
+        n.id = static_cast<std::uint32_t>(nodes.size()) - 1;
+        n.home_slot = home_slot;
+        return n.id;
+    }
+
+    void add_operand(std::uint32_t node, MachineOperand op) noexcept {
+        nodes[node].operands.push_back(op);
+    }
+
+    [[nodiscard]] std::size_t node_count() const noexcept { return nodes.size() - 1; }
+    [[nodiscard]] MachineNode& node(std::uint32_t id) noexcept { return nodes[id]; }
+    [[nodiscard]] const MachineNode& node(std::uint32_t id) const noexcept {
+        return nodes[id];
+    }
+};
+
+/// Live interval for linear-scan allocation (Pass 53).
+struct LiveInterval {
+    std::uint32_t vreg{0};
+    std::uint32_t start{0};
+    std::uint32_t end{0};
+    std::uint32_t loop_depth{0};
+    std::int32_t phys_reg{-1};      // assigned; -1 = spilled
+    std::uint32_t spill_slot{0};    // frame home when spilled
+    bool is_pyobject{false};        // spills insert refcount traffic
+    bool assigned{false};
+};
+
+/// Safepoint record — the .vortex_unwind entry format (Phase V).
+#pragma pack(push, 1)
+struct SafepointRecord {
+    std::uint32_t pc_offset{0};        // from function start
+    std::uint32_t frame_state_id{0};   // IR FrameState pool index
+    std::uint16_t live_regs{0};        // count of (physreg, slot) pairs
+    std::uint16_t stack_depth{0};      // Tier-0 reg count at this point
+    // Followed inline: live_regs x { u8 physreg, u8 pad, u16 slot }
+};
+#pragma pack(pop)
+
+struct SafepointMapping {
+    std::uint8_t physreg{0};
+    std::uint16_t slot{0};
+};
+
+}  // namespace abi_v1
+}  // namespace vortex::backend

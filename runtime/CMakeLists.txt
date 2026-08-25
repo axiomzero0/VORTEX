@@ -10,6 +10,7 @@ add_library(vortex_runtime STATIC
     src/builtins.cpp
     src/driver.cpp
     src/deopt.cpp
+    src/jit.cpp
 )
 target_include_directories(vortex_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(vortex_runtime PUBLIC vortex_common vortex_compiler)
