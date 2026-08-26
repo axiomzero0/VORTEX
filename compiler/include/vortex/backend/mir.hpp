@@ -54,12 +54,34 @@ enum class MOp : std::uint8_t {
     DECREF,
     GUARD_TAG,
     GUARD_INT,
+    GUARD_FLOAT,    // tag == Tag::Float (3) on both operands; else deopt
     PUSH,
     POP,
     LEA,
     VADDrr,
     VMOVUPS,
     VPINSRQ,
+    // --- scalar float (SSE2 / A64 scalar) -------------------------------
+    // 64-bit IEEE float in the low lane of an XMM/D-register. Distinct from
+    // VADDrr (full-lane SIMD): the cost model treats them differently
+    // (VecAlu vs Move+Alu) and the emitter selects ADDSD vs VPADDQ.
+    FMOVrr,         // movsd xmm_dst, xmm_src
+    FMOVrm,         // movsd xmm_dst, [base + slot*16 + off]
+    FMOVmr,         // movsd [base + slot*16 + off], xmm_src
+    FADDrr,         // addsd xmm_dst, xmm_src
+    FSUBrr,         // subsd xmm_dst, xmm_src
+    FMULrr,         // mulsd xmm_dst, xmm_src
+    FDIVrr,         // divsd xmm_dst, xmm_src
+    FNEGrr,         // xorpd with sign-mask (sign-flip; no FP subtract needed)
+    // FP constant materialization — writes the IEEE 754 bit pattern (an
+    // int64 payload) AND tag=Tag::Float to the home slot. Distinct from
+    // MOVri which writes payload + tag=Tag::Int. Without this op the
+    // ConstFloat lowering would have to compose a MOVri (writes
+    // payload+kTagInt) followed by a tag-only write — but no MOp exists
+    // for "write imm directly to the tag offset of a home slot" without
+    // risking payload clobber on a spill, so we fold the two writes into
+    // one node.
+    FCONSTri,
     SAFEPOINT,
     DEOPT_TRAP,
 };
@@ -100,6 +122,18 @@ enum class MCond : std::uint8_t {
         case MOp::VADDrr:
         case MOp::VPINSRQ:
             return CostClass::VecAlu;
+        case MOp::FMOVrr:
+        case MOp::FMOVrm:
+        case MOp::FMOVmr:
+            return CostClass::Move;   // FP moves are throughput-1 like GP moves
+        case MOp::FADDrr:
+        case MOp::FSUBrr:
+        case MOp::FMULrr:
+        case MOp::FDIVrr:
+        case MOp::FNEGrr:
+            return CostClass::Alu;     // FP adds throughput-1; mul ~4c, div ~13c, but Alu is the closest class
+        case MOp::FCONSTri:
+            return CostClass::Move;   // 1x mov + 1x store-imm32, throughput-bound
         case MOp::JMP:
         case MOp::Jcc:
             return CostClass::Branch;
@@ -114,6 +148,7 @@ enum class MCond : std::uint8_t {
         case MOp::DECREF:
         case MOp::GUARD_TAG:
         case MOp::GUARD_INT:
+        case MOp::GUARD_FLOAT:
             return CostClass::Alu;   // tag load + compare, branch folded
         case MOp::SAFEPOINT:
         case MOp::DEOPT_TRAP:

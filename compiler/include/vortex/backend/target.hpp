@@ -128,6 +128,15 @@ inline constexpr std::uint8_t RSP = 4, RBP = 5, RSI = 6, RDI = 7;
 inline constexpr std::uint8_t R8 = 8, R9 = 9, R10 = 10, R11 = 11;
 inline constexpr std::uint8_t R12 = 12, R13 = 13, R14 = 14, R15 = 15;
 
+// XMM encodings — share the ModRM reg-field encoding space with GPRs (the
+// REX.R bit + the SSE/AVX opcode family selects which file is addressed).
+// Named constants so the SSE2 emitter reads `x86::XMM0` instead of the
+// magic literal `0` (Rule 23 — no magic numbers in the backend).
+inline constexpr std::uint8_t XMM0 = 0, XMM1 = 1, XMM2 = 2, XMM3 = 3;
+inline constexpr std::uint8_t XMM4 = 4, XMM5 = 5, XMM6 = 6, XMM7 = 7;
+inline constexpr std::uint8_t XMM8 = 8, XMM9 = 9, XMM10 = 10, XMM11 = 11;
+inline constexpr std::uint8_t XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15;
+
 inline constexpr std::uint32_t kGPRCount = 16;
 
 // Frame-protocol role assignment (all callee-saved under SysV).

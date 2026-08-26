@@ -189,6 +189,103 @@ public:
         return emit8(modrm(kModReg, dst & 7, src & 7));
     }
 
+    // =========================================================================
+    // SSE2 scalar double-precision (F2 0F xx /r). The full xmm set is x0..x15;
+    // REX.R extends the reg field for xmm8..15, REX.B extends rm for x8..15.
+    // REX is mandatory for xmm8..15 even without W (SSE operands don't carry
+    // the W bit; the F2 prefix selects scalar-double form).
+    // =========================================================================
+private:
+    // Common helper: emit the F2 0F xx /r form with optional REX prefix.
+    [[nodiscard]] bool sse2_scalar(std::uint8_t opcode2, std::uint8_t dst,
+                                   std::uint8_t src) noexcept {
+        if (!emit8(0xF2)) return false;
+        std::uint8_t rex = 0;
+        if (dst >= 8) rex |= 0x04;   // R extends reg
+        if (src >= 8) rex |= 0x01;   // B extends rm
+        if (rex != 0) { if (!emit8(0x40 | rex)) return false; }
+        if (!emit8(0x0F)) return false;
+        if (!emit8(opcode2)) return false;
+        return emit8(modrm(kModReg, dst & 7, src & 7));
+    }
+
+public:
+    // MOVSD xmm, xmm (F2 0F 10 /r) — register-to-register move.
+    [[nodiscard]] bool movsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) noexcept {
+        return sse2_scalar(0x10, dst, src);
+    }
+    // ADDSD (F2 0F 58 /r)
+    [[nodiscard]] bool addsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) noexcept {
+        return sse2_scalar(0x58, dst, src);
+    }
+    // SUBSD (F2 0F 5C /r)
+    [[nodiscard]] bool subsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) noexcept {
+        return sse2_scalar(0x5C, dst, src);
+    }
+    // MULSD (F2 0F 59 /r)
+    [[nodiscard]] bool mulsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) noexcept {
+        return sse2_scalar(0x59, dst, src);
+    }
+    // DIVSD (F2 0F 5E /r)
+    [[nodiscard]] bool divsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) noexcept {
+        return sse2_scalar(0x5E, dst, src);
+    }
+    // XORPD xmm, xmm (66 0F 57 /r) — for FNEG (sign flip via mask). For the
+    // sign-mask trick, the caller loads the mask into one xmm from a 16-byte
+    // constant holding 0x8000'0000'0000'0000 in the low lane; xorpd flips the
+    // sign of the operand's low double without touching the high lane.
+    [[nodiscard]] bool xorpd_xmm_xmm(std::uint8_t dst, std::uint8_t src) noexcept {
+        if (!emit8(0x66)) return false;
+        std::uint8_t rex = 0;
+        if (dst >= 8) rex |= 0x04;
+        if (src >= 8) rex |= 0x01;
+        if (rex != 0) { if (!emit8(0x40 | rex)) return false; }
+        if (!emit8(0x0F)) return false;
+        if (!emit8(0x57)) return false;
+        return emit8(modrm(kModReg, dst & 7, src & 7));
+    }
+    // MOVSD xmm, [base + disp] (F2 0F 10 /r, memory form).
+    [[nodiscard]] bool movsd_xmm_mem(std::uint8_t dst, std::uint8_t base,
+                                     std::int32_t disp) noexcept {
+        if (!emit8(0xF2)) return false;
+        std::uint8_t rex = 0;
+        if (dst >= 8) rex |= 0x04;
+        if (base >= 8) rex |= 0x01;
+        if (rex != 0) { if (!emit8(0x40 | rex)) return false; }
+        if (!emit8(0x0F)) return false;
+        if (!emit8(0x10)) return false;
+        if (!modrm_with_base(dst & 7, base & 7, disp)) return false;
+        return true;
+    }
+    // MOVSD [base + disp], xmm (F2 0F 11 /r, memory form).
+    [[nodiscard]] bool movsd_mem_xmm(std::uint8_t base, std::int32_t disp,
+                                     std::uint8_t src) noexcept {
+        if (!emit8(0xF2)) return false;
+        std::uint8_t rex = 0;
+        if (src >= 8) rex |= 0x04;
+        if (base >= 8) rex |= 0x01;
+        if (rex != 0) { if (!emit8(0x40 | rex)) return false; }
+        if (!emit8(0x0F)) return false;
+        if (!emit8(0x11)) return false;
+        if (!modrm_with_base(src & 7, base & 7, disp)) return false;
+        return true;
+    }
+    // MOVQ xmm, imm64 — there is no direct form. Caller materializes the
+    // imm in a GPR (mov r64, imm64) then MOVD/MOVQ to xmm. We expose the
+    // MOVQ xmm, r64 form here (66 0F 6E /r W=1, then 66 0F 7E /r W=1 for
+    // the reverse direction). Used to load FP constants and sign masks.
+    [[nodiscard]] bool movq_xmm_r64(std::uint8_t xmm_dst, std::uint8_t gpr_src) noexcept {
+        // 66 REX.W 0F 6E /r — movd/movq xmm, r/m64 with W=1 selects 64-bit.
+        if (!emit8(0x66)) return false;
+        std::uint8_t rex = REX_W;
+        if (xmm_dst >= 8) rex |= 0x04;
+        if (gpr_src >= 8) rex |= 0x01;
+        if (!emit8(rex)) return false;
+        if (!emit8(0x0F)) return false;
+        if (!emit8(0x6E)) return false;
+        return emit8(modrm(kModReg, xmm_dst & 7, gpr_src & 7));
+    }
+
     // --- JMP rel32 (E9 cd) — returns the patch site for later fixup -----------------------------
     [[nodiscard]] std::size_t jmp_rel32() noexcept {
         std::size_t site = size();

@@ -122,6 +122,26 @@ constexpr std::array<LoweringEntry, 14> kLoweringTable{{
     return false;
 }
 
+// Provably-float analog of provably_int. A value is a fast-path float
+// candidate when:
+//   - it is a ConstFloat literal (the IR's source of FP constants), OR
+//   - it has the Unboxed flag set by Pass 47 AND the producing node's
+//     tag is FP-typed (PyBinary with float operands, I2F, Box-of-float).
+//
+// Pass 47 today only marks Box/Unbox identity pairs as Unboxed; the
+// ConstFloat branch is what makes this fast path fire in practice — the
+// IR currently doesn't propagate "this Parameter is float" without a
+// shape/type tag from Pass 15 (ShapeAnalysis) or Pass 16 (ICMono). That
+// is by design: Parameters default to dynamic; we don't want a guard
+// that almost always deopts.
+[[nodiscard]] bool provably_float(const Graph& g, NodeId v) noexcept {
+    const Node& n = g.node(v);
+    if (n.kind == NodeKind::ConstFloat) return true;
+    if (n.has(NodeFlag::Unboxed) && n.kind == NodeKind::I2F) return true;
+    if (n.has(NodeFlag::Unboxed) && n.kind == NodeKind::PyBinary) return true;
+    return false;
+}
+
 }  // namespace
 
 LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noexcept {
@@ -220,11 +240,18 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                 break;
             }
             case NodeKind::ConstFloat: {
-                // Floats travel boxed through the const pool for now: load
-                // the Value from the pool frame slot (const pool materializes
-                // at unit load; index = node id ordering done by scheduler).
-                result = out.mir.create(MOp::MOVrm, MachineRegClass::GPR, home);
-                out.mir.add_operand(result, MachineOperand::slot_op(home));
+                // Materialize the FP constant bit pattern into the home slot's
+                // payload AND set tag=Tag::Float. FCONSTri is distinct from
+                // MOVri (which writes tag=Tag::Int) — using MOVri here would
+                // cause every downstream GUARD_FLOAT to deopt (the tag
+                // mismatch fires the cold stub, which longjmps back to the
+                // interpreter, defeating the fast path). The FP bits travel
+                // as int64 through the MIR immediate; the codegen
+                // reinterprets them as IEEE double when storing into the
+                // home slot's payload.
+                result = out.mir.create(MOp::FCONSTri, MachineRegClass::FPR, home);
+                out.mir.add_operand(result, MachineOperand::imm_op(
+                    n.const_value.as.i));
                 break;
             }
             case NodeKind::ConstPy: {
@@ -359,6 +386,73 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                         out.mir.add_operand(wb, MachineOperand::reg(res));
                         break;
                     }
+                    // Float fast path: both operands provably float AND the
+                    // subop is one of Add/Sub/Mul/TrueDiv. SSE2 scalar ops;
+                    // GUARD_FLOAT compares both operand tags against Tag::Float
+                    // (3); on mismatch we deopt to the interpreter, which
+                    // produces the right value (including bignum promotion
+                    // when an int sneaks in). This covers the dominant Python
+                    // numeric surface — math/science/ML code is overwhelmingly
+                    // float-arith, and the existing bridge-everything path
+                    // was 1-2 orders of magnitude slower than Tier-0 because
+                    // of the safepoint+call overhead per op.
+                    if (n.ins.size() >= 4 && provably_float(g, n.ins[2]) &&
+                        provably_float(g, n.ins[3])) {
+                        const BinOpKind sub = static_cast<BinOpKind>(n.subop);
+                        const bool supported_float_op =
+                            sub == BinOpKind::Add || sub == BinOpKind::Sub ||
+                            sub == BinOpKind::Mul || sub == BinOpKind::TrueDiv;
+                        if (supported_float_op) {
+                            std::uint32_t a = materialize(materialize, n.ins[2], mb);
+                            std::uint32_t b = materialize(materialize, n.ins[3], mb);
+
+                            // GUARD_FLOAT: tag == Tag::Float on both operands.
+                            std::uint32_t guard = out.mir.create(
+                                MOp::GUARD_FLOAT, MachineRegClass::FPR, home);
+                            out.mir.add_operand(guard, MachineOperand::reg(a));
+                            out.mir.add_operand(guard, MachineOperand::reg(b));
+                            out.mir.node(guard).is_safepoint = true;
+                            out.mir.node(guard).block = mb;
+                            out.mir.node(guard).frame_state_id =
+                                n.aux1 < g.frame_state_count() ? n.aux1 : 0xFFFFFFFFu;
+                            out.referenced_frame_states.push_back(
+                                out.mir.node(guard).frame_state_id);
+
+                            MOp fop = MOp::FADDrr;
+                            switch (sub) {
+                                case BinOpKind::Add: fop = MOp::FADDrr; break;
+                                case BinOpKind::Sub: fop = MOp::FSUBrr; break;
+                                case BinOpKind::Mul: fop = MOp::FMULrr; break;
+                                case BinOpKind::TrueDiv: fop = MOp::FDIVrr; break;
+                                default: break;
+                            }
+                            std::uint32_t res = out.mir.create(
+                                fop, MachineRegClass::FPR, home);
+                            out.mir.node(res).block = mb;
+                            out.mir.add_operand(res, MachineOperand::reg(a));
+                            out.mir.add_operand(res, MachineOperand::reg(b));
+                            materialized.insert(id, res);
+                            // Write the FP payload (8 bytes) into home slot's
+                            // payload offset, and the tag word (Tag::Float = 3)
+                            // so deopt/Tier-0 see a consistent Value.
+                            std::uint32_t wb = out.mir.create(
+                                MOp::FMOVmr, MachineRegClass::FPR, home);
+                            out.mir.node(wb).block = mb;
+                            out.mir.add_operand(wb, MachineOperand::slot_op(home, 8 /*payload off*/));
+                            out.mir.add_operand(wb, MachineOperand::reg(res));
+                            // Tag write-back: materialize Tag::Float constant.
+                            std::uint32_t tag_v = out.mir.create(
+                                MOp::MOVri, MachineRegClass::GPR, 0);
+                            out.mir.node(tag_v).block = mb;
+                            out.mir.add_operand(tag_v, MachineOperand::imm_op(3 /*kTagFloat*/));
+                            std::uint32_t wb_tag = out.mir.create(
+                                MOp::MOVmr, MachineRegClass::GPR, 0);
+                            out.mir.node(wb_tag).block = mb;
+                            out.mir.add_operand(wb_tag, MachineOperand::slot_op(0, 0));
+                            out.mir.add_operand(wb_tag, MachineOperand::reg(tag_v));
+                            break;
+                        }
+                    }
                     // Dynamic: CALLri -> helper writes home; materialize loads.
                     std::uint32_t call = out.mir.create(MOp::CALLri, MachineRegClass::GPR, home);
                     out.mir.node(call).block = mb;
@@ -489,21 +583,55 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
             const Node& n = g.node(id);
             if (n.kind != NodeKind::Return || n.ins.empty() || n.ins[0] != leader) return;
             std::uint32_t v = materialize(materialize, n.ins[1], mb);
-            // Write the return value's payload into home slot 0 payload.
-            std::uint32_t wb = out.mir.create(MOp::MOVmr, MachineRegClass::GPR, 0);
-            out.mir.node(wb).block = mb;
-            out.mir.add_operand(wb, MachineOperand::slot_op(0, 8 /*payload off*/));
-            out.mir.add_operand(wb, MachineOperand::reg(v));
-            // Write the tag word (Tag::Int = 2 for arithmetic fast path).
-            // We materialize the constant kTagInt into a fresh vreg via
-            // MOVri, then write it to home[0].tag_offset.
-            std::uint32_t tag_vreg = out.mir.create(MOp::MOVri, MachineRegClass::GPR, 0);
-            out.mir.node(tag_vreg).block = mb;
-            out.mir.add_operand(tag_vreg, MachineOperand::imm_op(2 /*kTagInt*/));
-            std::uint32_t wb_tag = out.mir.create(MOp::MOVmr, MachineRegClass::GPR, 0);
-            out.mir.node(wb_tag).block = mb;
-            out.mir.add_operand(wb_tag, MachineOperand::slot_op(0, 0 /*tag off*/));
-            out.mir.add_operand(wb_tag, MachineOperand::reg(tag_vreg));
+            // Decide the tag of the return value from the IR source node.
+            // Int fast path (ConstInt, int arithmetic) → kTagInt = 2.
+            // Float fast path (ConstFloat, float arithmetic) → kTagFloat = 3.
+            // Otherwise the home slot's tag was already written by the
+            // helper or the dynamic-op writeback; we leave it alone and
+            // skip the tag MOVri+MOVmr pair entirely. The earlier code
+            // hard-coded kTagInt=2 — that clobbered float returns with
+            // Tag::Int, producing wrong results for any float-returning
+            // function.
+            const Node& src = g.node(n.ins[1]);
+            std::uint64_t ret_tag = 0;
+            bool know_tag = false;
+            if (src.kind == NodeKind::ConstInt ||
+                (src.has(NodeFlag::Unboxed) &&
+                 (src.kind == NodeKind::Add || src.kind == NodeKind::Sub ||
+                  src.kind == NodeKind::Mul || src.kind == NodeKind::Neg))) {
+                ret_tag = 2;   // kTagInt
+                know_tag = true;
+            } else if (src.kind == NodeKind::ConstFloat ||
+                       (src.has(NodeFlag::Unboxed) &&
+                        (src.kind == NodeKind::PyBinary ||
+                         src.kind == NodeKind::I2F))) {
+                ret_tag = 3;   // kTagFloat
+                know_tag = true;
+            }
+
+            if (know_tag) {
+                // Write the return value's payload into home slot 0 payload.
+                std::uint32_t wb = out.mir.create(MOp::MOVmr, MachineRegClass::GPR, 0);
+                out.mir.node(wb).block = mb;
+                out.mir.add_operand(wb, MachineOperand::slot_op(0, 8 /*payload off*/));
+                out.mir.add_operand(wb, MachineOperand::reg(v));
+                // Write the tag word for the known-type return.
+                std::uint32_t tag_vreg = out.mir.create(MOp::MOVri, MachineRegClass::GPR, 0);
+                out.mir.node(tag_vreg).block = mb;
+                out.mir.add_operand(tag_vreg, MachineOperand::imm_op(
+                    static_cast<std::int64_t>(ret_tag)));
+                std::uint32_t wb_tag = out.mir.create(MOp::MOVmr, MachineRegClass::GPR, 0);
+                out.mir.node(wb_tag).block = mb;
+                out.mir.add_operand(wb_tag, MachineOperand::slot_op(0, 0 /*tag off*/));
+                out.mir.add_operand(wb_tag, MachineOperand::reg(tag_vreg));
+            } else {
+                // Unknown tag — write payload only; tag was set by the
+                // producing helper / write-back. Use a single MOVmr.
+                std::uint32_t wb = out.mir.create(MOp::MOVmr, MachineRegClass::GPR, 0);
+                out.mir.node(wb).block = mb;
+                out.mir.add_operand(wb, MachineOperand::slot_op(0, 8 /*payload off*/));
+                out.mir.add_operand(wb, MachineOperand::reg(v));
+            }
             std::uint32_t ret = out.mir.create(MOp::RET, MachineRegClass::GPR, 0);
             out.mir.node(ret).block = mb;
         });

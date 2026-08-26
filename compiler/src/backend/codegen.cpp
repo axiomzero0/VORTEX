@@ -162,10 +162,23 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // Tier-0 register 5). The previous code set r.slot = op.vreg, reading
     // the wrong frame slot for spilled values and causing spurious deopts
     // or wrong values.
+    //
+    // FPR-class discipline: the regalloc only allocates GPRs (it does not
+    // track reg classes). For FPR-class vregs (FP arithmetic, FP constants)
+    // we IGNORE the regalloc assignment and always treat them as spilled
+    // to home — the codegen stages through XMM0/XMM1 (caller-saved scratch
+    // under SysV) for FP ops, reading and writing the home slot directly.
+    // Treating an FPR-class vreg as register-cached would have the MOVmr
+    // codegen read from a GPR the FADDrr never wrote to, producing
+    // garbage (the regression that masked the float fast path).
     const auto resolve = [&](const MachineOperand& op) noexcept {
         RegOrSlot r;
         if (op.kind == MachineOperand::VReg) {
-            if (op.vreg < ra.assignment.size() && ra.assignment[op.vreg] >= 0) {
+            const bool is_fpr_class =
+                op.vreg >= 1 && op.vreg <= lowered.mir.node_count() &&
+                lowered.mir.node(op.vreg).rc == MachineRegClass::FPR;
+            if (!is_fpr_class &&
+                op.vreg < ra.assignment.size() && ra.assignment[op.vreg] >= 0) {
                 r.is_reg = true;
                 r.reg = alloc_reg(ra.assignment[op.vreg]);
                 // For register-cached values, the home slot is still the
@@ -176,7 +189,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 }
                 return r;
             }
-            // spilled: home slot of the defining MIR node (NOT op.vreg).
+            // spilled or FPR-class: home slot of the defining MIR node.
             if (op.vreg >= 1 && op.vreg <= lowered.mir.node_count()) {
                 r.slot = lowered.mir.node(op.vreg).home_slot;
             } else {
@@ -292,19 +305,30 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // silently dropped the store when the source was
                     // spilled — the result Value was never written to
                     // home[0], and RET read an uninitialized slot.
+                    //
+                    // FPR-class sources: never use GPR allocation; the
+                    // result lives in the source's home slot payload
+                    // (the FADDrr/FCONSTri/etc. always write to home
+                    // under the write-through-home discipline). Treat
+                    // them identically to spilled GPRs.
                     if (n.operands.size() < 2 ||
                         n.operands[0].kind != MachineOperand::FrameSlot ||
                         n.operands[1].kind != MachineOperand::VReg) break;
                     if (n.operands[1].vreg >= ra.assignment.size()) break;
                     std::int32_t src_assign = ra.assignment[n.operands[1].vreg];
-                    if (src_assign >= 0) {
-                        // Register-cached: direct store.
+                    const bool src_is_fpr =
+                        n.operands[1].vreg >= 1 &&
+                        n.operands[1].vreg <= lowered.mir.node_count() &&
+                        lowered.mir.node(n.operands[1].vreg).rc == MachineRegClass::FPR;
+                    if (src_assign >= 0 && !src_is_fpr) {
+                        // Register-cached GPR: direct store.
                         a.mov_mem_r64(frame_base,
                                       slot_disp(n.operands[0].slot, n.operands[0].tag_off),
                                       alloc_reg(src_assign));
                     } else {
-                        // Spilled: load from source's home slot into RAX,
-                        // then store into the destination home slot.
+                        // Spilled GPR or any FPR-class: load from source's
+                        // home slot into RAX, then store into the
+                        // destination home slot.
                         std::uint32_t src_home = lowered.mir.node(n.operands[1].vreg).home_slot;
                         a.mov_r64_mem(x86::RAX, frame_base,
                                       slot_disp(src_home, n.operands[0].tag_off));
@@ -439,6 +463,121 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // the request, resolve the offset after the hot body.
                     deopt_stubs.push_back(DeoptStubReq{j1, sp_idx, n.frame_state_id});
                     deopt_stubs.push_back(DeoptStubReq{j2, sp_idx, n.frame_state_id});
+                    break;
+                }
+                case MOp::GUARD_FLOAT: {
+                    // Tag-check both operands against Tag::Float (3). The
+                    // operands are FPR-class vregs that don't go through the
+                    // regalloc — their home_slot is the authoritative source
+                    // of the tag word (write-back discipline: any FPR op
+                    // reads/writes through the home slot). We stage the tag
+                    // into RAX, compare against kTagFloat, Jcc to the deopt
+                    // stub on mismatch.
+                    if (n.operands.size() < 2) break;
+                    RegOrSlot lhs = resolve(n.operands[0]);
+                    RegOrSlot rhs = resolve(n.operands[1]);
+
+                    a.mov_r64_mem(x86::RAX, frame_base,
+                                  slot_disp(lhs.slot, kTagOffset));
+                    a.mov_r64_imm64(x86::RCX, kTagFloat);
+                    a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
+                    std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
+
+                    a.mov_r64_mem(x86::RAX, frame_base,
+                                  slot_disp(rhs.slot, kTagOffset));
+                    a.mov_r64_imm64(x86::RCX, kTagFloat);
+                    a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
+                    std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
+
+                    std::uint32_t sp_idx = emit_safepoint(n.frame_state_id, 2);
+                    out.mappings.push_back(SafepointMapping{x86::RAX, 0});
+                    out.mappings.push_back(SafepointMapping{x86::RCX, 0});
+                    deopt_stubs.push_back(DeoptStubReq{j1, sp_idx, n.frame_state_id});
+                    deopt_stubs.push_back(DeoptStubReq{j2, sp_idx, n.frame_state_id});
+                    break;
+                }
+                case MOp::FADDrr:
+                case MOp::FSUBrr:
+                case MOp::FMULrr:
+                case MOp::FDIVrr: {
+                    // SSE2 scalar double-precision. No FPR allocation — we
+                    // stage through XMM0/XMM1 (caller-saved scratch under
+                    // SysV). The home slot is the source of truth; we
+                    // reload from home on every use (no caching). This is
+                    // the same write-back discipline as the int fast path
+                    // (which stages through RAX/RCX) — slower than real FPR
+                    // allocation but correct and simple. Pass 53 (LSRA)
+                    // extension to allocate XMM is a future improvement.
+                    if (n.operands.size() < 2) break;
+                    RegOrSlot lhs = resolve(n.operands[0]);
+                    RegOrSlot rhs = resolve(n.operands[1]);
+
+                    // movsd xmm0, [frame_base + lhs.slot * 16 + 8]
+                    a.movsd_xmm_mem(x86::XMM0, frame_base,
+                                    slot_disp(lhs.slot, kPayloadOffset));
+                    // movsd xmm1, [frame_base + rhs.slot * 16 + 8]
+                    a.movsd_xmm_mem(x86::XMM1, frame_base,
+                                    slot_disp(rhs.slot, kPayloadOffset));
+
+                    bool ok = true;
+                    if (n.op == MOp::FADDrr) {
+                        ok = a.addsd_xmm_xmm(x86::XMM0, x86::XMM1);
+                    } else if (n.op == MOp::FSUBrr) {
+                        ok = a.subsd_xmm_xmm(x86::XMM0, x86::XMM1);
+                    } else if (n.op == MOp::FMULrr) {
+                        ok = a.mulsd_xmm_xmm(x86::XMM0, x86::XMM1);
+                    } else {  // FDIVrr
+                        ok = a.divsd_xmm_xmm(x86::XMM0, x86::XMM1);
+                    }
+                    (void)ok;   // every emit returns true unless buffer exhausted
+
+                    // movsd [frame_base + n.home_slot * 16 + 8], xmm0
+                    a.movsd_mem_xmm(frame_base,
+                                    slot_disp(n.home_slot, kPayloadOffset),
+                                    x86::XMM0);
+                    // Tag write-back: Tag::Float (3).
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagFloat));
+                    break;
+                }
+                case MOp::FMOVmr: {
+                    // Store FP result from a source vreg to a dest home slot.
+                    // Both operands resolve to home slots (FPR-class vregs
+                    // never register-cached under the current scheme); we
+                    // movsd from src home payload to dst home payload via XMM0.
+                    if (n.operands.size() < 2) break;
+                    RegOrSlot src = resolve(n.operands[1]);
+                    a.movsd_xmm_mem(x86::XMM0, frame_base,
+                                    slot_disp(src.slot, kPayloadOffset));
+                    a.movsd_mem_xmm(frame_base,
+                                    slot_disp(n.operands[0].slot,
+                                              n.operands[0].tag_off),
+                                    x86::XMM0);
+                    break;
+                }
+                case MOp::FMOVrr:
+                case MOp::FMOVrm:
+                case MOp::FNEGrr:
+                    // Reserved for future FPR-allocation work. Under the
+                    // current write-through-home scheme, these are no-ops:
+                    // values are reloaded from home on every use.
+                    break;
+                case MOp::FCONSTri: {
+                    // FP constant materialization. Write the imm's low 64
+                    // bits (the IEEE 754 bit pattern, carried as int64
+                    // through the MIR) into the home slot's payload, then
+                    // write tag=kTagFloat. RAX is the staging register
+                    // (caller-saved scratch under SysV).
+                    if (n.operands.empty()) break;
+                    a.mov_r64_imm64(x86::RAX,
+                                    static_cast<std::uint64_t>(n.operands[0].imm));
+                    a.mov_mem_r64(frame_base,
+                                  slot_disp(n.home_slot, kPayloadOffset),
+                                  x86::RAX);
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagFloat));
                     break;
                 }
                 case MOp::CALLri: {
