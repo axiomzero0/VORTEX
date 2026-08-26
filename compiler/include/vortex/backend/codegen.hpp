@@ -50,6 +50,13 @@ struct CompiledCode {
     /// hook (Rule 26): zero in a freshly-lowered unit with no ALU+const
     /// patterns; positive when MOVri+ALUrr fused to ALU r64, imm32.
     std::uint32_t peephole_fusions{0};
+    /// Pass 54: count of operand reads served from the GPR cache instead
+    /// of from the home slot. Zero under the legacy ALWAYS-SPILL codegen
+    /// path; positive when the regalloc-aware resolve finds the operand's
+    /// assigned GPR still holding its value. Each hit saves a memory load
+    /// (4-7 bytes, 3-5 cycles) and replaces it with a reg-to-reg move
+    /// (3 bytes, 1 cycle).
+    std::uint32_t gpr_cache_hits{0};
     bool valid{false};
 };
 

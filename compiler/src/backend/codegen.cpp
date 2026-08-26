@@ -165,6 +165,48 @@ struct ConstCache {
     }
 };
 
+/// Pass 54 (register-caching codegen): tracks which physical GPRs
+/// currently hold which vreg's value, so subsequent operand reads can
+/// use a reg-to-reg move (`mov rax, rbx`, 3 bytes) instead of a memory
+/// load (`mov rax, [r12 + slot*16 + 8]`, 4-7 bytes).
+///
+/// Retires the ALWAYS-SPILL DISCIPLINE that bypassed the regalloc for
+/// correctness. The cache model:
+///   - Per-block scope: cleared at block entry so cross-block live
+///     values fall back to home (a register's content from block A
+///     might be clobbered by a function call between A and B; the
+///     inter-block liveness proof is the regalloc's job, but tracking
+///     it correctly inside the codegen would duplicate LSRA).
+///   - Define after every producing op: the op's result lives in RAX
+///     (post-ALU) or in dst_gpr (post-load). The cache reflects both:
+///     RAX still has the result until the next op's stage_rax clobbers
+///     it; dst_gpr holds it for the rest of the block.
+///   - Clobber on every staging write: stage_rax writes RAX, so it
+///     must mark RAX free in the cache BEFORE any subsequent resolve
+///     in the same op (otherwise we'd read a stale cache entry).
+///
+/// The regalloc's invariant (no two simultaneously-live vregs share a
+/// GPR) means: if a vreg is cached in GPR X, no other live vreg is
+/// also in X — so reading from X is sound until X is clobbered.
+struct GprCache {
+    static constexpr std::uint32_t kFree = 0xFFFFFFFFu;
+    std::array<std::uint32_t, 16> state{};
+
+    void clear() noexcept { state.fill(kFree); }
+
+    void clobber(std::uint8_t gpr) noexcept {
+        if (gpr < 16) state[gpr] = kFree;
+    }
+
+    void define(std::uint8_t gpr, std::uint32_t vreg) noexcept {
+        if (gpr < 16) state[gpr] = vreg;
+    }
+
+    [[nodiscard]] bool holds(std::uint8_t gpr, std::uint32_t vreg) const noexcept {
+        return gpr < 16 && state[gpr] == vreg;
+    }
+};
+
 }  // namespace
 
 CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buffer,
@@ -204,6 +246,20 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // ---- Pass 54/55: emit ----------------------------------------------------------
     Assembler a(buffer, capacity);
 
+    // Pass 54 peephole state: per-block constant cache. Reset at every
+    // block entry so cross-block uses don't get unsoundly fused (a def
+    // in block A does not necessarily dominate a use in block B).
+    // Declared here (before the lambdas) because resolve/stage_rax/
+    // stage_rcx/populate_dst_from_rax all capture it by reference.
+    ConstCache const_cache;
+    std::uint32_t peephole_fusions = 0;   // reported back in CompiledCode
+
+    // Pass 54 register-caching state: per-block GPR occupancy. Retires
+    // the ALWAYS-SPILL DISCIPLINE that bypassed the regalloc for safety.
+    // See GprCache's doc comment for the cache model.
+    GprCache gpr_cache;
+    std::uint32_t gpr_cache_hits = 0;   // operand reads served from a cached GPR
+
     // Resolve operand (vreg or slot) -> RegOrSlot, given the assignment.
     // IBE-19 fix: spilled VRegs use the MIR node's home_slot (the Tier-0
     // register index that deopt reconstructs from), NOT op.vreg (the MIR
@@ -212,28 +268,30 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // the wrong frame slot for spilled values and causing spurious deopts
     // or wrong values.
     //
-    // ALWAYS-SPILL DISCIPLINE: the resolve lambda always returns is_reg=
-    // false, even when the regalloc assigned a GPR. This is sound because
-    // every producing op (MOVri, ADDrr, FCONSTri, etc.) writes its result
-    // to the home slot — the regalloc's GPR is only an (unsafe) cache
-    // that gets clobbered by the next op's RAX staging. The MOVri home
-    // write uses RAX as a staging register; if the previous op (e.g.
-    // MOVrm) cached its result in RAX via the regalloc, the MOVri's
-    // RAX staging silently overwrites that cache, and the next op's
-    // stage_rax(RAX) reads garbage instead of the original value.
-    //
-    // Treating all vregs as spilled-to-home trades a small perf loss
-    // (every operand is reloaded from home) for correctness across all
-    // instruction combinations. A future regalloc-aware codegen would
-    // re-introduce register caching with proper liveness tracking.
+    // REGALLOC-AWARE RESOLVE: if the regalloc assigned a GPR to this vreg
+    // AND gpr_cache confirms that GPR still holds the vreg's value, return
+    // is_reg=true so the staging helper emits a reg-to-reg move (3 bytes)
+    // instead of a memory load (4-7 bytes). On cache miss, fall back to
+    // the home slot — the home is always up-to-date because every
+    // defining op still writes it (for deopt safety).
     const auto resolve = [&](const MachineOperand& op) noexcept {
         RegOrSlot r;
         if (op.kind == MachineOperand::VReg) {
-            // spilled or FPR-class: home slot of the defining MIR node.
             if (op.vreg >= 1 && op.vreg <= lowered.mir.node_count()) {
                 r.slot = lowered.mir.node(op.vreg).home_slot;
             } else {
                 r.slot = op.vreg;   // fallback (shouldn't happen)
+                return r;
+            }
+            // If the regalloc assigned a GPR AND that GPR still holds this
+            // vreg's value (per gpr_cache), use the GPR directly.
+            if (op.vreg < ra.assignment.size() && ra.assignment[op.vreg] >= 0) {
+                std::uint8_t gpr = alloc_reg(ra.assignment[op.vreg]);
+                if (gpr_cache.holds(gpr, op.vreg)) {
+                    r.is_reg = true;
+                    r.reg = gpr;
+                    ++gpr_cache_hits;
+                }
             }
             return r;
         }
@@ -241,13 +299,58 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
         return r;
     };
 
-    // Stage a RegOrSlot value into RAX (operand staging register, SysV
-    // caller-saved scratch — clobbers are fine, values reload at next use).
+    // Stage a RegOrSlot value into RAX. Marks RAX as clobbered in
+    // gpr_cache BEFORE the load — otherwise a later resolve() in the
+    // same op would read a stale "RAX has the previous value" entry.
+    // This is the IBE-18-class bug the ALWAYS-SPILL DISCIPLINE was a
+    // workaround for: stage_rax(lhs) writes RAX; if the cache still
+    // said "RAX has rhs", the next resolve(rhs) would happily return
+    // is_reg=true with reg=RAX, and the emit would `mov RCX, RAX` —
+    // pulling in lhs's value, not rhs's. Clobbering RAX in the cache
+    // before the load closes the race.
     const auto stage_rax = [&](const RegOrSlot& r, std::uint8_t tag_off) noexcept {
+        gpr_cache.clobber(x86::RAX);
         if (r.is_reg) {
             a.mov_r64_r64(x86::RAX, r.reg);
         } else {
             a.mov_r64_mem(x86::RAX, frame_base, slot_disp(r.slot, tag_off));
+        }
+    };
+
+    // Stage a RegOrSlot value into RCX (second staging register). Same
+    // clobber-first discipline as stage_rax.
+    const auto stage_rcx = [&](const RegOrSlot& r, std::uint8_t tag_off) noexcept {
+        gpr_cache.clobber(x86::RCX);
+        if (r.is_reg) {
+            a.mov_r64_r64(x86::RCX, r.reg);
+        } else {
+            a.mov_r64_mem(x86::RCX, frame_base, slot_disp(r.slot, tag_off));
+        }
+    };
+
+    // Post-def cache update: after a producing op leaves its result in
+    // RAX (the common case for ADD/SUB/IMUL/NEG/MOVri/SETCC/FCONST),
+    // populate the regalloc-assigned dst_gpr from RAX, then mark both
+    // RAX and dst_gpr in the cache as holding this vreg's value.
+    //
+    // RAX's cache entry is valid until the next op's stage_rax clobbers
+    // it (which the cache correctly reflects because stage_rax calls
+    // gpr_cache.clobber(RAX)). dst_gpr's entry is valid for the rest
+    // of the block (or until some op explicitly clobbers it, which
+    // only happens if dst_gpr is RAX or RCX and an intervening op
+    // uses them as staging).
+    const auto populate_dst_from_rax = [&](std::uint32_t vreg_id) noexcept {
+        // RAX has the result (post-ALU or post-mov_r64_imm64). Mark it
+        // in the cache — a subsequent resolve() in the same op (rare)
+        // or the next op's resolve() before its stage_rax can use it.
+        gpr_cache.define(x86::RAX, vreg_id);
+        if (vreg_id < ra.assignment.size() && ra.assignment[vreg_id] >= 0) {
+            std::uint8_t dst_gpr = alloc_reg(ra.assignment[vreg_id]);
+            if (dst_gpr != x86::RAX) {
+                a.mov_r64_r64(dst_gpr, x86::RAX);
+                gpr_cache.define(dst_gpr, vreg_id);
+            }
+            // If dst_gpr == RAX, the define above already covers it.
         }
     };
 
@@ -268,12 +371,6 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
         std::uint32_t frame_state_id;
     };
     stdx::small_vector<DeoptStubReq, 16> deopt_stubs;
-
-    // Pass 54 peephole state: per-block constant cache. Reset at every
-    // block entry so cross-block uses don't get unsoundly fused (a def
-    // in block A does not necessarily dominate a use in block B).
-    ConstCache const_cache;
-    std::uint32_t peephole_fusions = 0;   // reported back in CompiledCode
 
     // Record a SafepointRecord at the current emission position and return
     // its index for later deopt stub emission.
@@ -305,6 +402,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
         if (block_start.contains(block_id)) return;   // already emitted
         block_start.insert(block_id, a.size());
         const_cache.clear();   // Pass 54: per-block peephole scope
+        gpr_cache.clear();    // Pass 54: per-block GPR occupancy scope
 
         for (std::uint32_t id = 1; id <= lowered.mir.node_count(); ++id) {
             MachineNode& n = lowered.mir.node(id);
@@ -345,41 +443,51 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // ALU r64, imm32. Vregs are single-def in the MIR,
                     // so the entry stays valid for the rest of the block.
                     const_cache.put(n.id, n.operands[0].imm);
+                    // Pass 54: populate the regalloc's assigned GPR from
+                    // RAX so a subsequent consumer of this vreg can read
+                    // from the GPR (3-byte reg-reg move) instead of from
+                    // home (4-7 byte memory load).
+                    populate_dst_from_rax(id);
                     break;
                 }
                 case MOp::MOVrm: {
                     if (has_reg && n.operands.size() >= 1 &&
                         n.operands[0].kind == MachineOperand::FrameSlot) {
-                        a.mov_r64_mem(alloc_reg(ra.assignment[id]), frame_base,
+                        std::uint8_t dst_gpr = alloc_reg(ra.assignment[id]);
+                        a.mov_r64_mem(dst_gpr, frame_base,
                                      slot_disp(n.operands[0].slot, n.operands[0].tag_off));
+                        // Pass 54: the load populated dst_gpr directly —
+                        // mark it in the cache so consumers can use it.
+                        gpr_cache.define(dst_gpr, id);
                     }
                     break;
                 }
                 case MOp::MOVmr: {
                     // Store source vreg's value into the destination home
-                    // slot. Under the always-spill discipline (see resolve
-                    // lambda), we always read from the source's home slot
-                    // via RAX staging — the regalloc's cached GPR is
-                    // unsafe (it can be clobbered by intermediate ops'
-                    // RAX staging).
+                    // slot. Source read offset: ALWAYS the payload offset
+                    // (8). The source vreg's value (whether it's the Add
+                    // result, a ConstInt's imm, or a tag_vreg's
+                    // kTagBool/kTagInt/kTagFloat constant) lives at
+                    // home[src].payload.
                     //
-                    // Source read offset: ALWAYS the payload offset (8).
-                    // The source vreg's value (whether it's the Add result,
-                    // a ConstInt's imm, or a tag_vreg's kTagBool/kTagInt/
-                    // kTagFloat constant) lives at home[src].payload.
                     // Dest write offset: dest.tag_off (controlled by the
                     // lowering — 8 for payload-writes, 0 for tag-writes).
                     // The earlier code used dest.tag_off for BOTH src read
                     // and dest write — that conflated the two offsets,
                     // producing wrong values when src.payload → dest.tag
                     // (the tag_vreg pattern in the Return terminator).
+                    //
+                    // Pass 54: the source read goes through stage_rax,
+                    // which (a) clobbers RAX in gpr_cache before the load
+                    // so a subsequent resolve in the same op can't read a
+                    // stale entry, and (b) uses a reg-reg move when the
+                    // source vreg's GPR is still cached.
                     if (n.operands.size() < 2 ||
                         n.operands[0].kind != MachineOperand::FrameSlot ||
                         n.operands[1].kind != MachineOperand::VReg) break;
                     if (n.operands[1].vreg >= ra.assignment.size()) break;
-                    std::uint32_t src_home = lowered.mir.node(n.operands[1].vreg).home_slot;
-                    a.mov_r64_mem(x86::RAX, frame_base,
-                                  slot_disp(src_home, kPayloadOffset));
+                    RegOrSlot src = resolve(n.operands[1]);
+                    stage_rax(src, kPayloadOffset);
                     a.mov_mem_r64(frame_base,
                                   slot_disp(n.operands[0].slot, n.operands[0].tag_off),
                                   x86::RAX);
@@ -413,11 +521,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                                         static_cast<std::int32_t>(rhs_imm));
                         ++peephole_fusions;
                     } else {
-                        if (rhs.is_reg) {
-                            a.mov_r64_r64(x86::RCX, rhs.reg);
-                        } else {
-                            a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
-                        }
+                        stage_rcx(rhs, kPayloadOffset);
                         if (n.op == MOp::ADDrr) {
                             a.alu_r64_r64(0x01, x86::RAX, x86::RCX);
                         } else if (n.op == MOp::SUBrr) {
@@ -426,13 +530,13 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                             a.imul_r64_r64(x86::RAX, x86::RCX);
                         }
                     }
-                    if (has_reg) {
-                        a.mov_r64_r64(alloc_reg(ra.assignment[id]), x86::RAX);
-                    }
                     // Write-back: payload + tag.
                     a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
                     a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagInt));
+                    // Pass 54: populate dst_gpr from RAX so subsequent
+                    // consumers can read from the GPR.
+                    populate_dst_from_rax(id);
                     break;
                 }
                 case MOp::NEGrr: {
@@ -445,12 +549,11 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     RegOrSlot src = resolve(n.operands[0]);
                     stage_rax(src, kPayloadOffset);
                     a.neg_r64(x86::RAX);
-                    if (has_reg) {
-                        a.mov_r64_r64(alloc_reg(ra.assignment[id]), x86::RAX);
-                    }
                     a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
                     a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagInt));
+                    // Pass 54: populate dst_gpr from RAX.
+                    populate_dst_from_rax(id);
                     break;
                 }
                 case MOp::CMPrr: {
@@ -472,11 +575,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                                         static_cast<std::int32_t>(rhs_imm));
                         ++peephole_fusions;
                     } else {
-                        if (rhs.is_reg) {
-                            a.mov_r64_r64(x86::RCX, rhs.reg);
-                        } else {
-                            a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
-                        }
+                        stage_rcx(rhs, kPayloadOffset);
                         a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                     }
                     break;
@@ -526,6 +625,11 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // slot and producing spurious deopts on valid input.
                     // lhs.slot is now always the actual home_slot (or the
                     // FrameSlot's explicit slot); use it directly.
+                    // Pass 54: clobber RAX/RCX in the cache before staging
+                    // tag values into them (they don't hold vreg payloads
+                    // after this point — only tag words).
+                    gpr_cache.clobber(x86::RAX);
+                    gpr_cache.clobber(x86::RCX);
                     a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(lhs.slot, kTagOffset));
                     a.mov_r64_imm64(x86::RCX, kTagInt);
@@ -561,6 +665,10 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     RegOrSlot lhs = resolve(n.operands[0]);
                     RegOrSlot rhs = resolve(n.operands[1]);
 
+                    // Pass 54: clobber RAX/RCX in the cache before staging
+                    // tag values into them.
+                    gpr_cache.clobber(x86::RAX);
+                    gpr_cache.clobber(x86::RCX);
                     a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(lhs.slot, kTagOffset));
                     a.mov_r64_imm64(x86::RCX, kTagFloat);
@@ -662,6 +770,10 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     a.mov_mem_imm32(frame_base,
                                     slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagFloat));
+                    // Pass 54: populate dst_gpr from RAX (the FP constant
+                    // is stored as a raw bit pattern in the home payload;
+                    // consumers that read the payload can use the GPR).
+                    populate_dst_from_rax(id);
                     break;
                 }
                 case MOp::SETCCri: {
@@ -687,6 +799,9 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     a.mov_mem_imm32(frame_base,
                                     slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagBool));
+                    // Pass 54: populate dst_gpr from RAX (the bool payload
+                    // is now in RAX after movzx_eax_al — 0 or 1).
+                    populate_dst_from_rax(id);
                     break;
                 }
                 case MOp::CALLri: {
@@ -706,6 +821,14 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     a.mov_r64_imm64(x86::RDX, op_hint);
                     a.mov_r64_imm64(x86::RAX, reinterpret_cast<std::uint64_t>(&vortex_jit_bridge));
                     a.jmp_rax_placeholder();
+                    // Pass 54: a call (or jmp to bridge — same ABI clobber
+                    // set) clobbers ALL caller-saved GPRs per SysV. Mark
+                    // every allocatable caller-saved GPR free in the cache;
+                    // the only survivor is RBX (callee-saved).
+                    for (std::uint32_t i = 0; i < n_alloc; ++i) {
+                        std::uint8_t gpr = target.allocatable[i];
+                        if (gpr != x86::RBX) gpr_cache.clobber(gpr);
+                    }
                     break;
                 }
                 case MOp::RET: {
@@ -796,6 +919,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     out.code = buffer;
     out.code_size = a.size();
     out.peephole_fusions = peephole_fusions;
+    out.gpr_cache_hits = gpr_cache_hits;
     out.valid = a.size() > 0 && a.size() < capacity;
     (void)kTagNone;
     (void)kTagBool;
