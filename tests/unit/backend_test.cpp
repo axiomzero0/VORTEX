@@ -1141,25 +1141,404 @@ TEST(p54_gpr_cache_preserves_correctness_single_block) {
 // This is a META-TEST note, not a runtime test. The cross-block soundness
 // of the GPR cache (after retiring the per-block reset) is verified by the
 // regression suite, which compiles multi-block Python sources through the
-// full parser → IR → lowering → regalloc → codegen pipeline:
-//
-//   - determinism_regr: nested `while i < 3: while j < 3: ...` — the loop
-//     header, loop body, and loop exit form distinct MIR blocks; vregs
-//     defined in the loop header are used in the loop body across a Jcc.
-//   - verifier_after_each_pass_regr: same nested-while shape.
-//   - opt_in_toggle_regr / pass_idempotency_regr: for-loops over items,
-//     which lower to multi-block MIR with loop headers and exits.
-//
-// All these pass after the per-block reset removal. If the cross-block
-// cache were unsound, these would fail (the cache would serve a stale
-// value across a Jcc and produce wrong results).
-//
-// A direct unit test that hand-constructs a multi-block IR graph and
-// JIT-executes it is non-trivial: the lowering expects a Region/Phi merge
-// structure (which the parser always produces) to correctly compute
-// postorder block layout. Hand-constructed If graphs without a Region
-// trip a pre-existing lowering issue where the entry block ends up last
-// in MIR block id order — that's a separate bug to fix when the
-// hand-construction path becomes important. For now, the regression
-// suite covers cross-block soundness.
+// full parser -> IR -> lowering -> regalloc -> codegen pipeline.
 // =============================================================================
+
+// =============================================================================
+// Pass 52 lowering: hand-constructed If-without-Region multi-block graph.
+//
+// The frontend always wraps both arms of an `if` in a Region merge when
+// both arms fall through, but when both arms `return`, NO Region is
+// produced (merge_arms sees an empty `live` list and leaves control_
+// invalid). The lowering's iterative DFS computes a bogus "postorder"
+// (it actually emits nodes in pop order, not after-children-finish
+// order), so for any multi-block graph the entry block ends up LAST in
+// MIR block id order. The codegen emits hot blocks in block id order,
+// so execution falls into block 0 = the wrong arm immediately after
+// the prologue, skipping the Start block's CMPrr+Jcc entirely.
+//
+// This test hand-constructs the canonical "both-arms-return" shape and
+// verifies both arms produce the correct result for inputs that exercise
+// each path:
+//   * truthy input (p=5) -> true arm (return p+1 = 6)
+//   * falsy input  (p=0) -> false arm (return 0)
+// Under the buggy lowering, the falsy input produces 1 (it falls into
+// the true arm and computes 0+1=1). The truthy input coincidentally
+// produces the right answer because falling into the true arm IS
+// correct for truthy inputs.
+// =============================================================================
+TEST(p52_lowering_if_both_arms_return_truthy_path) {
+    // Hand-construct: lambda p -> if p: return p+1 else: return 0
+    // (true-arm case).
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId p0 = g.create(NodeKind::Parameter, {start});
+    g.node(p0).aux0 = 0;
+    NodeId c1 = g.create(NodeKind::ConstInt);
+    g.node(c1).const_value = Value::integer(1);
+    NodeId add = g.create(NodeKind::Add, {p0, c1});
+    NodeId iff = g.create(NodeKind::If, {start, p0});
+    NodeId iftrue = g.create(NodeKind::IfTrue, {iff});
+    NodeId iffalse = g.create(NodeKind::IfFalse, {iff});
+    NodeId c0 = g.create(NodeKind::ConstInt);
+    g.node(c0).const_value = Value::integer(0);
+    NodeId ret_true = g.create(NodeKind::Return, {iftrue, add});
+    NodeId ret_false = g.create(NodeKind::Return, {iffalse, c0});
+    (void)ret_true; (void)ret_false;
+    g.node(p0).set_flag(NodeFlag::Pure);
+    g.node(c1).set_flag(NodeFlag::Pure);
+    g.node(add).set_flag(NodeFlag::Pure);
+    g.node(c0).set_flag(NodeFlag::Pure);
+    g.node(p0).set_flag(NodeFlag::Unboxed);
+    g.node(c1).set_flag(NodeFlag::Unboxed);
+    g.node(add).set_flag(NodeFlag::Unboxed);
+    g.node(c0).set_flag(NodeFlag::Unboxed);
+    g.node(ret_true).set_flag(NodeFlag::OnEffectChain);
+    g.node(ret_false).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret_true);
+    g.n_parameters = 1;
+    g.function_name = global_symbols().intern("if_both_arms_return");
+
+    constexpr std::size_t kCodeCap = 4096;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+    CompiledCode cc = compile_unit(g, /*unit_id=*/9, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    regs[2] = Value::integer(5);   // truthy
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 6);   // 5 + 1 = 6 (true arm)
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}
+
+TEST(p52_lowering_if_both_arms_return_falsy_path) {
+    // Same graph as the truthy test, but with p=0. This is the case
+    // that distinguishes the buggy lowering (which falls into the
+    // true arm and returns 1) from the correct lowering (which jumps
+    // to the false arm and returns 0).
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId p0 = g.create(NodeKind::Parameter, {start});
+    g.node(p0).aux0 = 0;
+    NodeId c1 = g.create(NodeKind::ConstInt);
+    g.node(c1).const_value = Value::integer(1);
+    NodeId add = g.create(NodeKind::Add, {p0, c1});
+    NodeId iff = g.create(NodeKind::If, {start, p0});
+    NodeId iftrue = g.create(NodeKind::IfTrue, {iff});
+    NodeId iffalse = g.create(NodeKind::IfFalse, {iff});
+    NodeId c0 = g.create(NodeKind::ConstInt);
+    g.node(c0).const_value = Value::integer(0);
+    NodeId ret_true = g.create(NodeKind::Return, {iftrue, add});
+    NodeId ret_false = g.create(NodeKind::Return, {iffalse, c0});
+    (void)ret_true; (void)ret_false;
+    g.node(p0).set_flag(NodeFlag::Pure);
+    g.node(c1).set_flag(NodeFlag::Pure);
+    g.node(add).set_flag(NodeFlag::Pure);
+    g.node(c0).set_flag(NodeFlag::Pure);
+    g.node(p0).set_flag(NodeFlag::Unboxed);
+    g.node(c1).set_flag(NodeFlag::Unboxed);
+    g.node(add).set_flag(NodeFlag::Unboxed);
+    g.node(c0).set_flag(NodeFlag::Unboxed);
+    g.node(ret_true).set_flag(NodeFlag::OnEffectChain);
+    g.node(ret_false).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret_true);
+    g.n_parameters = 1;
+    g.function_name = global_symbols().intern("if_both_arms_return_v2");
+
+    constexpr std::size_t kCodeCap = 4096;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+    CompiledCode cc = compile_unit(g, /*unit_id=*/10, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    regs[2] = Value::integer(0);   // falsy
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 0);   // false arm returns 0
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}
+
+// Rule 34 #3: boundary/negative. The fix to the iterative postorder DFS
+// must not change behavior for single-block graphs (no If/Region/Loop).
+// The previous code's "pop-then-append" pseudo-postorder happens to be
+// equivalent to true postorder for a single-block graph (the entry is
+// the only node, so it lands in postorder[0] in both formulations). This
+// test pins that equivalence so a future refactor of the DFS can't silently
+// break the trivial case while fixing the multi-block case.
+TEST(p52_lowering_single_block_graph_unchanged_by_postorder_fix) {
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId p0 = g.create(NodeKind::Parameter, {start});
+    g.node(p0).aux0 = 0;
+    NodeId c1 = g.create(NodeKind::ConstInt);
+    g.node(c1).const_value = Value::integer(1);
+    NodeId add = g.create(NodeKind::Add, {p0, c1});
+    NodeId ret = g.create(NodeKind::Return, {start, add});
+    (void)ret;
+    g.node(p0).set_flag(NodeFlag::Pure);
+    g.node(c1).set_flag(NodeFlag::Pure);
+    g.node(add).set_flag(NodeFlag::Pure);
+    g.node(add).set_flag(NodeFlag::Unboxed);
+    g.node(p0).set_flag(NodeFlag::Unboxed);
+    g.node(c1).set_flag(NodeFlag::Unboxed);
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+    g.n_parameters = 1;
+    g.function_name = global_symbols().intern("single_block_boundary");
+
+    constexpr std::size_t kCodeCap = 4096;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+    CompiledCode cc = compile_unit(g, /*unit_id=*/11, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    regs[2] = Value::integer(41);
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 42);   // 41 + 1 = 42
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}
+
+// Rule 34 #4: integration/contextual. The same multi-block shape, but
+// produced by the FRONTEND (lexer + parser + frontend lowering) instead
+// of hand-constructed. This is the realistic surrounding-code case: a
+// real Python function with `if`+`return` in both arms. The frontend's
+// lower_if + merge_arms produces a NO-Region graph when both arms return
+// (merge_arms sees an empty `live` list), which is exactly the shape the
+// buggy lowering mis-ordered.
+//
+// The source uses constants only (`if p: return 5 else: return 0`) so
+// the lowered IR contains zero CALLri helper calls — the JIT can execute
+// the whole function without invoking the interpreter bridge. (A source
+// like `if p: return p+1 else: return 0` would lower `p+1` to PyBinary
+// with a Parameter operand that isn't provably-int, which falls back to
+// CALLri; the CALLri stub needs a registered CodeUnit for the unit_id,
+// which is out of scope for this bug-fix's integration test.)
+TEST(p52_lowering_parser_produced_if_both_arms_return) {
+    constexpr std::string_view src =
+        "def f(p):\n"
+        "    if p:\n"
+        "        return 5\n"
+        "    else:\n"
+        "        return 0\n";
+
+    vortex::BumpArena arena;
+    Result<fe::Module*> ast = fe::compile_to_ast(arena, src);
+    CHECK(ast.has_value());
+    if (!ast) return;
+    fe::LowerContext lctx;
+    stdx::small_vector<SymbolId, 8> no_caps;
+    SymbolId mod = global_symbols().intern("regr_mod_p52_int");
+    Result<fe::LoweredUnit> top =
+        fe::lower_unit(**ast, lctx, nullptr, mod, no_caps, false, 0xFFFFFFFF);
+    CHECK(top.has_value() && !(*top).children.empty());
+    if (!top || (*top).children.empty()) return;
+    fe::PendingFunction& fdef = (*top).children[0];
+    Result<fe::LoweredUnit> fu = fe::lower_unit(**ast, lctx, fdef.def, fdef.name,
+                                                fdef.captures, false, fdef.code_unit_hint);
+    CHECK(fu.has_value());
+    if (!fu) return;
+    Graph g = (*fu).graph;
+    passes::PassContext ctx;
+    ctx.tier = passes::TierMode::Tier2;
+    passes::OptPipeline pipeline;
+    Result<void> pr = passes::run_pipeline(g, ctx, pipeline);
+    CHECK(pr.has_value());
+    if (!pr) return;
+
+    constexpr std::size_t kCodeCap = 8192;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+    CompiledCode cc = compile_unit(g, /*unit_id=*/12, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    // The frontend-lowered Parameter lives at its IR NodeId; pass-renumbering
+    // may shift the exact id. Set EVERY slot in regs to integer(5); the
+    // parameter's home slot reads from regs[home_slot] which will be 5
+    // regardless of the exact NodeId assigned.
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::integer(5);
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 5);   // true arm returns the constant 5
+
+    // Falsy input: p=0 → false arm → return 0.
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::integer(0);
+    result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 0);   // false arm returns 0
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}
+
+// Rule 34 #5: deopt/state reconstruction. The true arm of an if-both-arms-
+// return graph contains a PyBinary (ins=[control, eff, lhs, rhs]) with
+// provably-int operands (Parameter marked Unboxed + ConstInt). The
+// lowering's PyBinary int-fast path emits:
+//   GUARD_INT (safepoint; tag-check both operands; failure → deopt stub)
+//   ADDrr     (native add; result in home)
+//   MOVmr     (write-back to home so deopt/Tier-0 see a consistent Value)
+//
+// The GUARD_INT is a SAFEPONT that lives in the IfTrue block. With the
+// buggy postorder, the IfTrue block was MIR block id 0 — execution fell
+// into it immediately after the prologue, the GUARD_INT fired (and
+// passed, since p is int), and the result was p+1 regardless of p's
+// value. With the fix, the IfTrue block is emitted AFTER the Start block
+// (which contains the CMPrr+Jcc terminator), so the GUARD_INT only fires
+// when execution genuinely reaches the true arm (p truthy).
+//
+// This test verifies the guard fires in the correct block: with p=0
+// (int, falsy), the false arm runs and the GUARD_INT in the true arm
+// NEVER fires. If the postorder is wrong, the guard would fire on
+// every execution (and the result would be p+1, not 0).
+TEST(p52_lowering_guard_int_lives_in_correct_arm_for_if) {
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId p0 = g.create(NodeKind::Parameter, {start});
+    g.node(p0).aux0 = 0;
+    NodeId c1 = g.create(NodeKind::ConstInt);
+    g.node(c1).const_value = Value::integer(1);
+    // PyBinary with provably-int operands → GUARD_INT + ADDrr fast path.
+    // Inputs: [control=start, memory=start, lhs=p0, rhs=c1].
+    //   - ins[0]=start  (block leader: Start)
+    //   - ins[1]=start  (effect chain root; the verifier accepts Start
+    //                    as the effect-chain origin per verifier.cpp:81)
+    //   - ins[2]=p0     (lhs, provably_int via Unboxed flag)
+    //   - ins[3]=c1     (rhs, provably_int via ConstInt)
+    NodeId binadd = g.create(NodeKind::PyBinary, {start, start, p0, c1});
+    g.node(binadd).subop = static_cast<std::uint16_t>(ir::BinOpKind::Add);
+    g.node(binadd).set_flag(NodeFlag::OnEffectChain);
+    g.node(binadd).set_flag(NodeFlag::MayThrow);
+    g.node(binadd).set_flag(NodeFlag::MayCall);
+    NodeId iff = g.create(NodeKind::If, {start, p0});
+    NodeId iftrue = g.create(NodeKind::IfTrue, {iff});
+    NodeId iffalse = g.create(NodeKind::IfFalse, {iff});
+    NodeId c0 = g.create(NodeKind::ConstInt);
+    g.node(c0).const_value = Value::integer(0);
+    NodeId ret_true = g.create(NodeKind::Return, {iftrue, binadd});
+    NodeId ret_false = g.create(NodeKind::Return, {iffalse, c0});
+    (void)ret_true; (void)ret_false;
+    g.node(p0).set_flag(NodeFlag::Pure);
+    g.node(c1).set_flag(NodeFlag::Pure);
+    g.node(c0).set_flag(NodeFlag::Pure);
+    g.node(p0).set_flag(NodeFlag::Unboxed);   // makes provably_int true
+    g.node(c1).set_flag(NodeFlag::Unboxed);
+    g.node(c0).set_flag(NodeFlag::Unboxed);
+    g.node(ret_true).set_flag(NodeFlag::OnEffectChain);
+    g.node(ret_false).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret_true);
+    g.n_parameters = 1;
+    g.function_name = global_symbols().intern("guard_int_in_correct_arm");
+
+    constexpr std::size_t kCodeCap = 8192;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+    CompiledCode cc = compile_unit(g, /*unit_id=*/13, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+    // The PyBinary's int-fast path emits exactly one safepoint (the
+    // GUARD_INT). The CALLri fallback would also emit one. Either way,
+    // there must be at least one safepoint recorded — that proves the
+    // PyBinary was lowered (not skipped) and that the safepoint's
+    // associated deopt stub was wired up.
+    CHECK(!cc.safepoints.empty());
+
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    regs[2] = Value::integer(0);   // falsy int
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    // With the fix, execution enters the FALSE arm (return 0). The
+    // GUARD_INT in the true arm never fires. Result: 0.
+    // Under the buggy lowering, execution fell into the true arm,
+    // the GUARD_INT fired (and passed, since p is int), and the result
+    // was 0+1=1.
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 0);   // false arm; guard never fires
+
+    // Truthy input: p=5 → true arm → guard passes → 5+1=6.
+    regs[2] = Value::integer(5);
+    result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 6);   // true arm; guard passes; returns p+1
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}

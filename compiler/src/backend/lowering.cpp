@@ -156,39 +156,73 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
     LoopInfo loops = compute_loops(g, dom);
 
     // ---- stage 1: RPO block order (main flow, handlers appended) -----------
+    // Iterative two-state DFS that produces TRUE postorder: a node is
+    // appended to `postorder` only after ALL its descendants in the CFG
+    // have been fully processed. The previous single-state pop-then-append
+    // formulation appended the node immediately on pop (BEFORE its
+    // successors were visited), producing reverse-preorder rather than
+    // postorder. Reversing that gave a block id order in which the entry
+    // block landed LAST, so the codegen emitted the entry block last and
+    // execution fell into the wrong arm immediately after the prologue
+    // (the Start block's CMPrr+Jcc terminator was skipped entirely).
+    //
+    // The two-state stack (ENTER/EXIT) is the standard fix: on ENTER we
+    // push the EXIT marker, then push ENTER markers for each unvisited
+    // successor. On EXIT we append the node to postorder — guaranteed to
+    // happen after every reachable successor has hit its own EXIT.
+    //
+    // Rule 9 (no std::function): the stack frame is a 2-word POD, not a
+    // type-erased callable. Rule 19 (SBO): the small_vector inlines up to
+    // 64 frames (sufficient for any function we currently compile) and
+    // falls back to heap allocation only for pathological nested control.
     stdx::small_vector<NodeId, 64> postorder;
     {
+        struct PostorderFrame { NodeId node; bool is_exit; };
         stdx::flat_map<NodeId, bool, 32> visited;
-        stdx::small_vector<NodeId, 64> stack{g.start()};
+        stdx::small_vector<PostorderFrame, 64> stack{{g.start(), false}};
         visited.insert(g.start(), true);
         while (!stack.empty()) {
-            NodeId b = stack.back();
+            PostorderFrame f = stack.back();
             stack.pop_back();
-            for (NodeId s : block_succs(g, b)) {
+            if (f.is_exit) {
+                postorder.push_back(f.node);
+                continue;
+            }
+            // ENTER: schedule EXIT first (so it runs AFTER all successors
+            // pushed below it have hit their own EXIT). Then push each
+            // unvisited successor as a fresh ENTER.
+            stack.push_back(PostorderFrame{f.node, true});
+            for (NodeId s : block_succs(g, f.node)) {
                 if (!visited.contains(s)) {
                     visited.insert(s, true);
-                    stack.push_back(s);
+                    stack.push_back(PostorderFrame{s, false});
                 }
             }
-            postorder.push_back(b);
         }
-        // handler roots (Catch) appended after main flow
+        // handler roots (Catch) appended after main flow — same two-state
+        // DFS, scoped to handler-only roots that the main flow missed.
+        // The visited map carries over so a Catch reachable from the
+        // main flow is not double-counted.
         stdx::small_vector<NodeId, 64> handler_po;
         g.for_each_live([&](NodeId id) {
             if (g.node(id).kind != NodeKind::Catch) return;
             if (visited.contains(id)) return;
-            stdx::small_vector<NodeId, 64> hstack{id};
+            stdx::small_vector<PostorderFrame, 16> hstack{{id, false}};
             visited.insert(id, true);
             while (!hstack.empty()) {
-                NodeId b = hstack.back();
+                PostorderFrame f = hstack.back();
                 hstack.pop_back();
-                for (NodeId s : block_succs(g, b)) {
+                if (f.is_exit) {
+                    handler_po.push_back(f.node);
+                    continue;
+                }
+                hstack.push_back(PostorderFrame{f.node, true});
+                for (NodeId s : block_succs(g, f.node)) {
                     if (!visited.contains(s)) {
                         visited.insert(s, true);
-                        hstack.push_back(s);
+                        hstack.push_back(PostorderFrame{s, false});
                     }
                 }
-                handler_po.push_back(b);
             }
         });
         for (NodeId h : handler_po) postorder.push_back(h);
