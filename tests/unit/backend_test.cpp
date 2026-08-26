@@ -1075,11 +1075,13 @@ TEST(p54_gpr_cache_fires_on_chained_add) {
     free_exec_buffer(code_buf, kCodeCap);
 }
 
-TEST(p54_gpr_cache_preserves_correctness_across_blocks) {
-    // This is a positive-correctness test, not a hit-count test. The GPR
-    // cache is per-block-scoped; cross-block reads fall back to home (which
-    // is always up-to-date). This test compiles a graph with a conditional
-    // so the IR has multiple blocks, and verifies the result is correct.
+TEST(p54_gpr_cache_preserves_correctness_single_block) {
+    // Positive-correctness test on a single-block graph (λp → p+1).
+    // The GPR cache must not introduce behavioral drift on the simplest
+    // case. Cross-block soundness is exercised by the regression suite
+    // (determinism_regr / verifier_after_each_pass_regr both compile
+    // nested-while-loop Python sources that lower to multi-block MIR;
+    // they pass after the per-block reset removal).
     Graph g;
     NodeId start = g.create(NodeKind::Start);
     g.set_start(start);
@@ -1132,3 +1134,32 @@ TEST(p54_gpr_cache_preserves_correctness_across_blocks) {
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
 }
+
+// =============================================================================
+// p54_gpr_cache_cross_block_soundness_via_regression_suite
+//
+// This is a META-TEST note, not a runtime test. The cross-block soundness
+// of the GPR cache (after retiring the per-block reset) is verified by the
+// regression suite, which compiles multi-block Python sources through the
+// full parser → IR → lowering → regalloc → codegen pipeline:
+//
+//   - determinism_regr: nested `while i < 3: while j < 3: ...` — the loop
+//     header, loop body, and loop exit form distinct MIR blocks; vregs
+//     defined in the loop header are used in the loop body across a Jcc.
+//   - verifier_after_each_pass_regr: same nested-while shape.
+//   - opt_in_toggle_regr / pass_idempotency_regr: for-loops over items,
+//     which lower to multi-block MIR with loop headers and exits.
+//
+// All these pass after the per-block reset removal. If the cross-block
+// cache were unsound, these would fail (the cache would serve a stale
+// value across a Jcc and produce wrong results).
+//
+// A direct unit test that hand-constructs a multi-block IR graph and
+// JIT-executes it is non-trivial: the lowering expects a Region/Phi merge
+// structure (which the parser always produces) to correctly compute
+// postorder block layout. Hand-constructed If graphs without a Region
+// trip a pre-existing lowering issue where the entry block ends up last
+// in MIR block id order — that's a separate bug to fix when the
+// hand-construction path becomes important. For now, the regression
+// suite covers cross-block soundness.
+// =============================================================================
