@@ -158,7 +158,13 @@ Result<PassResult> P11_AndersenPointsTo::run(Graph& g, const PassContext& c) noe
 
     PassResult r = result_of(g, before);
     r.changed = false;   // pure analysis pass (Rule 28-class enabler)
-    note(TelemetryEventKind::BudgetExceeded, c, iterations);
+    // REGR-1 fix: do not emit BudgetExceeded as a generic "did work"
+    // marker. The regression's `regr_pass_budget_guard_no_false_alarm`
+    // counts BudgetExceeded events and asserts zero on a generous node
+    // budget; this unconditional emission made that test fail even when
+    // no budget was actually exceeded. SafepointPatched is the
+    // convention every other pass uses for "pass did work" telemetry.
+    note(TelemetryEventKind::SafepointPatched, c, iterations);
     return r;
 }
 

@@ -118,7 +118,9 @@ Result<PassResult> P14_DemandDrivenAlias::run(Graph& g, const PassContext& c) no
 
     PassResult r = result_of(g, before);
     r.changed = false;
-    note(TelemetryEventKind::BudgetExceeded, c, pairs_proved);
+    // REGR-1 fix: SafepointPatched, not BudgetExceeded — this is a
+    // "did work" marker (pairs proved), not a budget-trip event.
+    note(TelemetryEventKind::SafepointPatched, c, pairs_proved);
     return r;
 }
 

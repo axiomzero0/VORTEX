@@ -109,8 +109,16 @@ Result<PassResult> P45_StringInterning::run(Graph& g, const PassContext& c) noex
         fn.set_flag(NodeFlag::Pure);
 
         // Replace all uses of the PyBinary with the new ConstPy. The
-        // PyBinary becomes dead and will be reaped by DCE (Pass 3/51).
+        // PyBinary becomes dead and is killed here so the second run of
+        // the pass (and any subsequent pass) does not re-discover it as
+        // a fold candidate — Rule 10 idempotency: the second run MUST
+        // be a no-op. Previously the PyBinary was left alive (only its
+        // uses were rewired), so the second run re-folded it (the
+        // operands were still const_str and the PyBinary still
+        // matched the candidate filter) and reported changed=true —
+        // a real idempotency violation that the regression caught.
         g.replace_all_uses(bin_id, folded_id);
+        g.kill(bin_id);
 
         ++folded;
     }

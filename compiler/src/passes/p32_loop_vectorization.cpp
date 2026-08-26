@@ -62,6 +62,30 @@ Result<PassResult> P32_LoopVectorization::run(Graph& g, const PassContext& c) no
             gn.subop = static_cast<std::uint16_t>(GuardKind::AliasDisjoint);
             gn.set_flag(NodeFlag::Speculative);
             gn.set_flag(NodeFlag::OnEffectChain);
+            // VERIFIER-1 fix: the Guard has OnEffectChain set, so the
+            // structural verifier requires ins[0] to be a control
+            // projection and ins[1] to be a chained effect (or Start /
+            // EffectPhi). The previous emission only pushed the
+            // accesses' base pointers — leaving the guard with one or
+            // more data inputs but no control / effect input, so every
+            // downstream verifier check fired "effect chain
+            // discontinuity" (Rule 40) on any code that ran P32 with
+            // Tier2 (is_profiled() == true for the regression harness
+            // that drives the full pipeline on the lang corpus).
+            //
+            // The guard semantically gates the loop's first access: its
+            // control is the access's control projection (ins[0]) and
+            // its effect is the access's effect input (ins[1]). Both
+            // are valid effect-chain members by construction (the
+            // access has OnEffectChain set). The data inputs — the
+            // base pointers — follow as ins[2+].
+            if (!accesses.empty()) {
+                const Node& first = g.node(accesses[0]);
+                if (first.ins.size() >= 2) {
+                    g.add_input(guard, first.ins[0]);   // control
+                    g.add_input(guard, first.ins[1]);   // effect (memory)
+                }
+            }
             for (NodeId a : accesses) {
                 if (g.node(a).ins.size() >= 3) g.add_input(guard, g.node(a).ins[2]);
             }

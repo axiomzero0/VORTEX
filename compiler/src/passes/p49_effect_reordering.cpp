@@ -73,6 +73,26 @@ Result<PassResult> P49_SpeculativeEffectReordering::run(Graph& g, const PassCont
                 gn.subop = static_cast<std::uint16_t>(GuardKind::AliasDisjoint);
                 gn.set_flag(NodeFlag::Speculative);
                 gn.set_flag(NodeFlag::OnEffectChain);
+                // VERIFIER-1 fix (mirrors P32's fix): the Guard has
+                // OnEffectChain set, so the structural verifier requires
+                // ins[0] = a control projection and ins[1] = a chained
+                // effect. The previous emission only pushed the loads'
+                // base pointers — leaving the guard with no control or
+                // effect input, so every downstream verifier check
+                // fired "effect chain discontinuity" (Rule 40).
+                //
+                // The guard semantically gates the block's first load:
+                // its control is the load's control (ins[0]) and its
+                // effect is the load's effect input (ins[1]). The base
+                // pointers — the alias-disjoint hypothesis operands —
+                // follow as ins[2+].
+                if (!kv.second.empty()) {
+                    const Node& first = g.node(kv.second[0]);
+                    if (first.ins.size() >= 2) {
+                        g.add_input(guard, first.ins[0]);   // control
+                        g.add_input(guard, first.ins[1]);   // effect (memory)
+                    }
+                }
                 for (NodeId load : kv.second) {
                     if (g.node(load).ins.size() >= 3) g.add_input(guard, g.node(load).ins[2]);
                 }

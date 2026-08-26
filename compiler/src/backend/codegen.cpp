@@ -342,6 +342,24 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                                     static_cast<std::int32_t>(kTagInt));
                     break;
                 }
+                case MOp::NEGrr: {
+                    // IBE-20 fix: NEG is a single-operand op — load the
+                    // operand's payload into RAX, apply NEG, write back.
+                    // Mirrors the ADD/SUB/IMUL write-back discipline (payload
+                    // + tag) so the home slot stays consistent with what
+                    // the Tier-0 interpreter would have stored.
+                    if (n.operands.size() < 1) break;
+                    RegOrSlot src = resolve(n.operands[0]);
+                    stage_rax(src, kPayloadOffset);
+                    a.neg_r64(x86::RAX);
+                    if (has_reg) {
+                        a.mov_r64_r64(alloc_reg(ra.assignment[id]), x86::RAX);
+                    }
+                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
+                    a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagInt));
+                    break;
+                }
                 case MOp::CMPrr: {
                     if (n.operands.size() < 2) break;
                     RegOrSlot lhs = resolve(n.operands[0]);

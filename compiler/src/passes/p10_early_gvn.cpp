@@ -65,7 +65,8 @@ void sweep(Graph& g) noexcept {
 
 Result<PassResult> P10_EarlyGVN::run(Graph& g, const PassContext& c) noexcept {
     if (c.tier == TierMode::Tier1) {
-        note(TelemetryEventKind::BudgetExceeded, c);
+        // REGR-1 fix: tier self-gate, not a node-budget trip.
+        note(TelemetryEventKind::SafepointPatched, c);
         return PassResult{};   // deferred to Tier 2/3 (budget)
     }
     std::uint32_t before = g.live_node_count();

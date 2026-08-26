@@ -577,7 +577,12 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
         ++transforms;
 
         if (transforms > cfg::fixpoint_max_iterations) {
-            note(TelemetryEventKind::BudgetExceeded, c, transforms);
+            // REGR-1 fix: the fixpoint iteration cap is an internal
+            // limit, NOT the global node_budget. Same reasoning as
+            // P27's per-loop cap — emit SafepointPatched to avoid
+            // false BudgetExceeded alarms when the global budget is
+            // ample.
+            note(TelemetryEventKind::SafepointPatched, c, transforms);
             break;
         }
     }

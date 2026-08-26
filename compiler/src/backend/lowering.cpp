@@ -254,6 +254,22 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                 out.mir.add_operand(result, MachineOperand::reg(b));
                 break;
             }
+            case NodeKind::Neg: {
+                // IBE-20 fix: Neg is a one-operand arithmetic op, distinct
+                // from the Add/Sub/Mul/Cmp family above (which all take two
+                // operands via the shared kLoweringTable). The previous
+                // lowering let Neg fall through to the default case
+                // (MOVrm — a pure copy from the home slot), so the JIT
+                // returned x instead of -x for any `Neg` node.
+                //
+                // The Neg node has one input (the operand), no concept of
+                // a "subop" (it's not PyBinary), and emits MOp::NEGrr —
+                // x86's F7 /3 (single-operand two's-complement negation).
+                std::uint32_t a = self(self, n.ins[0], blk);
+                result = out.mir.create(MOp::NEGrr, MachineRegClass::GPR, home);
+                out.mir.add_operand(result, MachineOperand::reg(a));
+                break;
+            }
             default: {
                 // Dynamic Python op: the value lives in its frame home slot
                 // after the interpreter-equivalent helper ran. Materializing

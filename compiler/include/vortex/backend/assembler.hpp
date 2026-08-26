@@ -162,6 +162,22 @@ public:
         return emit32(static_cast<std::uint32_t>(imm));
     }
 
+    // --- NEG r/m64 (REX.W F7 /3) — one-operand two's-complement negation ---------------
+    // The IBE-20 differential test caught that the Neg IR node was silently
+    // lowered through the default "copy from home slot" path, producing
+    // `result = x` instead of `result = -x` in the JIT. This emitter wraps
+    // the F7 /3 form (single-byte opcode with modrm.reg=3 for NEG, vs the
+    // /0..5 sub-opcodes F7 dispatches on). REX.W is forced for 64-bit
+    // operand size — int payloads are 64-bit by the IR's Value contract.
+    [[nodiscard]] bool neg_r64(std::uint8_t reg) noexcept {
+        std::uint8_t rex = REX_W;
+        if (reg >= 8) rex |= 0x01;   // B extends rm field
+        if (!emit8(rex)) return false;
+        if (!emit8(0xF7)) return false;
+        // modrm(mod=11, reg=3, rm=reg) — /3 is the NEG opcode extension.
+        return emit8(modrm(kModReg, 3, reg & 7));
+    }
+
     // --- IMUL r64, r/m64 (REX.W 0F AF /r) ------------------------------------------------------
     [[nodiscard]] bool imul_r64_r64(std::uint8_t dst, std::uint8_t src) noexcept {
         std::uint8_t rex = REX_W;

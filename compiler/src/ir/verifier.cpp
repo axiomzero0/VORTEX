@@ -89,11 +89,25 @@ stdx::small_vector<Diagnostic, 4> verify_graph(const Graph& g) noexcept {
     });
 
     // 3. Control inputs of control-region users are Region/If/Loop projections.
+    //
+    // Catch is exempted just like Region: a Catch node is the merge target
+    // for runtime exception dispatch. When the try body's only statement
+    // is a `return EXPR` where EXPR may raise (e.g. `return 1/0`), the
+    // body's lowering pushes no post-statement ArmState snapshots
+    // (control_ becomes invalid after the Return terminates), so the
+    // Catch region has zero IR-edges in — but it is still reachable
+    // at runtime via the exception dispatch mechanism. Exempting it
+    // from the structural "control node must have a control input"
+    // invariant keeps the verifier sound on this shape (the catch path's
+    // reachability is runtime-driven, not IR-edge-driven — the same
+    // reason Region is exempted: a region may be a structurally-empty
+    // merge that the scheduler/runtime fills in later).
     g.for_each_live([&](NodeId id) {
         const Node& n = g.node(id);
         if (!is_control(n.kind)) return;
         if (n.kind == NodeKind::Start) return;
-        if (n.ins.empty() && n.kind != NodeKind::Region) {
+        if (n.ins.empty() && n.kind != NodeKind::Region &&
+            n.kind != NodeKind::Catch) {
             Diagnostic d = Diagnostic::error("control node without control input",
                                              diag_code::graph_verify_dominance);
             d.fix = "Control nodes must consume a control projection";

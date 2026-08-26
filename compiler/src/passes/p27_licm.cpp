@@ -86,7 +86,14 @@ Result<PassResult> P27_LICM::run(Graph& g, const PassContext& c) noexcept {
             }
         }
         if (hoisted > cfg::licm_max_hoisted_per_loop) {
-            note(TelemetryEventKind::BudgetExceeded, c, hoisted);
+            // REGR-1 fix: the per-loop hoist limit is an internal
+            // cap, NOT the global node_budget. Emitting BudgetExceeded
+            // here collided with the regression's "no false alarm on
+            // a generous budget" check — that test counts
+            // BudgetExceeded events and expects zero when the global
+            // budget is ample. SafepointPatched is the right kind for
+            // "LICM hit its per-loop cap" telemetry.
+            note(TelemetryEventKind::SafepointPatched, c, hoisted);
             break;
         }
     }

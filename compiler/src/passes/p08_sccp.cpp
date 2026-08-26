@@ -71,8 +71,14 @@ bool decide_branch(Graph& g, NodeId id) noexcept {
 
 Result<PassResult> P08_SCCP::run(Graph& g, const PassContext& c) noexcept {
     if (c.tier == TierMode::Tier1) {
-        // Budget gate (Rule 45): SCCP's fixpoint is deferred out of Tier 1.
-        note(TelemetryEventKind::BudgetExceeded, c);
+        // Tier 1 self-gate: SCCP's fixpoint is deferred out of Tier 1
+        // (Rule 45). REGR-1 fix: this is a tier self-gate, not a
+        // node-budget trip — emitting BudgetExceeded here made the
+        // regression's "no false alarm on a reasonable budget" check
+        // fail (any Tier1 run of SCCP would record one). Use
+        // SafepointPatched (the project's convention for "pass did /
+        // didn't do work" telemetry) instead.
+        note(TelemetryEventKind::SafepointPatched, c);
         return PassResult{};
     }
     std::uint32_t before = g.live_node_count();

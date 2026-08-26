@@ -42,6 +42,29 @@ Result<PassResult> P40_PartialEscapeAnalysis::run(Graph& g, const PassContext& c
         if (!is_alloc(n.kind)) return;
         if (n.ins.empty()) return;
 
+        // Idempotency (Rule 10): if a previous run of this pass already
+        // materialized an Allocated node for this allocation, skip it.
+        // Without this guard the second run would re-discover the same
+        // alloc, re-find the same escape users on the same arm, and
+        // spawn a SECOND Allocated node — the regression's idempotency
+        // check fired exactly this: r2->changed was true on the second
+        // P40 invocation. The Allocated node carries the original alloc
+        // id as its LAST input (g.add_input(alloc, id) below — the
+        // scalar value being materialized); the position varies when
+        // the original alloc lacks an effect input (single-input
+        // NewList), so we check whether `id` appears anywhere in the
+        // Allocated's input list.
+        bool already_materialized = false;
+        g.for_each_live([&](NodeId user) {
+            if (already_materialized) return;
+            const Node& un = g.node(user);
+            if (un.kind != NodeKind::Allocated) return;
+            for (NodeId in : un.ins) {
+                if (in == id) { already_materialized = true; break; }
+            }
+        });
+        if (already_materialized) return;
+
         // Find the users that force escape (calls, stores, returns).
         stdx::small_vector<NodeId, 4> escape_users;
         g.for_each_live([&](NodeId user) {
