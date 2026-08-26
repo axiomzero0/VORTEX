@@ -261,20 +261,20 @@ TEST(regr_pass_idempotency_kitchen_sink_tier1) {
 }
 
 // =============================================================================
-// Idempotency on the polyhedral opt-in path: opted in, the polyhedral pass
+// Idempotency on the polyhedral default-on path: the polyhedral pass
 // fires ONCE (real transformation) and a second run must be a no-op. A
 // non-idempotent polyhedral pass would re-swap loops forever — that's
 // clearly broken and would manifest as an infinite fixpoint.
 // =============================================================================
-TEST(regr_pass_idempotency_polyhedral_optin) {
+TEST(regr_pass_idempotency_polyhedral_default_on) {
     bool ok = false;
     Graph g = vortex_test::lower_function(kPolySrc, &ok);
     CHECK(ok);
     if (!ok) return;
 
+    // Default PassContext: polyhedral is ON by default, no opt-out flag.
     passes::PassContext ctx;
     ctx.tier = passes::TierMode::Tier2;
-    ctx.options.set(passes::OptOption::Polyhedral);
 
     passes::P33_PolyhedralOptimization p;
     Result<passes::PassResult> r1 = p.run(g, ctx);

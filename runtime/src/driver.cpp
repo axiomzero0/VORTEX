@@ -92,9 +92,11 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
             // bytes (Rule 5). Passes that fold string constants (Pass 45)
             // read from this pool.
             pctx.string_pool = &(**ast).string_pool;
-            // Opt-in switches (Pass 33 polyhedral is off unless requested).
-            if (options.polyhedral) {
-                pctx.options.set(passes::OptOption::Polyhedral);
+            // Opt-out switches (Pass 33 polyhedral is ON unless disabled).
+            // The only legitimate reason to opt out is compilation-time
+            // sensitivity (see p33_polyhedral.cpp header for rationale).
+            if (options.disable_polyhedral) {
+                pctx.options.set(passes::OptOption::DisablePolyhedral);
             }
             Result<void> optimized = passes::optimize(lowered.graph, pctx);
             if (!optimized) {

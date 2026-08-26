@@ -78,13 +78,13 @@ TEST(regr_verifier_after_each_pass_full_pipeline_corpus) {
 }
 
 // =============================================================================
-// Same as above, but with polyhedral opted in. The polyhedral pass rewires
-// the IR more aggressively than any other pass — if the verifier is going
-// to break, it breaks here. Run on the nested-while polyhedral candidate
-// only (we don't opt-in for the whole corpus — most cases have no
-// nested loops and the pass self-declines, which is correct).
+// Same as above, but explicitly on the polyhedral default-on path. The
+// polyhedral pass rewires the IR more aggressively than any other pass —
+// if the verifier is going to break, it breaks here. Run on the nested-
+// while polyhedral candidate only (most lang_cases have no nested loops
+// and the pass self-declines, which is correct).
 // =============================================================================
-TEST(regr_verifier_after_polyhedral_optin) {
+TEST(regr_verifier_after_polyhedral_default_on) {
     static const char* kSrc =
         "def f(a):\n"
         "    total = 0\n"
@@ -103,16 +103,16 @@ TEST(regr_verifier_after_polyhedral_optin) {
     if (!ok) return;
 
     vortex_test::VerifierScope vs;
+    // Default PassContext: polyhedral is ON by default, no opt-out flag set.
     passes::PassContext ctx;
     ctx.tier = passes::TierMode::Tier2;
-    ctx.options.set(passes::OptOption::Polyhedral);
     passes::OptPipeline pipeline;
     Result<void> r = passes::run_pipeline(g, ctx, pipeline);
     CHECK(r.has_value());
     if (!r) return;
     if (!vs.empty()) {
         std::fprintf(stderr,
-                     "  [verifier] polyhedral opt-in produced %zu failures:\n",
+                     "  [verifier] polyhedral default-on produced %zu failures:\n",
                      vs.size());
         for (const std::string& msg : vs.fails.msgs) {
             std::fprintf(stderr, "    %s\n", msg.c_str());

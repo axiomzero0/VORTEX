@@ -75,25 +75,35 @@ using OptPipeline = std::tuple<
     P51_GlobalDCE>;
 
 /// Budget-aware tier filter. Two independent gates:
-///   1. OPT-IN gate (all tiers): passes flagged OptOption in the spec only
-///      run when the caller explicitly requested them. Polyhedral
-///      (33) is the canonical example — heavy, profile-dependent, off by
-///      default in every tier.
-///   2. TIER gate: Tier 1 runs only the linear-time subset.
+///   1. OPT-OUT gate (all tiers): passes flagged OptOption in the spec only
+///      SKIP when the caller explicitly opted out. Polyhedral (33) is the
+///      canonical example — DEFAULT-ON, opt-out only via
+///      OptOption::DisablePolyhedral. The only legitimate reason to opt
+///      out is compilation-time sensitivity (see pass header for the full
+///      rationale).
+///   2. TIER gate: Tier 1 runs only the linear-time subset. Tier 1 still
+///      gets polyhedral — it's linear in N — UNLESS the budget gate also
+///      fires (the Tier 1 linear-time list below excludes polyhedral
+///      alongside the other non-linear analyses).
 struct TierFilter {
     TierMode tier{TierMode::Tier1};
     explicit TierFilter(TierMode t) noexcept : tier(t) {}
     TierFilter() = default;
     [[nodiscard]] bool include(const char* pass_name, const PassContext& ctx) const noexcept {
         std::string_view n(pass_name);
-        // Opt-in optimizations: never run unless requested (all tiers).
-        if (n == "33_polyhedral" && !ctx.options.has(OptOption::Polyhedral)) {
+        // Opt-out optimizations: skip when the caller explicitly disabled.
+        // Polyhedral is DEFAULT-ON — set OptOption::DisablePolyhedral to
+        // skip it (the only legitimate reason: compilation-time).
+        if (n == "33_polyhedral" && ctx.options.has(OptOption::DisablePolyhedral)) {
             return false;
         }
         if (tier != TierMode::Tier1) return true;
         // Tier 1 (budget-constrained baseline): cheap passes only. The
         // fixpoint-heavy analyses and all speculation defer to Tier 2/3 —
-        // each pass additionally self-gates on the tier mode.
+        // each pass additionally self-gates on the tier mode. NOTE:
+        // polyhedral is O(N + L + ΣA·D) — linear in N for bounded D — but
+        // it's still a fixpoint-heavy analysis that we defer in Tier 1 to
+        // keep the baseline JIT's compile time bounded.
         return n != "08_sccp" && n != "10_early_gvn" && n != "11_andersen" &&
                n != "12_cfl_alias" && n != "14_demand_alias" && n != "16_ic_mono" &&
                n != "20_spec_inline" && n != "21_partial_inline" &&

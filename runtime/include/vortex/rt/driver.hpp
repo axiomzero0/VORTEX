@@ -15,12 +15,17 @@ namespace vortex::rt {
 
 inline namespace abi_v1 {
 
-/// Compilation switches the CALLER controls (opt-in optimizations live
-/// here — default-constructed options run the conservative pipeline only).
+/// Compilation switches the CALLER controls. Default-ON optimizations
+/// live here as opt-OUT toggles — a default-constructed CompileOptions
+/// runs the FULL pipeline (polyhedral included). The only legitimate
+/// reason to set an opt-out flag here is compilation-time sensitivity
+/// (the polyhedral analysis is linear in N for bounded D, but non-
+/// trivial in absolute terms on hot-loop-heavy code).
 struct CompileOptions {
-    /// Pass 33 (polyhedral loop transforms). Opt-in by design: expensive
-    /// analysis, profile-dependent payoff. Maps to OptOption::Polyhedral.
-    bool polyhedral{false};
+    /// Pass 33 (polyhedral loop transforms). DEFAULT-ON. Maps to
+    /// OptOption::DisablePolyhedral when set. The only legitimate
+    /// reason to set this is compilation-time sensitivity.
+    bool disable_polyhedral{false};
 };
 
 struct CompileOutcome {

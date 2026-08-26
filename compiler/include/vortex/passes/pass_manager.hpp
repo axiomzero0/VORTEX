@@ -40,15 +40,22 @@ enum class TierMode : std::uint8_t {
     Tier3,   // AOT/static: proofs only, zero guards
 };
 
-/// Opt-in optimization switches (Rule 23: named, no magic booleans).
-/// These gate transforms whose cost/risk profile makes them WRONG to run
-/// by default — the pass must be explicitly requested. A flag set here is
-/// advisory to the pipeline filter AND self-checked by the pass itself
-/// (defense in depth: direct invocations are gated identically).
+/// Opt-out optimization switches (Rule 23: named, no magic booleans).
+///
+/// These gate transforms whose compile-time cost is high enough that the
+/// caller may want to skip them in compile-time-sensitive contexts. The
+/// pass is ON BY DEFAULT — setting the corresponding flag here opts OUT.
+/// A flag set here is advisory to the pipeline filter AND self-checked by
+/// the pass itself (defense in depth: direct invocations are gated
+/// identically).
 enum class OptOption : std::uint8_t {
     /// Pass 33 — polyhedral loop transforms (interchange/skew/tiling).
-    /// Heavy analysis with profile-dependent payoff: opt-in only.
-    Polyhedral = 1 << 0,
+    /// DEFAULT-ON. The only legitimate reason to set this flag is
+    /// compilation-time sensitivity on hot-loop-heavy code (the analysis
+    /// is O(N + L + ΣA·D) — linear for bounded D, non-trivial in
+    /// absolute terms). Maps to CompileOptions::disable_polyhedral in
+    /// the runtime driver.
+    DisablePolyhedral = 1 << 0,
 };
 
 /// Input evidence bundle per compilation (Rule 1's "multiple inputs").
@@ -58,7 +65,9 @@ struct PassContext {
     std::uint32_t code_unit_id{0};
     Telemetry* telemetry{nullptr};
 
-    /// Opt-in optimization switches — empty by default (Rule 23).
+    /// Opt-out optimization switches — empty by default (Rule 23).
+    /// Empty means "run all default-on passes". Setting a flag here
+    /// opts the corresponding pass OUT (the inverse of opt-in).
     Flags<OptOption> options{};
 
     /// Pointer to the module's cooked string-pool (Rule 5: pool bytes are

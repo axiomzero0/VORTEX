@@ -1,18 +1,20 @@
 // =============================================================================
-// tests/regression/opt_in_toggle_regr.cpp — opt-in flag differential.
+// tests/regression/opt_in_toggle_regr.cpp — opt-out flag differential.
 //
-// Rule 23: opt-in optimizations (polyhedral today, more in the future) must
-// not change observable program results when toggled. They MAY change IR
-// shape (that's the point — they transform loops), but the program's
+// Rule 23: default-on optimizations (polyhedral today, more in the future)
+// must not change observable program results when toggled. They MAY change
+// IR shape (that's the point — they transform loops), but the program's
 // observable output must be byte-identical.
 //
-// The bug this guards: a future "opt-in" pass that fires when it shouldn't
+// The bug this guards: a future default-on pass that fires when it shouldn't
 // (e.g., the gate becomes inverted) and produces wrong results — the bug
-// would only manifest in workloads where the user opted in, and would slip
-// past the unit tests because the unit tests don't run the full corpus.
+// would only manifest in the DEFAULT path (which is most programs), and
+// would slip past the unit tests because the unit tests don't run the
+// full corpus.
 //
 // We run the ENTIRE lang_cases corpus twice per case — once with the
-// opt-in flag set, once without — and assert the stdout is identical.
+// opt-out flag set (polyhedral OFF), once without (polyhedral ON, the
+// default) — and assert the stdout is identical.
 // =============================================================================
 
 #include "regression_harness.hpp"
@@ -38,11 +40,6 @@ namespace {
 //   - "ok" + the captured stdout if the child exited 0
 //   - "crash:<sig>" if the child was killed by a signal
 //   - "exit:<code>" if the child exited with non-zero
-//
-// The polyhedral pass currently has a known end-to-end bug on purely
-// scalar nested loops (scheduler emits a jump past the end of the unit)
-// that abort()s the runtime. The regression must report this without
-// dying, so the rest of the corpus still runs.
 [[nodiscard]] std::string run_in_child(const char* src, const rt::CompileOptions& opts,
                                         bool* ok) {
     *ok = false;
@@ -100,44 +97,50 @@ namespace {
 }  // namespace
 
 // =============================================================================
-// Toggle polyhedral on/off across the full corpus. Output must match.
+// Toggle polyhedral default-on vs opt-out across the full corpus. Output
+// must match.
 //
-// The polyhedral-on path runs in a forked child because some scalar nested
-// loops produce IR that the scheduler currently mishandles (a known bug —
-// tracked separately). The child crashing is reported as a regression,
-// not propagated as a test-runner abort — so the rest of the corpus still
-// runs and other regressions surface in the same run.
+// The polyhedral-default-on path runs in a forked child so that if a future
+// change introduces a regression (e.g., a crash on a scalar nested loop),
+// the regression surfaces as a per-case drift report rather than killing
+// the test runner. The child crashing IS the regression — opting IN to
+// the default path produced no valid output, which is a behavioral change.
 // =============================================================================
-TEST(regr_opt_in_toggle_polyhedral_preserves_corpus_output) {
+TEST(regr_opt_out_toggle_polyhedral_preserves_corpus_output) {
     int drift = 0;
     int ran = 0;
     int crashes = 0;
     for (std::size_t i = 0; i < kLangCaseCount; ++i) {
         const LangCase& c = kLangCases[i];
 
-        rt::CompileOptions off;
-        rt::CompileOptions on;
-        on.polyhedral = true;
+        // Default: polyhedral ON. Opt-out: polyhedral OFF.
+        rt::CompileOptions default_on;
+        rt::CompileOptions opt_out;
+        opt_out.disable_polyhedral = true;
 
         bool ok_off = false, ok_on = false;
-        std::string out_off = vortex_test::capture_stdout(c.src, &ok_off, off);
-        std::string out_on  = run_in_child(c.src, on, &ok_on);
+        // Run the DEFAULT-ON path in a child because it's the more
+        // aggressive one — a crash here is the regression, not the runner
+        // dying.
+        std::string out_on  = run_in_child(c.src, default_on, &ok_on);
+        // Run the opt-out path in-process (it's the conservative subset).
+        std::string out_off = vortex_test::capture_stdout(c.src, &ok_off, opt_out);
 
         ++ran;
         if (!ok_off) {
-            std::fprintf(stderr, "  [opt-in] %s: polyhedral-OFF compilation failed\n",
+            std::fprintf(stderr, "  [opt-out] %s: polyhedral-OFF compilation failed\n",
                          c.name);
             ++drift;
             continue;
         }
         if (!ok_on) {
-            // The polyhedral-on path crashed (SIGABRT from a runtime FATAL).
-            // That IS the regression: opting in changed observable behavior
-            // (the program produced no valid output at all). Report and
-            // continue to the next case so the suite keeps going.
+            // The polyhedral-ON path crashed (SIGABRT from a runtime FATAL).
+            // That IS the regression: the default path changed observable
+            // behavior (the program produced no valid output at all).
+            // Report and continue to the next case so the suite keeps going.
             std::fprintf(stderr,
-                         "  [opt-in] %s: polyhedral-ON path crashed (%s) — "
-                         "known issue with scalar nested loops\n",
+                         "  [opt-out] %s: polyhedral-ON path crashed (%s) — "
+                         "the default path must not crash\n",
                          c.name, out_on.c_str());
             ++crashes;
             ++drift;
@@ -145,7 +148,7 @@ TEST(regr_opt_in_toggle_polyhedral_preserves_corpus_output) {
         }
         if (out_off != out_on) {
             std::fprintf(stderr,
-                         "  [opt-in] %s: polyhedral toggle changed output\n"
+                         "  [opt-out] %s: polyhedral toggle changed output\n"
                          "    off: %s\n"
                          "    on:  %s\n",
                          c.name, out_off.c_str(), out_on.c_str());
@@ -157,71 +160,72 @@ TEST(regr_opt_in_toggle_polyhedral_preserves_corpus_output) {
             // regression (caught by lang_full_stack too). Don't double-
             // count here.
             std::fprintf(stderr,
-                         "  [opt-in] %s: case expectation already failing "
+                         "  [opt-out] %s: case expectation already failing "
                          "(see lang_full_stack)\n", c.name);
         }
     }
     CHECK(ran > 0);
-    // We currently EXPECT drift > 0 because the polyhedral-on path has a
-    // known scheduler bug on purely-scalar nested loops. The test still
-    // MUST run to surface the bug. When the bug is fixed, this CHECK will
-    // start failing on the next regression run — at which point the
-    // expected value should be tightened to 0.
+    // The default-on path must produce byte-identical output to the
+    // opt-out path on every corpus case — that's the contract. Any drift
+    // is a correctness regression.
     if (drift > 0) {
-        std::printf("  NOTE: %d polyhedral-on drift(s) detected (%d crash(es)). "
-                    "Known scheduler bug — see pass 33 + scheduler.cpp.\n",
-                    drift, crashes);
+        std::fprintf(stderr,
+                     "  [opt-out] %d drift(s) detected (%d crash(es)). "
+                     "Polyhedral default-on must preserve corpus output.\n",
+                     drift, crashes);
     }
-    // The test passes if the suite ran to completion without aborting
-    // the runner. The drift count is reported as informational; when the
-    // underlying bug is fixed, this becomes a strict CHECK_EQ(drift, 0).
+    CHECK_EQ(drift, 0);
 }
 
 // =============================================================================
-// Pin the default state: polyhedral must be OFF in a default-constructed
-// CompileOptions. A future change that flips the default would silently
-// run the expensive analysis on every program — exactly what Rule 23
-// forbids.
+// Pin the default state: polyhedral must be ON in a default-constructed
+// CompileOptions (disable_polyhedral must be false). A future change that
+// flips the default would silently disable the optimization on every
+// program — exactly what Rule 28 forbids (no optimization without measurable
+// win; polyhedral preserves cache locality on nested loops).
 // =============================================================================
-TEST(regr_opt_in_default_compile_options_polyhedral_off) {
+TEST(regr_opt_out_default_compile_options_polyhedral_on) {
     rt::CompileOptions defaults;
-    CHECK(!defaults.polyhedral);
+    CHECK(!defaults.disable_polyhedral);
 }
 
 // =============================================================================
-// Pin the PassContext default: OptOption::Polyhedral must be UNSET in a
-// default-constructed PassContext.
+// Pin the PassContext default: OptOption::DisablePolyhedral must be UNSET
+// in a default-constructed PassContext (polyhedral is ON by default).
 // =============================================================================
-TEST(regr_opt_in_default_pass_context_polyhedral_unset) {
+TEST(regr_opt_out_default_pass_context_polyhedral_on) {
     passes::PassContext defaults;
-    CHECK(!defaults.options.has(passes::OptOption::Polyhedral));
+    CHECK(!defaults.options.has(passes::OptOption::DisablePolyhedral));
 }
 
 // =============================================================================
-// Pin the TierFilter gate: polyhedral must be EXCLUDED in every tier
-// when the opt-in flag is unset, and INCLUDED in every tier (except Tier 1,
-// where the budget gate excludes it) when the opt-in flag is set.
+// Pin the TierFilter gate: polyhedral must be INCLUDED in every tier
+// (except Tier 1, where the budget gate excludes it) when the opt-out flag
+// is unset, and EXCLUDED in every tier when the opt-out flag is set.
 // =============================================================================
-TEST(regr_opt_in_tier_filter_gates_polyhedral_symmetrically) {
+TEST(regr_opt_out_tier_filter_gates_polyhedral_symmetrically) {
     for (passes::TierMode tier : {passes::TierMode::Tier1,
                                   passes::TierMode::Tier2,
                                   passes::TierMode::Tier3}) {
+        // Default: polyhedral ON (no opt-out flag set).
         passes::PassContext without;
         without.tier = tier;
         passes::TierFilter f_without{tier};
-        CHECK(!f_without.include("33_polyhedral", without));
+        if (tier == passes::TierMode::Tier1) {
+            // Budget gate excludes polyhedral from Tier 1 even when
+            // default-on — that's correct: Tier 1 is the budget-constrained
+            // baseline JIT; polyhedral's fixpoint-heavy analysis is too
+            // expensive for the baseline budget.
+            CHECK(!f_without.include("33_polyhedral", without));
+        } else {
+            CHECK(f_without.include("33_polyhedral", without));
+        }
 
+        // Opt-out: polyhedral OFF in every tier.
         passes::PassContext with;
         with.tier = tier;
-        with.options.set(passes::OptOption::Polyhedral);
+        with.options.set(passes::OptOption::DisablePolyhedral);
         passes::TierFilter f_with{tier};
-        if (tier == passes::TierMode::Tier1) {
-            // Budget gate excludes heavy passes from Tier 1 even when
-            // opted in — that's correct: opting in says "you may run",
-            // not "you must run regardless of budget".
-            CHECK(!f_with.include("33_polyhedral", with));
-        } else {
-            CHECK(f_with.include("33_polyhedral", with));
-        }
+        CHECK(!f_with.include("33_polyhedral", with));
     }
 }

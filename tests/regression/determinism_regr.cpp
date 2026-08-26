@@ -97,12 +97,12 @@ TEST(regr_pipeline_determinism_tier1) {
 }
 
 // =============================================================================
-// Determinism on polyhedral-optin path: the swap transformation must be
+// Determinism on polyhedral default-on path: the swap transformation must be
 // deterministic — same input, same swap. A non-deterministic legality
 // check (e.g. iterating a hash set of access sites) would produce
 // different IR across runs.
 // =============================================================================
-TEST(regr_pipeline_determinism_polyhedral_optin) {
+TEST(regr_pipeline_determinism_polyhedral_default_on) {
     static const char* kSrc =
         "def f(a):\n"
         "    total = 0\n"
@@ -122,8 +122,9 @@ TEST(regr_pipeline_determinism_polyhedral_optin) {
     CHECK(ok2);
     if (!ok1 || !ok2) return;
 
+    // No opt-out flag set: polyhedral runs by default. The transformation
+    // must be deterministic across runs.
     Flags<passes::OptOption> opts;
-    opts.set(passes::OptOption::Polyhedral);
 
     bool r1 = vortex_test::run_full_pipeline(g1, passes::TierMode::Tier2, opts);
     bool r2 = vortex_test::run_full_pipeline(g2, passes::TierMode::Tier2, opts);

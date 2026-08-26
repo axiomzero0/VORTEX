@@ -285,65 +285,70 @@ TEST(codegen_refuses_foreign_architecture) {
     }
 }
 
-// --- polyhedral opt-in -------------------------------------------------------------
+// --- polyhedral default-on / opt-out ---------------------------------------------
 
 TEST(polyhedral_pipeline_gate) {
-    // Tier 2, no opt-in: excluded.
+    // Tier 2, no opt-out: polyhedral is DEFAULT-ON — included.
     passes::PassContext ctx;
     ctx.tier = passes::TierMode::Tier2;
     passes::TierFilter f2{ctx.tier};
-    CHECK(!f2.include("33_polyhedral", ctx));
+    CHECK(f2.include("33_polyhedral", ctx));
     CHECK(f2.include("03_trivial_dce", ctx));
 
-    // Tier 2, opted in: included.
-    ctx.options.set(passes::OptOption::Polyhedral);
-    CHECK(f2.include("33_polyhedral", ctx));
+    // Tier 2, opted out via DisablePolyhedral: excluded.
+    ctx.options.set(passes::OptOption::DisablePolyhedral);
+    CHECK(!f2.include("33_polyhedral", ctx));
 
-    // Tier 1: budget gate excludes it even when opted in.
+    // Tier 1: budget gate excludes polyhedral regardless of opt-out (it's
+    // already off in Tier 1 by budget, not by opt-out). Opting out is a
+    // no-op in Tier 1 — but a default-on pass must NOT suddenly appear
+    // in Tier 1 just because the user didn't opt out.
     passes::PassContext t1;
     t1.tier = passes::TierMode::Tier1;
-    t1.options.set(passes::OptOption::Polyhedral);
     passes::TierFilter f1{t1.tier};
-    CHECK(!f1.include("33_polyhedral", t1));
+    CHECK(!f1.include("33_polyhedral", t1));   // budget gate excludes
+    t1.options.set(passes::OptOption::DisablePolyhedral);
+    CHECK(!f1.include("33_polyhedral", t1));   // still excluded
 
-    // Tier 3 honors the opt-in flag symmetrically.
+    // Tier 3: polyhedral is DEFAULT-ON; opt-out excludes it.
     passes::PassContext t3;
     t3.tier = passes::TierMode::Tier3;
     passes::TierFilter f3{t3.tier};
-    CHECK(!f3.include("33_polyhedral", t3));
-    t3.options.set(passes::OptOption::Polyhedral);
     CHECK(f3.include("33_polyhedral", t3));
+    t3.options.set(passes::OptOption::DisablePolyhedral);
+    CHECK(!f3.include("33_polyhedral", t3));
 }
 
 TEST(polyhedral_pass_self_gate) {
-    // Gate 2 (defense in depth): direct invocation without the flag is a
-    // no-op even though the graph is a perfect interchange candidate.
+    // Gate 2 (defense in depth): direct invocation WITH the opt-out flag
+    // is a no-op even though the graph is a perfect interchange candidate.
     bool ok = false;
     Graph g = lower_nested_loops(&ok);
     CHECK(ok);
     if (!ok) return;
 
-    // Snapshot the loop structure before any opt-in: both Loops' (entry,
+    // Snapshot the loop structure before any run: both Loops' (entry,
     // backedge) pairs. The opt-out run must not touch either.
     LoopSnapshot before = snapshot_loops(g);
 
     passes::PassContext off;
-    off.tier = passes::TierMode::Tier2;   // tier alone must NOT enable it
+    off.tier = passes::TierMode::Tier2;
+    off.options.set(passes::OptOption::DisablePolyhedral);
     passes::P33_PolyhedralOptimization p33;
     Result<passes::PassResult> r_off = p33.run(g, off);
     CHECK(r_off.has_value());
-    CHECK(!r_off->changed);                 // opt-out: pass reports no change
+    CHECK(!r_off->changed);                 // opted out: pass reports no change
     CHECK(loops_unchanged(before, snapshot_loops(g)));  // and the IR is unchanged
 
-    // Opted in: the analysis runs and ACTUALLY swaps the two Loop nodes'
-    // control-input arrays — the IR is observably different, not just a
-    // hint bit on a header that nothing reads.
+    // Default-on (no opt-out flag set): the analysis runs and ACTUALLY
+    // swaps the two Loop nodes' control-input arrays — the IR is
+    // observably different, not just a hint bit on a header that nothing
+    // reads.
     passes::PassContext on;
     on.tier = passes::TierMode::Tier2;
-    on.options.set(passes::OptOption::Polyhedral);
     Result<passes::PassResult> r_on = p33.run(g, on);
     CHECK(r_on.has_value());
-    CHECK(r_on->changed);                   // opted in: real transformation
+    CHECK(r_on->changed);                   // default-on: real transformation
     CHECK(!loops_unchanged(before, snapshot_loops(g)));  // IR was rewritten
 
     // After the swap, exactly one Loop node has its entry edge coming from
@@ -371,9 +376,9 @@ TEST(polyhedral_interchange_preserves_outermost_loop_count) {
         if (g.node(id).kind == NodeKind::Loop) ++loops_before;
     });
 
+    // Default-on: polyhedral runs without needing an opt-in flag.
     passes::PassContext on;
     on.tier = passes::TierMode::Tier2;
-    on.options.set(passes::OptOption::Polyhedral);
     passes::P33_PolyhedralOptimization p33;
     Result<passes::PassResult> r = p33.run(g, on);
     CHECK(r.has_value());
@@ -422,16 +427,18 @@ TEST(polyhedral_end_to_end_differential) {
 
     bool ok1 = false, ok2 = false;
     std::string out1, out2;
-    rt::CompileOptions off;             // default: polyhedral NOT requested
-    rt::CompileOptions on;
-    on.polyhedral = true;
+    rt::CompileOptions off;             // default: polyhedral ON
+    rt::CompileOptions on;              // explicit opt-out: polyhedral OFF
+    on.disable_polyhedral = true;
 
     run(off, &ok1, &out1);
     run(on, &ok2, &out2);
 
     CHECK(ok1);
     CHECK(ok2);
-    // 3 outer x (1+2+3) = 18; opting in must not change observable results.
+    // 3 outer x (1+2+3) = 18; polyhedral interchange must preserve
+    // observable results (the iteration space is unchanged, only the
+    // traversal order flips).
     CHECK_EQ(out1, std::string("18\n"));
     CHECK_EQ(out2, out1);
 }

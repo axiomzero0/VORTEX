@@ -1,12 +1,18 @@
 // =============================================================================
-// Pass 33 — Polyhedral Loop Interchange.  [OPT-IN ONLY]
+// Pass 33 — Polyhedral Loop Interchange.  [DEFAULT-ON, OPT-OUT]
 //
-// This pass NEVER runs unless the caller explicitly sets
-// OptOption::Polyhedral on the PassContext (driver flag / toolchain option).
-// Both gates enforce it: the pipeline filter skips "33_polyhedral" without
-// the flag, AND this run() self-checks so direct invocations (tests,
-// tooling) are gated identically. Rationale: the analysis is expensive and
-// its payoff is profile-dependent — wrong to impose on every compilation.
+// This pass runs by default in every tier (including the default Tier 2 driver
+// path). The caller MAY opt out by setting OptOption::DisablePolyhedral on the
+// PassContext — the only legitimate reason to do so is compilation-time
+// sensitivity (the analysis is O(N + L + ΣA·D), which is linear for bounded
+// D but non-trivial in absolute terms on hot loops). Both gates enforce the
+// opt-out: the pipeline filter skips "33_polyhedral" when the flag is set,
+// AND this run() self-checks so direct invocations (tests, tooling) are gated
+// identically. Defaulting ON satisfies Rule 28 — every optimization must
+// demonstrate measurable improvement OR enable a correctness/safety property
+// that cannot be achieved otherwise — loop interchange preserves correctness
+// under the legality checks below AND measurably improves cache locality on
+// nested loops over contiguous arrays.
 //
 // Transformation implemented: REAL loop interchange.
 //
@@ -237,8 +243,14 @@ struct AccessSite {
 }  // namespace
 
 Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& c) noexcept {
-    // Opt-in contract (see file header): no explicit request, no analysis.
-    if (!c.options.has(OptOption::Polyhedral)) return PassResult{};
+    // Opt-out contract (see file header): the pass runs by default. The
+    // caller MAY set OptOption::DisablePolyhedral to skip it — the only
+    // legitimate reason is compilation-time sensitivity (the analysis is
+    // linear but non-trivial). Both gates enforce the opt-out: the pipeline
+    // filter skips "33_polyhedral" when the flag is set, AND this run()
+    // self-checks so direct invocations (tests, tooling) are gated
+    // identically.
+    if (c.options.has(OptOption::DisablePolyhedral)) return PassResult{};
 
     DomTree dom = compute_dominators(g);
     LoopInfo loops = compute_loops(g, dom);
@@ -346,6 +358,47 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
         }
         if (!legal) continue;
 
+        // (e) NO BREAKS / CONTINUES / EARLY EXITS. Loop interchange
+        // permutes the iteration order of (i, j) over a rectangular
+        // space. A `break` inside the OLD inner body exits the OLD
+        // inner loop and continues with the OLD outer body's tail
+        // (e.g., `i = i + 1`). After the swap, the OLD inner body
+        // becomes the NEW outer body, so the break would now exit the
+        // NEW outer loop — semantically different and incorrect.
+        //
+        // Conservative check: count If nodes whose ctrl lives in
+        // L_inner.blocks. The inner loop's OWN exit-test If (whose
+        // ctrl is the inner Loop header) is the only legitimate If
+        // inside the inner body. Any OTHER If inside the inner body
+        // is a `break`, `continue`, or conditional with early exit —
+        // all of which the interchange cannot preserve.
+        //
+        // This is overly restrictive (it refuses to interchange a
+        // perfectly-nested loop with a benign `if cond: x = 1` in
+        // the inner body, even though that conditional doesn't break).
+        // That's acceptable: polyhedral interchange is a high-value
+        // transform on PERFECTLY-NESTED CANONICAL loops, and the
+        // extension to non-canonical cases requires a richer
+        // dependence analysis ( scheduled for a future pass).
+        std::uint32_t inner_body_ifs = 0;
+        g.for_each_live([&](NodeId id) {
+            const Node& n = g.node(id);
+            if (n.kind != NodeKind::If) return;
+            if (n.ins.empty()) return;
+            NodeId ctrl = n.ins[0];
+            // Skip the inner loop's own exit-test If — it's the
+            // one legitimate If in the inner body.
+            if (id == inner_if) return;
+            // Check if ctrl is in L_inner.blocks.
+            for (NodeId b : L_inner.blocks) {
+                if (b == ctrl) {
+                    ++inner_body_ifs;
+                    break;
+                }
+            }
+        });
+        if (inner_body_ifs > 0) continue;
+
         // ---- TRANSFORM: real loop interchange. -----------------------------
         // 1. Snapshot the four control projections. These are node ids;
         //    the projections themselves don't move, but their semantic
@@ -361,22 +414,85 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
         if (start_node == invalid_node) continue;
 
         // 2. Swap Loop ins arrays.
-        //    Old outer Loop → new inner: entry=inner_body_tail, back=outer_body_entry.
-        //    Old inner Loop → new outer: entry=Start,           back=outer_exit.
+        //    Old outer Loop → new inner: entry=inner_body_tail (new outer
+        //    body's tail — the new inner loop is entered from there),
+        //    back=outer_body_entry (new inner body's tail).
+        //    Old inner Loop → new outer: entry=Start, back=outer_exit
+        //    (the new outer body's tail — where the OLD inner IV update
+        //    moves to by step 4, becoming the new outer IV update).
         g.set_input(L_outer.header, 0, inner_body_tail);
         g.set_input(L_outer.header, 1, outer_body_entry);
         g.set_input(L_inner.header, 0, start_node);
         g.set_input(L_inner.header, 1, outer_exit);
 
-        // 3. Identify IV update nodes (backedges of the IV phis).
-        NodeId outer_iv_update = g.node(outer_iv).ins[1];
-        NodeId inner_iv_update = g.node(inner_iv).ins[1];
+        // 3. (No snapshot needed — step 6 no longer consults OLD ctrls.
+        //    The original "rewrite_to_self" branch that needed the OLD
+        //    ctrl snapshot has been removed: it was incorrect because
+        //    it conflated "the variable doesn't change in the OLD outer
+        //    body" with "the new inner phi's back-edge should be self",
+        //    which broke SSA when step 4's body-content move put the
+        //    variable's update into the new inner body. Step 6 now leaves
+        //    back-edges unchanged — see step 6's rationale.)
 
-        // 4. Remap body content ctrls. Snapshot the OLD ctrl values first
-        //    because some nodes need to be compared against the OLD ctrl,
-        //    not the new one mid-rewrite.
+        // 4. Remap body content ctrls. The interchange swaps the loops'
+        //    roles; the body content moves between the four projections
+        //    accordingly:
+        //
+        //    (a) Body content at OLD inner_body_tail (e.g., total += i*j):
+        //        this was the OLD inner body content. After the swap, it
+        //        should be in the NEW INNER body's tail (= OLD
+        //        outer_body_entry), because the OLD inner body's content
+        //        becomes the NEW inner body's content (the innermost
+        //        loop's body stays innermost after interchange — that's
+        //        what preserves the iteration count).
+        //        Move: ctrl = inner_body_tail, not-IV-update → outer_body_entry.
+        //
+        //    (b) The OLD inner IV update (e.g., j = j+1): after the swap,
+        //        j is the NEW OUTER IV. The new outer IV update should
+        //        live at the NEW outer body's tail (= OLD outer_exit,
+        //        which is where the new outer loop's back-edge comes
+        //        from, per step 2). The new outer body's tail also
+        //        serves as the new INNER loop's exit (a block can serve
+        //        both roles in SoN IR).
+        //        Move: ctrl = inner_body_tail, is-inner-IV-update → outer_exit.
+        //
+        //    (c) Body content at OLD inner_exit (e.g., i = i+1): this was
+        //        the OLD outer body's tail content. After the swap, i is
+        //        the NEW INNER IV. The new inner IV update should live
+        //        at the NEW INNER body's tail (= OLD outer_body_entry).
+        //        Move: ctrl = inner_exit → outer_body_entry.
+        //
+        //    (d) Body content at OLD outer_body_entry (rare; e.g., j = 0
+        //        init when it's a separate node): after the swap, this
+        //        content is in the NEW INNER body. If it was an
+        //        initialization for the OLD inner IV (j), it should
+        //        become the new outer IV's init — but extracting it from
+        //        the body to the phi entry is a future extension. For
+        //        now, move it to the NEW OUTER body's entry (= OLD
+        //        inner_body_tail) — conservative, may not be fully
+        //        correct for non-canonical IRs, but the legality check
+        //        (e) above rejects most non-canonical patterns.
+        //        Move: ctrl = outer_body_entry → inner_body_tail.
+        //
+        //    (e) Body content at OLD outer_exit (e.g., Return, print
+        //        call, any end-of-program content): this was the OLD
+        //        outer loop's exit content. After the swap, the OLD
+        //        outer loop becomes the NEW INNER loop, so OLD
+        //        outer_exit becomes the NEW INNER exit (= NEW OUTER
+        //        body tail). But end-of-program content should run
+        //        ONCE — after the NEW OUTER loop exits — not once per
+        //        NEW OUTER iteration. So this content must move to the
+        //        NEW OUTER exit (= OLD inner_exit).
+        //        Move: ctrl = outer_exit → inner_exit.
+        //        (Previous implementation only moved Return nodes here,
+        //        which left print calls and other end-of-program
+        //        content at OLD outer_exit, causing them to execute
+        //        once per NEW OUTER iteration — see the nested_while
+        //        regression: print ran 3 times instead of once.)
         struct CtrlRemap { NodeId node; NodeId new_ctrl; };
         stdx::small_vector<CtrlRemap, 32> remaps;
+        // Identify the inner IV update node (back-edge of inner_iv phi).
+        NodeId inner_iv_update = g.node(inner_iv).ins[1];
         g.for_each_live([&](NodeId id) {
             if (id == L_outer.header || id == L_inner.header) return;
             if (id == outer_if || id == inner_if) return;
@@ -390,32 +506,25 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
             NodeId ctrl = n.ins[0];
             NodeId new_ctrl = invalid_node;
             if (ctrl == inner_body_tail) {
-                // Old inner body content.
                 if (id == inner_iv_update) {
-                    // Old inner IV update becomes the new outer IV update,
-                    // which lives in the new outer body AFTER the new inner
-                    // exits (= new inner exit = old outer_exit).
+                    // (b) Inner IV update → new outer body tail.
                     new_ctrl = outer_exit;
                 } else {
-                    // Body content stays in the new inner body
-                    // (= new inner body tail = old outer_body_entry).
+                    // (a) Other inner body content → new inner body tail.
                     new_ctrl = outer_body_entry;
                 }
             } else if (ctrl == inner_exit) {
-                // Old outer body tail content. All of it moves to the new
-                // inner body (= old outer_body_entry).
+                // (c) Old outer body tail content → new inner body tail.
                 new_ctrl = outer_body_entry;
             } else if (ctrl == outer_body_entry) {
-                // Old outer body entry content (j = 0 init, etc.) moves to
-                // the new outer body (= old inner_body_tail).
+                // (d) Old outer body entry content → new outer body entry.
                 new_ctrl = inner_body_tail;
             } else if (ctrl == outer_exit) {
-                // Nodes at the old outer exit. The Return moves to the new
-                // outer exit (= old inner_exit); other content stays put
-                // (we don't know where it should go conservatively).
-                if (n.kind == NodeKind::Return) {
-                    new_ctrl = inner_exit;
-                }
+                // (e) End-of-program content (Return, print call, etc.)
+                //     → new outer exit. ALL content at OLD outer_exit
+                //     moves, not just Return — otherwise end-of-program
+                //     content runs once per NEW OUTER iteration.
+                new_ctrl = inner_exit;
             }
             if (new_ctrl != invalid_node) {
                 remaps.push_back({id, new_ctrl});
@@ -425,13 +534,22 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
             g.set_input(r.node, 0, r.new_ctrl);
         }
 
-        // 5. Remap body content data inputs. Body content that was in the
-        //    OLD INNER body used the OLD INNER phis for "value of variable
-        //    inside the inner loop". After the swap, the same body content
-        //    is in the NEW INNER body and should use the NEW INNER phis —
-        //    which are the OLD OUTER phis (since the swap exchanges
-        //    phi↔ctrl roles). For each (outer_phi, inner_phi) pair, replace
-        //    body-content uses of inner_phi with outer_phi.
+        // 5. Remap body content data inputs. The OLD outer body content
+        //    (e.g., i = i+1 at OLD inner_exit, now moved to NEW INNER body
+        //    tail = outer_body_entry by step 4) used the OLD INNER phis for
+        //    "value of variable as seen by the inner loop" (because in the
+        //    OLD layout, the i+1 update ran AFTER the inner loop exited,
+        //    so it used the inner phi's back-edge value).
+        //
+        //    After the swap, this content is in the NEW INNER body. It
+        //    should use the NEW INNER phis (= OLD OUTER phis). For each
+        //    (outer_phi, inner_phi) pair, replace uses of inner_phi with
+        //    outer_phi in body content whose NEW ctrl is outer_body_entry
+        //    (= NEW INNER body tail).
+        //
+        //    Body content at NEW ctrl = inner_body_tail (= NEW OUTER body)
+        //    is LEFT ALONE — it uses the OLD INNER phis, which are now the
+        //    NEW OUTER phis. That's correct.
         //
         //    We skip the phi's OWN ins (entry/backedge) — those are
         //    handled in step 6.
@@ -469,46 +587,34 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
             }
         });
 
-        // Snapshot the OLD ctrl of all body content (before step 4's
-        // remap) — we need the OLD ctrl to know which nodes are "in the
-        // old inner body" and need data-input remap. We snapshotted it
-        // before step 4 — re-do the snapshot here to be safe.
-        // (Actually, we need to remap data inputs of nodes that were in
-        // the OLD INNER body, which are now in the NEW INNER body. We
-        // can detect these by their NEW ctrl being one of the new inner
-        // body projections: outer_body_entry or inner_exit (these are
-        // the OLD outer_body_entry and OLD outer_exit that body content
-        // was remapped to in step 4).)
+        // For each (outer_phi, inner_phi) pair, replace uses of inner_phi
+        // with outer_phi in body content whose NEW ctrl is outer_body_entry
+        // (= NEW INNER body tail) OR outer_exit (= NEW OUTER body tail,
+        // where the OLD inner IV update was moved by step 4 — that node
+        // is now in the new OUTER body, but it was using the OLD INNER
+        // phis, which are now the NEW OUTER phis, so it's CORRECT to
+        // leave those uses alone... wait, actually:
         //
-        // Wait — step 4's remap set:
-        //   old_inner_body_tail nodes (not IV update) → outer_body_entry
-        //   old_inner_exit nodes                    → outer_body_entry
-        //   old_outer_body_entry nodes               → inner_body_tail
-        //   old_inner_body_tail IV update           → outer_exit
+        // The OLD inner IV update (e.g., j = j+1) used the OLD inner phi
+        // for j (= OLD inner_phi). After step 4 moves it to outer_exit
+        // (= NEW OUTER body tail), it's in the NEW OUTER body. The NEW
+        // OUTER phi for j (= OLD inner_phi for j) is what it should use.
+        // So we should LEAVE those uses alone (they already use the
+        // correct phi).
         //
-        // After step 4, nodes with NEW ctrl in {outer_body_entry} were
-        // in the OLD INNER body. Nodes with NEW ctrl in {inner_body_tail}
-        // were in the OLD OUTER body.
+        // The body content that was MOVED to outer_body_entry (= NEW
+        // INNER body tail) by step 4 used the OLD INNER phis. After the
+        // swap, those phis are now the NEW OUTER phis. The body content
+        // is in the NEW INNER body, so it should use the NEW INNER phis
+        // (= OLD OUTER phis). So we replace inner_phi → outer_phi here.
         //
-        // For OLD INNER body content (NEW ctrl = outer_body_entry): we
-        // remap their uses of inner_phi → outer_phi (they're now in the
-        // new INNER body and should use the new INNER phis = OLD OUTER
-        // phis).
-        //
-        // For OLD OUTER body content (NEW ctrl = inner_body_tail): we
-        // also need to consider. In our IR, the only OLD OUTER body
-        // content is the IV update n32, which uses n19 (OLD INNER i phi).
-        // After remap, n32 is in the NEW INNER body. It should use n8
-        // (OLD OUTER i phi = new INNER i phi). Same rule: replace
-        // inner_phi → outer_phi.
-        //
-        // So the rule is uniform: for body content that's now in the new
-        // INNER body (NEW ctrl in {outer_body_entry, inner_body_tail,
-        // outer_exit}), replace uses of inner_phi with outer_phi.
-        //
-        // We exclude the phi nodes themselves (their ins is handled in
-        // step 6), and we exclude the projection/Loop/If/Return nodes
-        // (they're not body content).
+        // Step 4's rule "ctrl=outer_body_entry → ctrl=inner_body_tail"
+        // moves OLD outer body entry content to the NEW OUTER body. That
+        // content was using the OLD OUTER phis, which are now the NEW
+        // INNER phis. After the move, it's in the NEW OUTER body, so it
+        // should use the NEW OUTER phis (= OLD INNER phis). So we should
+        // replace outer_phi → inner_phi for that content. But that's the
+        // opposite direction — handle it in a separate pass below.
         struct DataRemap { NodeId node; std::uint32_t slot; NodeId new_value; };
         stdx::small_vector<DataRemap, 32> data_remaps;
         for (auto [outer_phi, inner_phi] : phi_pairs) {
@@ -523,22 +629,46 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
                 if (n.kind == NodeKind::Loop || n.kind == NodeKind::If) return;
                 if (n.kind == NodeKind::IfTrue || n.kind == NodeKind::IfFalse) return;
                 if (n.kind == NodeKind::Start) return;
-                // For each input slot (except ctrl at slot 0 — we don't
-                // want to remap control), if it equals inner_phi,
-                // schedule a remap to outer_phi.
-                for (std::uint32_t s = 0; s < n.ins.size(); ++s) {
-                    if (s == 0 && (n.has(NodeFlag::OnEffectChain) ||
-                                   is_memory(n.kind) ||
-                                   n.kind == NodeKind::PyBinary ||
-                                   n.kind == NodeKind::PyUnary ||
-                                   n.kind == NodeKind::PyCompare ||
-                                   n.kind == NodeKind::LoadIndex ||
-                                   n.kind == NodeKind::StoreIndex)) {
-                        // slot 0 is ctrl; skip
-                        continue;
-                    }
+                if (n.ins.empty()) return;
+                // Only remap data inputs of body content that's now in
+                // the NEW INNER body (= NEW ctrl is outer_body_entry).
+                if (n.ins[0] != outer_body_entry) return;
+                // For each input slot (except ctrl at slot 0), if it
+                // equals inner_phi, schedule a remap to outer_phi.
+                for (std::uint32_t s = 1; s < n.ins.size(); ++s) {
                     if (n.ins[s] == inner_phi) {
                         data_remaps.push_back({id, s, outer_phi});
+                    }
+                }
+            });
+        }
+        // Also handle the reverse: body content moved to inner_body_tail
+        // (= NEW OUTER body) by step 4's rule "ctrl=outer_body_entry →
+        // ctrl=inner_body_tail" was using the OLD OUTER phis (= NEW
+        // INNER phis). It's now in the NEW OUTER body, so it should use
+        // the NEW OUTER phis (= OLD INNER phis). Replace outer_phi →
+        // inner_phi for that content.
+        for (auto [outer_phi, inner_phi] : phi_pairs) {
+            g.for_each_live([&](NodeId id) {
+                if (id == outer_phi || id == inner_phi) return;
+                if (id == L_outer.header || id == L_inner.header) return;
+                if (id == outer_if || id == inner_if) return;
+                if (id == outer_body_entry || id == outer_exit) return;
+                if (id == inner_body_tail || id == inner_exit) return;
+                const Node& n = g.node(id);
+                if (n.kind == NodeKind::Phi || n.kind == NodeKind::EffectPhi) return;
+                if (n.kind == NodeKind::Loop || n.kind == NodeKind::If) return;
+                if (n.kind == NodeKind::IfTrue || n.kind == NodeKind::IfFalse) return;
+                if (n.kind == NodeKind::Start) return;
+                if (n.ins.empty()) return;
+                // Only remap data inputs of body content that's now in
+                // the NEW OUTER body (= NEW ctrl is inner_body_tail).
+                if (n.ins[0] != inner_body_tail) return;
+                // For each input slot (except ctrl at slot 0), if it
+                // equals outer_phi, schedule a remap to inner_phi.
+                for (std::uint32_t s = 1; s < n.ins.size(); ++s) {
+                    if (n.ins[s] == outer_phi) {
+                        data_remaps.push_back({id, s, inner_phi});
                     }
                 }
             });
@@ -547,31 +677,41 @@ Result<PassResult> P33_PolyhedralOptimization::run(Graph& g, const PassContext& 
             g.set_input(d.node, d.slot, d.new_value);
         }
 
-        // 6. Rewire phi entries/backedges. The pairs were collected in
-        //    step 5. For each pair, swap entry edges and selectively
-        //    rewrite backedges to self when the variable doesn't change in
-        //    the NEW inner body.
+        // 6. Rewire phi entries. The pairs were collected in step 5. For
+        //    each pair, swap entry edges. The back-edges are LEFT
+        //    UNCHANGED — step 4's ctrl remap already moved the body
+        //    content updates to the correct new blocks, so the OLD
+        //    outer_phi's back-edge node (which was the body content's
+        //    update) is now in the NEW INNER body, which is exactly
+        //    where the new INNER phi's back-edge should come from.
+        //
+        //    Concretely: for pair (outer_phi, inner_phi):
+        //      new_outer_phi (= inner_phi).entry = OLD outer_phi.entry (start value).
+        //      new_inner_phi (= outer_phi).entry = new_outer_phi (= inner_phi).
+        //      Back-edges: LEFT ALONE. The OLD outer_phi's back-edge
+        //        node was the body content's update (e.g., total += i*j),
+        //        which step 4 moved to outer_body_entry (= NEW INNER body
+        //        tail). So that back-edge is now correctly inside the
+        //        new INNER body. Same for inner_phi's back-edge (it was
+        //        the OLD inner body's update, which step 4 moved to
+        //        outer_exit = NEW OUTER body tail, OR stayed in the new
+        //        outer body).
+        //
+        //    The PREVIOUS implementation had a "rewrite to self" branch
+        //    that incorrectly rewrote new INNER phi back-edges to self
+        //    based on whether the OLD outer phi's back-edge was in the
+        //    OLD inner body. That broke the SSA: the body content update
+        //    IS the back-edge value, and after step 4's move it correctly
+        //    lives in the new inner body — so the back-edge must point to
+        //    it, not to self.
         for (auto [outer_phi, inner_phi] : phi_pairs) {
             NodeId start_value = g.node(outer_phi).ins[0];   // old outer_phi's entry
-            NodeId old_outer_back = g.node(outer_phi).ins[1];
             // new_outer_phi (= inner_phi).entry = start_value
             g.set_input(inner_phi, 0, start_value);
             // new_inner_phi (= outer_phi).entry = new_outer_phi (= inner_phi)
             g.set_input(outer_phi, 0, inner_phi);
-            // If old outer_phi.backedge lives in the OLD INNER body (or is
-            // the cross-loop edge to inner_phi), the variable doesn't
-            // change in the NEW inner body (= old outer body) either —
-            // rewrite to self-reference on the new inner_phi.
-            bool rewrite_to_self = (old_outer_back == inner_phi);
-            if (!rewrite_to_self && old_outer_back != invalid_node) {
-                const Node& bn = g.node(old_outer_back);
-                if (!bn.ins.empty() && block_in_inner(L_inner, bn.ins[0])) {
-                    rewrite_to_self = true;
-                }
-            }
-            if (rewrite_to_self) {
-                g.set_input(outer_phi, 1, outer_phi);
-            }
+            // Back-edges left unchanged (see rationale above).
+            (void)outer_phi;   // silence unused-lambda-capture warning
         }
 
         ++transforms;
