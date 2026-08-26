@@ -259,6 +259,12 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // See GprCache's doc comment for the cache model.
     GprCache gpr_cache;
     std::uint32_t gpr_cache_hits = 0;   // operand reads served from a cached GPR
+    // Pass 54 V2: self-mov eliminations in stage_rax / stage_rcx (when
+    // the operand's cached GPR IS the staging register, the naive path
+    // would emit a 3-byte no-op `mov reg, reg`; the cache-aware path
+    // skips the mov and the cache clobber, so future resolves in the
+    // same op can still hit the cache for other vregs. See stage_rax.
+    std::uint32_t self_mov_eliminations = 0;
 
     // Resolve operand (vreg or slot) -> RegOrSlot, given the assignment.
     // IBE-19 fix: spilled VRegs use the MIR node's home_slot (the Tier-0
@@ -308,7 +314,20 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // is_reg=true with reg=RAX, and the emit would `mov RCX, RAX` —
     // pulling in lhs's value, not rhs's. Clobbering RAX in the cache
     // before the load closes the race.
+    //
+    // Pass 54 V2: self-mov elimination. If r.is_reg && r.reg == RAX,
+    // the cache invariant says state[RAX] == r's vreg (the resolve()
+    // that produced r checked holds(RAX, r's vreg)). RAX already
+    // holds r's value — there is nothing to stage. Skipping the mov
+    // AND the clobber keeps the cache consistent: future resolves in
+    // the same op can still hit the cache for other vregs (e.g., the
+    // rhs of a binary op whose cache entry lives in RAX because the
+    // regalloc assigned RAX to it).
     const auto stage_rax = [&](const RegOrSlot& r, std::uint8_t tag_off) noexcept {
+        if (r.is_reg && r.reg == x86::RAX) {
+            ++self_mov_eliminations;
+            return;
+        }
         gpr_cache.clobber(x86::RAX);
         if (r.is_reg) {
             a.mov_r64_r64(x86::RAX, r.reg);
@@ -318,8 +337,13 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     };
 
     // Stage a RegOrSlot value into RCX (second staging register). Same
-    // clobber-first discipline as stage_rax.
+    // clobber-first discipline as stage_rax; same self-mov elimination
+    // when r.is_reg && r.reg == RCX.
     const auto stage_rcx = [&](const RegOrSlot& r, std::uint8_t tag_off) noexcept {
+        if (r.is_reg && r.reg == x86::RCX) {
+            ++self_mov_eliminations;
+            return;
+        }
         gpr_cache.clobber(x86::RCX);
         if (r.is_reg) {
             a.mov_r64_r64(x86::RCX, r.reg);
@@ -938,6 +962,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     out.code_size = a.size();
     out.peephole_fusions = peephole_fusions;
     out.gpr_cache_hits = gpr_cache_hits;
+    out.self_mov_eliminations = self_mov_eliminations;
     out.valid = a.size() > 0 && a.size() < capacity;
     (void)kTagNone;
     (void)kTagBool;

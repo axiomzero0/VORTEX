@@ -57,6 +57,17 @@ struct CompiledCode {
     /// (4-7 bytes, 3-5 cycles) and replaces it with a reg-to-reg move
     /// (3 bytes, 1 cycle).
     std::uint32_t gpr_cache_hits{0};
+    /// Pass 54 V2: count of stage_rax / stage_rcx calls where the
+    /// operand was already in the staging register (cache hit on RAX for
+    /// stage_rax, on RCX for stage_rcx). The naive path emits a 3-byte
+    /// `mov reg, reg` self-move (which is a no-op at the ISA level but
+    /// still occupies the decode stream and 3 bytes of i-cache). The
+    /// cache-aware path skips the mov entirely AND avoids the cache
+    /// clobber, so subsequent resolves in the same op can still hit
+    /// the cache for OTHER vregs that happen to live in the staging
+    /// register's slot. Each elimination saves 3 bytes and one decode
+    /// slot.
+    std::uint32_t self_mov_eliminations{0};
     bool valid{false};
 };
 
