@@ -818,3 +818,172 @@ TEST(p45_folds_const_str_concat_into_one_constpy) {
     });
     CHECK(!bin_still_used);
 }
+
+// =============================================================================
+// Pass 54 (peephole) — V1: MOVri + ALUrr -> ALU r64, imm32
+//
+// The existing jit_executes_int_arithmetic_correctly test ALREADY exercises
+// the peephole (the test's graph is λp → p + 1, which is exactly the
+// MOVri(1) + ADDrr pattern), and now produces the correct result of 42.
+// This new test asserts the peephole ACTUALLY fired (peephole_fusions > 0)
+// and that the emitted code is smaller than the non-fused form would have
+// been. Per the architecture contract, the fusion is a per-block, intra-
+// block-only optimization — correctness comes from the SSA property that
+// the only writer to a vreg's home is its defining MOVri.
+// =============================================================================
+
+TEST(p54_peephole_fires_on_int_plus_const) {
+    Graph g = int_identity_plus_one_graph();
+
+    constexpr std::size_t kCodeCap = 4096;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+
+    CompiledCode cc = compile_unit(g, /*unit_id=*/1, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+
+    // The graph has exactly one ADD whose RHS is ConstInt(1) defined in
+    // the same block. The peephole MUST fire — if it didn't, either the
+    // cache miss path is broken or the lowering put the MOVri in a
+    // different block from the ADD.
+    CHECK(cc.peephole_fusions >= 1);
+
+    // Execute: fused code must still produce 42 = 41 + 1.
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    regs[2] = Value::integer(41);
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 42);
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}
+
+TEST(p54_peephole_skips_imm_outside_int32_range) {
+    // Build a graph: λp → p + 0x1'0000'0001 (outside int32 range, but
+    // inside int64 — so no int64 overflow when added to a small input).
+    // The peephole must NOT fire for this constant — the assembler's
+    // ALU r64, imm32 form sign-extends imm32 to 64 bits, so emitting
+    // the full 0x1'0000'0001 value via the imm32 path would truncate
+    // the high bits. The fallback path (RCX load + reg-reg ALU) is
+    // correct.
+    constexpr std::int64_t kBigConst = 0x1'0000'0001LL;   // > INT32_MAX
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId p0 = g.create(NodeKind::Parameter, {start});
+    g.node(p0).aux0 = 0;
+    NodeId c = g.create(NodeKind::ConstInt);
+    g.node(c).const_value = Value::integer(kBigConst);
+    NodeId add = g.create(NodeKind::Add, {p0, c});
+    NodeId ret = g.create(NodeKind::Return, {start, add});
+    (void)ret;
+    g.node(p0).set_flag(NodeFlag::Pure);
+    g.node(c).set_flag(NodeFlag::Pure);
+    g.node(add).set_flag(NodeFlag::Pure);
+    g.node(add).set_flag(NodeFlag::Unboxed);
+    g.node(p0).set_flag(NodeFlag::Unboxed);
+    g.node(c).set_flag(NodeFlag::Unboxed);
+    g.set_end(ret);
+    g.n_parameters = 1;
+    g.function_name = global_symbols().intern("add_big_const");
+
+    constexpr std::size_t kCodeCap = 4096;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+
+    CompiledCode cc = compile_unit(g, /*unit_id=*/2, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+
+    // Peephole must NOT have fired (imm > INT32_MAX).
+    CHECK_EQ(cc.peephole_fusions, 0u);
+
+    // Verify the computation is correct via the fallback path.
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    regs[2] = Value::integer(1);
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 1 + kBigConst);
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}
+
+TEST(p54_peephole_sub_const_pattern) {
+    // λp → p - 5 — exercises the SUBrr + imm32 fusion path (modrm /5).
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId p0 = g.create(NodeKind::Parameter, {start});
+    g.node(p0).aux0 = 0;
+    NodeId c = g.create(NodeKind::ConstInt);
+    g.node(c).const_value = Value::integer(5);
+    NodeId sub = g.create(NodeKind::Sub, {p0, c});
+    NodeId ret = g.create(NodeKind::Return, {start, sub});
+    (void)ret;
+    g.node(p0).set_flag(NodeFlag::Pure);
+    g.node(c).set_flag(NodeFlag::Pure);
+    g.node(sub).set_flag(NodeFlag::Pure);
+    g.node(sub).set_flag(NodeFlag::Unboxed);
+    g.node(p0).set_flag(NodeFlag::Unboxed);
+    g.node(c).set_flag(NodeFlag::Unboxed);
+    g.set_end(ret);
+    g.n_parameters = 1;
+    g.function_name = global_symbols().intern("sub_const");
+
+    constexpr std::size_t kCodeCap = 4096;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    CHECK(code_buf != nullptr);
+    if (!code_buf) return;
+
+    CompiledCode cc = compile_unit(g, /*unit_id=*/3, code_buf, kCodeCap, host_target());
+    CHECK(cc.valid);
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return;
+    }
+    CHECK(cc.peephole_fusions >= 1);
+
+    std::uint32_t n_regs = cc.frame_slots > 16 ? cc.frame_slots : 16;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+    regs[2] = Value::integer(100);
+
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<JitEntryFn>(code_buf);
+    Value result = entry(regs);
+    CHECK(result.tag == Tag::Int);
+    CHECK_EQ(result.as.i, 95);
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+}

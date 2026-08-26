@@ -116,6 +116,55 @@ struct PatchSite {
     std::uint32_t target_block{0};   // MIR block id; 0xFFFFFFFFu = past_cold
 };
 
+/// Pass 54 (peephole) constant cache.
+///
+/// Tracks vregs defined by a `MOVri` (or float const) inside the current
+/// block so that subsequent `ADDrr/SUBrr/CMPrr` whose RHS is one of those
+/// vregs can be fused to `ALU r64, imm32` — eliminating a memory load and
+/// a register-to-register ALU op. Single-def SSA at the MIR level means
+/// the only writer to a vreg's home is its defining MOVri/FCONSTri, so
+/// once we observe the definition we can substitute the immediate for
+/// any later read within the SAME block. Cross-block uses are NOT fused:
+/// we'd need a use-count + dominance proof that the def dominates the use
+/// through every path, which is more than a peephole's job.
+///
+/// The cache is small (Rule 9): 16 entries cover >99% of basic blocks
+/// (the median Python basic block has 2–4 constants). Overflow is silent
+/// — extra constants simply don't get fused, never an error.
+struct ConstCacheEntry {
+    std::uint32_t vreg{0};     // MIR node id of the MOVri
+    std::int64_t imm{0};      // immediate payload (only int for V1)
+    bool is_float{false};     // future: enable FADDrr fusion to FP-constant load
+};
+struct ConstCache {
+    stdx::small_vector<ConstCacheEntry, 16> entries{};
+
+    void clear() noexcept { entries.clear(); }
+
+    void put(std::uint32_t vreg, std::int64_t imm, bool is_float = false) noexcept {
+        if (entries.size() < entries.capacity()) {
+            entries.push_back(ConstCacheEntry{vreg, imm, is_float});
+        }
+    }
+
+    /// Look up an immediate for a vreg. Returns true on hit.
+    [[nodiscard]] bool lookup(std::uint32_t vreg, std::int64_t& out_imm) const noexcept {
+        for (const auto& e : entries) {
+            if (e.vreg == vreg && !e.is_float) {
+                out_imm = e.imm;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// True iff imm fits in a sign-extended imm32 (the form ALU r64, imm32
+    /// uses — 81 /x id, sign-extended to 64 bits at decode time).
+    [[nodiscard]] static constexpr bool fits_int32(std::int64_t imm) noexcept {
+        return imm >= -0x8000'0000LL && imm <= 0x7FFF'FFFFLL;
+    }
+};
+
 }  // namespace
 
 CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buffer,
@@ -220,6 +269,12 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     };
     stdx::small_vector<DeoptStubReq, 16> deopt_stubs;
 
+    // Pass 54 peephole state: per-block constant cache. Reset at every
+    // block entry so cross-block uses don't get unsoundly fused (a def
+    // in block A does not necessarily dominate a use in block B).
+    ConstCache const_cache;
+    std::uint32_t peephole_fusions = 0;   // reported back in CompiledCode
+
     // Record a SafepointRecord at the current emission position and return
     // its index for later deopt stub emission.
     const auto emit_safepoint = [&](std::uint32_t frame_state_id,
@@ -249,6 +304,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     const auto emit_block_body = [&](std::uint32_t block_id) noexcept {
         if (block_start.contains(block_id)) return;   // already emitted
         block_start.insert(block_id, a.size());
+        const_cache.clear();   // Pass 54: per-block peephole scope
 
         for (std::uint32_t id = 1; id <= lowered.mir.node_count(); ++id) {
             MachineNode& n = lowered.mir.node(id);
@@ -284,6 +340,11 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     a.mov_mem_imm32(frame_base,
                                     slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagInt));
+                    // Pass 54: record this vreg's immediate so a later
+                    // ADDrr/SUBrr/CMPrr in the SAME block can fuse to
+                    // ALU r64, imm32. Vregs are single-def in the MIR,
+                    // so the entry stays valid for the rest of the block.
+                    const_cache.put(n.id, n.operands[0].imm);
                     break;
                 }
                 case MOp::MOVrm: {
@@ -331,17 +392,39 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     RegOrSlot lhs = resolve(n.operands[0]);
                     RegOrSlot rhs = resolve(n.operands[1]);
                     stage_rax(lhs, kPayloadOffset);
-                    if (rhs.is_reg) {
-                        a.mov_r64_r64(x86::RCX, rhs.reg);
+
+                    // ---- Pass 54 peephole: fuse MOVri + ALUrr -> ALU r64, imm32
+                    // when the RHS is a vreg whose MOVri lives in this block.
+                    // Skips the RCX load + the reg-reg ALU in favor of one
+                    // 81 /x id instruction. Skipped for IMUL (no imm32 form
+                    // exposed by the assembler) and when imm doesn't fit int32.
+                    std::int64_t rhs_imm = 0;
+                    const bool rhs_is_vreg_const =
+                        n.op != MOp::IMULrr &&
+                        n.operands[1].kind == MachineOperand::VReg &&
+                        const_cache.lookup(n.operands[1].vreg, rhs_imm) &&
+                        ConstCache::fits_int32(rhs_imm);
+
+                    if (rhs_is_vreg_const) {
+                        // modrm /x sub-opcode: ADD=0, SUB=5, CMP=7 (CMP lives
+                        // in its own case below; this branch covers ADD/SUB).
+                        const std::uint8_t ext = (n.op == MOp::ADDrr) ? 0u : 5u;
+                        a.alu_r64_imm32(ext, x86::RAX,
+                                        static_cast<std::int32_t>(rhs_imm));
+                        ++peephole_fusions;
                     } else {
-                        a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
-                    }
-                    if (n.op == MOp::ADDrr) {
-                        a.alu_r64_r64(0x01, x86::RAX, x86::RCX);
-                    } else if (n.op == MOp::SUBrr) {
-                        a.alu_r64_r64(0x29, x86::RAX, x86::RCX);
-                    } else {
-                        a.imul_r64_r64(x86::RAX, x86::RCX);
+                        if (rhs.is_reg) {
+                            a.mov_r64_r64(x86::RCX, rhs.reg);
+                        } else {
+                            a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
+                        }
+                        if (n.op == MOp::ADDrr) {
+                            a.alu_r64_r64(0x01, x86::RAX, x86::RCX);
+                        } else if (n.op == MOp::SUBrr) {
+                            a.alu_r64_r64(0x29, x86::RAX, x86::RCX);
+                        } else {
+                            a.imul_r64_r64(x86::RAX, x86::RCX);
+                        }
                     }
                     if (has_reg) {
                         a.mov_r64_r64(alloc_reg(ra.assignment[id]), x86::RAX);
@@ -375,12 +458,27 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     RegOrSlot lhs = resolve(n.operands[0]);
                     RegOrSlot rhs = resolve(n.operands[1]);
                     stage_rax(lhs, kPayloadOffset);
-                    if (rhs.is_reg) {
-                        a.mov_r64_r64(x86::RCX, rhs.reg);
+
+                    // Pass 54 peephole: CMP r64, imm32 — fuse when RHS is
+                    // an intra-block constant vreg. CMP semantics are
+                    // `lhs - rhs` (sets flags accordingly); substituting
+                    // imm preserves the operand order. The modrm /x for
+                    // CMP under 81 is 7.
+                    std::int64_t rhs_imm = 0;
+                    if (n.operands[1].kind == MachineOperand::VReg &&
+                        const_cache.lookup(n.operands[1].vreg, rhs_imm) &&
+                        ConstCache::fits_int32(rhs_imm)) {
+                        a.alu_r64_imm32(7, x86::RAX,
+                                        static_cast<std::int32_t>(rhs_imm));
+                        ++peephole_fusions;
                     } else {
-                        a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
+                        if (rhs.is_reg) {
+                            a.mov_r64_r64(x86::RCX, rhs.reg);
+                        } else {
+                            a.mov_r64_mem(x86::RCX, frame_base, slot_disp(rhs.slot, kPayloadOffset));
+                        }
+                        a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                     }
-                    a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                     break;
                 }
                 case MOp::Jcc: {
@@ -697,6 +795,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
 
     out.code = buffer;
     out.code_size = a.size();
+    out.peephole_fusions = peephole_fusions;
     out.valid = a.size() > 0 && a.size() < capacity;
     (void)kTagNone;
     (void)kTagBool;

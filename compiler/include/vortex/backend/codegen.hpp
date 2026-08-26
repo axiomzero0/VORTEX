@@ -46,6 +46,10 @@ struct CompiledCode {
     stdx::small_vector<SafepointMapping, 64> mappings{};   // concat per record
     std::uint32_t frame_slots{0};
     std::uint32_t unit_id{0};
+    /// Pass 54: count of peephole fusions applied during emission. Telemetry
+    /// hook (Rule 26): zero in a freshly-lowered unit with no ALU+const
+    /// patterns; positive when MOVri+ALUrr fused to ALU r64, imm32.
+    std::uint32_t peephole_fusions{0};
     bool valid{false};
 };
 
