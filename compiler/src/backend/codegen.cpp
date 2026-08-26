@@ -401,8 +401,26 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     const auto emit_block_body = [&](std::uint32_t block_id) noexcept {
         if (block_start.contains(block_id)) return;   // already emitted
         block_start.insert(block_id, a.size());
-        const_cache.clear();   // Pass 54: per-block peephole scope
-        gpr_cache.clear();    // Pass 54: per-block GPR occupancy scope
+        const_cache.clear();   // Pass 54: per-block peephole scope.
+                               // Cross-block const fusion would require a
+                               // dominance proof that the def reaches the
+                               // use through every path — out of scope for V1.
+        // Pass 54 GPR cache: CROSS-BLOCK (live-interval aware). The LSRA
+        // invariant (no two simultaneously-live vregs share a GPR) means a
+        // cache entry "GPR g holds vreg v" stays sound until either v's
+        // interval ends or g is clobbered by staging/call. Per-block reset
+        // would throw away valid cross-block cache entries — every vreg
+        // that lives across a Jcc would reload from home at the target
+        // block even though the LSRA assigned it a GPR throughout. We do
+        // NOT clear here. Stale entries (vreg v ended but cache still
+        // says "g holds v") are harmless: no resolve(v) happens past
+        // v.end (no use exists past the interval end per LSRA), and any
+        // resolve(v2) where v2 is freshly assigned g correctly fails
+        // holds(g, v2) and falls back to home — until v2's def refreshes
+        // the cache via populate_dst_from_rax.
+        // The earlier "per-block scope" was an unsoundness-defensive
+        // workaround that conflicted with the architecture's
+        // live-interval-aware regalloc contract. Retired.
 
         for (std::uint32_t id = 1; id <= lowered.mir.node_count(); ++id) {
             MachineNode& n = lowered.mir.node(id);
