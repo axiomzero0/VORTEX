@@ -139,6 +139,27 @@ inline constexpr std::uint8_t XMM12 = 12, XMM13 = 13, XMM14 = 14, XMM15 = 15;
 
 inline constexpr std::uint32_t kGPRCount = 16;
 
+// Allocatable FPR pool: the XMM registers the regalloc may assign to FPR-
+// class vregs. EXCLUDES XMM0 and XMM1 — those are the codegen's FP
+// staging/scratch registers (analog of RAX/RCX for the GPR path). The
+// reason for the asymmetry with the GPR pool (which INCLUDES RAX/RCX as
+// allocatable + scratch, handled via self-mov elimination): the GPR
+// self-mov elim only closes the race for the case `lhs.reg == RAX`. The
+// symmetric race `rhs.reg == RAX` (or `rhs.xmm == XMM0` for the FP path)
+// is NOT closed by self-mov elim — stage_xmm0(lhs) clobbers XMM0
+// *before* stage_xmm1(rhs) reads it, and stage_xmm1's self-mov check
+// is `r.xmm == XMM1` (not XMM0). Excluding XMM0/XMM1 from the FPR pool
+// sidesteps the race entirely: the regalloc never assigns an operand to
+// XMM0 or XMM1, so stage_xmm0/stage_xmm1's clobber can never destroy a
+// cached operand value. The trade-off: 2 fewer XMMs available for FPR
+// allocation (6 instead of 8), which is fine for any Python-level FP
+// loop's working set. XMM8-XMM15 stay reserved for future SIMD work
+// (Pass 31 SLP packetization).
+inline constexpr std::uint32_t kAllocatableFprCount = 6;
+inline constexpr std::uint8_t kAllocatableFpr[kAllocatableFprCount] = {
+    XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
+};
+
 // Frame-protocol role assignment (all callee-saved under SysV).
 inline constexpr std::uint8_t kRoleReg[enum_size(ReservedGPR::Count)] = {
     R12,   // FrameBase
@@ -191,6 +212,21 @@ inline constexpr std::uint8_t kAllocatable[kAllocatableCount] = {
 // ISA floor of armv8-a: ASIMD 128-bit is mandatory.
 inline constexpr std::uint32_t kBaselineSimdBytes = 16;
 
+// Allocatable FPR pool: armv8-a scalar double-precision lives in the low
+// 64 bits of the V/n register file (D0-D31). The 18 allocatable d-regs
+// (D0-D7 = argument/scratch, D8-D15 = callee-saved subset, D16-D17 =
+// caller-saved temp) cover every Python-level FP loop's working set.
+// D8-D15 are callee-saved (the ONLY callee-saved FP register file under
+// AAPCS64), which means an eviction from the pool doesn't need a spill
+// to the home slot — but the LSRA is class-uniform across arches, so it
+// still uses the home-slot path for soundness on both ISAs.
+inline constexpr std::uint32_t kAllocatableFprCount = 18;
+inline constexpr std::uint8_t kAllocatableFpr[kAllocatableFprCount] = {
+    0, 1, 2, 3, 4, 5, 6, 7,    // D0-D7   (caller-saved arg/scratch)
+    8, 9, 10, 11, 12, 13, 14, 15,  // D8-D15  (callee-saved)
+    16, 17,                          // D16-D17 (caller-saved temp)
+};
+
 }  // namespace aarch64
 
 /// Upper bound on the allocatable set across all supported architectures —
@@ -214,6 +250,15 @@ struct TargetDescriptor {
     /// read THIS table — never a per-arch global.
     std::uint32_t allocatable_gprs{0};
     std::uint8_t allocatable[kMaxAllocatable]{};
+
+    /// Allocatable FPR encodings; valid indices are [0, allocatable_fprs).
+    /// Index order IS allocation priority (analog of the GPR pool). The
+    /// regalloc assigns FPR-class vregs to entries from THIS table; the
+    /// codegen's XmmCache (or AArch64 equivalent) reads the same encodings.
+    /// A zero count means "no FPR allocation" — every FPR-class vreg spills
+    /// to home (the legacy write-through-home discipline; correct but slow).
+    std::uint32_t allocatable_fprs{0};
+    std::uint8_t allocatable_fpr[kMaxAllocatable]{};
 
     /// Frame-protocol role encodings, indexed by ReservedGPR.
     std::uint8_t reserved[enum_size(ReservedGPR::Count)]{};
@@ -287,6 +332,11 @@ constexpr TargetDescriptor x86_64_baseline() noexcept {
     for (std::uint32_t i = 0; i < x86::kAllocatableCount; ++i) {
         t.allocatable[i] = x86::kAllocatable[i];
     }
+    // FPR pool: XMM0-XMM7 (caller-saved; XMM8-XMM15 reserved for SIMD).
+    t.allocatable_fprs = x86::kAllocatableFprCount;
+    for (std::uint32_t i = 0; i < x86::kAllocatableFprCount; ++i) {
+        t.allocatable_fpr[i] = x86::kAllocatableFpr[i];
+    }
     for (std::uint32_t r = 0; r < enum_size(ReservedGPR::Count); ++r) {
         t.reserved[r] = x86::kRoleReg[r];
     }
@@ -308,6 +358,11 @@ constexpr TargetDescriptor aarch64_baseline() noexcept {
     t.allocatable_gprs = aarch64::kAllocatableCount;
     for (std::uint32_t i = 0; i < aarch64::kAllocatableCount; ++i) {
         t.allocatable[i] = aarch64::kAllocatable[i];
+    }
+    // FPR pool: D0-D17 (18 scalar double-precision registers).
+    t.allocatable_fprs = aarch64::kAllocatableFprCount;
+    for (std::uint32_t i = 0; i < aarch64::kAllocatableFprCount; ++i) {
+        t.allocatable_fpr[i] = aarch64::kAllocatableFpr[i];
     }
     for (std::uint32_t r = 0; r < enum_size(ReservedGPR::Count); ++r) {
         t.reserved[r] = aarch64::kRoleReg[r];

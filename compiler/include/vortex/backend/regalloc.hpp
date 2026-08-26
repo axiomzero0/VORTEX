@@ -30,8 +30,19 @@ namespace vortex::backend {
 inline namespace abi_v1 {
 
 struct RegAllocResult {
-    /// vreg -> physical register (encoding byte) or -1 when spilled.
+    /// vreg -> physical GPR encoding byte, or -1 when spilled (or when the
+    /// vreg is FPR-class and was assigned an XMM via `assignment_fpr`).
     stdx::small_vector<std::int32_t, 128> assignment{};
+    /// vreg -> physical FPR encoding index into target.allocatable_fpr[],
+    /// or -1 when spilled (or when the vreg is GPR-class and was assigned
+    /// a GPR via `assignment`). Symmetric to `assignment` — a vreg has
+    /// EITHER a GPR (GPR-class vregs) OR an FPR (FPR-class vregs) OR
+    /// neither (spilled). The two arrays never disagree on the same vreg:
+    /// if assignment[v] >= 0 then assignment_fpr[v] == -1, and vice versa.
+    /// A zero-length `assignment_fpr` (the legacy contract before the
+    /// LSRA->XMM extension) means "FPR allocation is disabled" — FPR-class
+    /// vregs read/write through home (the ALWAYS-SPILL discipline for FPRs).
+    stdx::small_vector<std::int32_t, 128> assignment_fpr{};
     /// Spill/reload code is encoded as MIR nodes appended after allocation:
     /// the codegen consumes `spill_ops` in position order.
     std::uint32_t spills{0};

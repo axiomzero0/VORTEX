@@ -39,6 +39,7 @@ struct Piece {
     std::uint32_t end{0};
     std::uint32_t loop_depth{0};
     bool is_pyobject{false};
+    bool is_fpr{false};        // reg class: false = GPR pool, true = FPR pool
     std::int32_t assigned{-1};
     std::uint32_t parent_interval{0};   // index into intervals_out
 };
@@ -52,6 +53,26 @@ RegAllocResult linear_scan(MachineGraph& mir,
     RegAllocResult out;
     const std::uint32_t n_nodes = static_cast<std::uint32_t>(mir.node_count());
     out.assignment.assign(n_nodes + 1, -1);
+    // LSRA->XMM extension: parallel assignment for FPR-class vregs. The
+    // pool is sized to zero when the target descriptor doesn't expose an
+    // FPR pool (the legacy contract). When the pool is non-empty, the
+    // allocator runs a class-split linear scan: GPR pieces draw from
+    // target.allocatable (the GPR pool), FPR pieces draw from
+    // target.allocatable_fpr (the FPR pool). The two pools are independent
+    // — a GPR-piece cannot evict an FPR-piece, and vice versa — so a
+    // float-heavy workload that saturates the FPR pool still leaves the
+    // GPR pool untouched for the loop-IV integers.
+    const std::uint32_t available_fpr = target.allocatable_fprs;
+    if (available_fpr > 0) {
+        out.assignment_fpr.assign(n_nodes + 1, -1);
+    } else {
+        // Make explicit that the FPR pool is disabled — the codegen reads
+        // a non-existent entry as "spilled to home" via the same `>= 0`
+        // check that the GPR pool uses. An empty vector safely returns
+        // false for any vreg-size check; we keep it empty so a future
+        // caller iterating assignment_fpr[] doesn't pay an n_nodes-sized
+        // zero-initialization cost when no FPR pool exists.
+    }
     if (n_nodes == 0) return out;
 
     // ---- 1. linear positions --------------------------------------------------
@@ -131,6 +152,17 @@ RegAllocResult linear_scan(MachineGraph& mir,
     stdx::small_vector<Piece, 128> pieces;
     for (std::uint32_t i = 0; i < intervals_out.size(); ++i) {
         const LiveInterval& li = intervals_out[i];
+        // LSRA->XMM extension: a vreg's reg class is read from its MIR
+        // node's `rc` field. GPR-class vregs draw from the GPR pool;
+        // FPR-class vregs (FP arithmetic: FADD/FSUB/FMUL/FDIV, FCONSTri,
+        // FMOV*, GUARD_FLOAT) draw from the FPR pool. The regalloc's two
+        // pools stay independent — a piece's reg class never changes
+        // across a loop-header split (it's a property of the vreg, not
+        // the position). The same is_pyobject / loop_depth invariants
+        // apply in both pools.
+        const bool piece_is_fpr =
+            (available_fpr > 0) &&
+            (mir.node(li.vreg).rc == MachineRegClass::FPR);
         if (li.end <= li.start) {
             Piece p{};
             p.vreg = li.vreg;
@@ -138,6 +170,7 @@ RegAllocResult linear_scan(MachineGraph& mir,
             p.end = li.end;
             p.loop_depth = li.loop_depth;
             p.is_pyobject = li.is_pyobject;
+            p.is_fpr = piece_is_fpr;
             p.parent_interval = i;
             pieces.push_back(p);
             continue;
@@ -159,6 +192,7 @@ RegAllocResult linear_scan(MachineGraph& mir,
                 piece.end = p - 1;
                 piece.loop_depth = region_depth;
                 piece.is_pyobject = li.is_pyobject;
+                piece.is_fpr = piece_is_fpr;
                 piece.parent_interval = i;
                 pieces.push_back(piece);
                 region_start = p;
@@ -173,27 +207,54 @@ RegAllocResult linear_scan(MachineGraph& mir,
         tail.end = li.end;
         tail.loop_depth = region_depth;
         tail.is_pyobject = li.is_pyobject;
+        tail.is_fpr = piece_is_fpr;
         tail.parent_interval = i;
         pieces.push_back(tail);
         (void)split_any;
     }
 
     // ---- 4. priority linear scan --------------------------------------------------
+    // Sort by start asc; for equal starts, prefer higher loop depth first
+    // (hot values claim registers). Ties after that: GPR-class before FPR
+    // class (no semantic effect on a single pool, but stabilizes the sort
+    // across runs — the rule 34 determinism guard). The original sort used
+    // a vreg tiebreak, which is fine; we add the reg-class tiebreak ahead
+    // of it so a tiny int-IV and a float-IV starting at the same position
+    // have a deterministic relative order.
     std::sort(pieces.begin(), pieces.end(), [](const Piece& a, const Piece& b) noexcept {
         if (a.start != b.start) return a.start < b.start;
-        // higher loop depth first at equal start (hot values claim regs).
         if (a.loop_depth != b.loop_depth) return a.loop_depth > b.loop_depth;
+        if (a.is_fpr != b.is_fpr) return !a.is_fpr;
         return a.vreg < b.vreg;
     });
 
-    const std::uint32_t available = target.allocatable_gprs;
+    const std::uint32_t available_gpr = target.allocatable_gprs;
+    // LSRA->XMM extension: two independent occupancy bitmasks, one per
+    // pool. A GPR-piece's `assigned` index is into target.allocatable[]
+    // (the GPR pool); an FPR-piece's `assigned` index is into
+    // target.allocatable_fpr[] (the FPR pool). The active list carries
+    // both kinds mixed; the per-piece `is_fpr` flag routes expiry/eviction
+    // to the right bitmask. The same victim-selection heuristic (lowest
+    // loop_depth, then furthest end) is applied per-pool: a high-pressure
+    // FPR workload evicts from the FPR pool only, never stealing a GPR
+    // that's holding a loop-IV integer.
     stdx::small_vector<Piece*, 16> active;   // currently holding a register
-    std::uint32_t in_use = 0;                // bitmask of allocated slots
+    std::uint32_t in_use_gpr = 0;            // bitmask of allocated GPR slots
+    std::uint32_t in_use_fpr = 0;            // bitmask of allocated FPR slots
 
-    auto free_reg = [&]() noexcept -> std::int32_t {
-        for (std::uint32_t r = 0; r < available; ++r) {
-            if (!(in_use & (1u << r))) {
-                in_use |= 1u << r;
+    auto free_gpr = [&]() noexcept -> std::int32_t {
+        for (std::uint32_t r = 0; r < available_gpr; ++r) {
+            if (!(in_use_gpr & (1u << r))) {
+                in_use_gpr |= 1u << r;
+                return static_cast<std::int32_t>(r);
+            }
+        }
+        return -1;
+    };
+    auto free_fpr = [&]() noexcept -> std::int32_t {
+        for (std::uint32_t r = 0; r < available_fpr; ++r) {
+            if (!(in_use_fpr & (1u << r))) {
+                in_use_fpr |= 1u << r;
                 return static_cast<std::int32_t>(r);
             }
         }
@@ -202,11 +263,15 @@ RegAllocResult linear_scan(MachineGraph& mir,
 
     std::uint32_t pressure = 0;
     for (Piece& p : pieces) {
-        // expire
+        // expire: release slots held by pieces whose lifetime ended before
+        // this piece's start. The pool the piece drew from is encoded on
+        // the piece itself via `is_fpr`.
         for (std::size_t k = 0; k < active.size();) {
             if (active[k]->end < p.start) {
-                // release its slot
-                for (std::uint32_t r = 0; r < available; ++r) {
+                std::uint32_t& in_use = active[k]->is_fpr ? in_use_fpr : in_use_gpr;
+                const std::uint32_t pool_sz = active[k]->is_fpr ? available_fpr
+                                                                 : available_gpr;
+                for (std::uint32_t r = 0; r < pool_sz; ++r) {
                     if (active[k]->assigned == static_cast<std::int32_t>(r)) {
                         in_use &= ~(1u << r);
                     }
@@ -218,23 +283,46 @@ RegAllocResult linear_scan(MachineGraph& mir,
         }
         if (active.size() > pressure) pressure = static_cast<std::uint32_t>(active.size());
 
-        std::int32_t reg = free_reg();
+        // LSRA->XMM: pick the right pool for this piece. An FPR pool size
+        // of zero (the legacy contract when the descriptor doesn't expose
+        // one) forces FPR-class pieces onto the spill-to-home path —
+        // equivalent to the always-spill discipline the GPR cache
+        // retired for GPR-class vregs. Backward compatible.
+        const bool use_fpr_pool = p.is_fpr && available_fpr > 0;
+        std::int32_t reg = use_fpr_pool ? free_fpr() : free_gpr();
         if (reg < 0) {
-            // Evict: lowest loop depth, then furthest end. Evicted piece
-            // spills to its frame home (spill bookkeeping for codegen).
+            // Evict: lowest loop depth, then furthest end. Same heuristic
+            // as before but constrained to the SAME pool as p (a GPR-piece
+            // cannot evict an FPR-piece, and vice versa — cross-pool
+            // eviction would silently steal a register from the wrong
+            // register file, which the codegen's per-class cache model
+            // doesn't track).
             Piece* victim = nullptr;
             for (Piece* a : active) {
+                if (a->is_fpr != p.is_fpr) continue;   // different pool
                 if (!victim) { victim = a; continue; }
                 if (a->loop_depth < victim->loop_depth) { victim = a; continue; }
                 if (a->loop_depth == victim->loop_depth && a->end > victim->end) victim = a;
             }
             if (victim && (victim->loop_depth < p.loop_depth ||
                            (victim->loop_depth == p.loop_depth && victim->end > p.end))) {
-                intervals_out[victim->parent_interval].phys_reg = -1;
-                intervals_out[victim->parent_interval].assigned = true;
-                if (victim->is_pyobject) ++out.spills;   // INCREF/DECREF boundary
-                // free the victim's slot and hand it to p
-                for (std::uint32_t r = 0; r < available; ++r) {
+                // Mark the whole vreg spilled. The codegen's resolve
+                // falls back to home; the legacy contract.
+                if (victim->is_fpr) {
+                    intervals_out[victim->parent_interval].phys_reg = -1;
+                    intervals_out[victim->parent_interval].assigned = true;
+                    // (no INCREF/DECREF traffic for spilled FP vregs; only
+                    // PyObject-class spills do — and FP vregs are not
+                    // PyObjects by construction.)
+                } else {
+                    intervals_out[victim->parent_interval].phys_reg = -1;
+                    intervals_out[victim->parent_interval].assigned = true;
+                    if (victim->is_pyobject) ++out.spills;   // INCREF/DECREF boundary
+                }
+                std::uint32_t& in_use = victim->is_fpr ? in_use_fpr : in_use_gpr;
+                const std::uint32_t pool_sz = victim->is_fpr ? available_fpr
+                                                              : available_gpr;
+                for (std::uint32_t r = 0; r < pool_sz; ++r) {
                     if (victim->assigned == static_cast<std::int32_t>(r)) {
                         in_use &= ~(1u << r);
                     }
@@ -245,14 +333,19 @@ RegAllocResult linear_scan(MachineGraph& mir,
                         break;
                     }
                 }
-                reg = free_reg();
+                reg = use_fpr_pool ? free_fpr() : free_gpr();
                 // victim reload happens at its next piece boundary (codegen
                 // inserts MOV from home slot).
             } else {
                 // p itself spills: its vreg reads/writes go through home.
-                intervals_out[p.parent_interval].phys_reg = -1;
-                intervals_out[p.parent_interval].assigned = true;
-                if (p.is_pyobject) ++out.spills;
+                if (p.is_fpr) {
+                    intervals_out[p.parent_interval].phys_reg = -1;
+                    intervals_out[p.parent_interval].assigned = true;
+                } else {
+                    intervals_out[p.parent_interval].phys_reg = -1;
+                    intervals_out[p.parent_interval].assigned = true;
+                    if (p.is_pyobject) ++out.spills;
+                }
                 continue;
             }
         }
@@ -280,11 +373,14 @@ RegAllocResult linear_scan(MachineGraph& mir,
     // header), the vreg spills to home. The codegen then reads/writes
     // home slots uniformly — no per-piece move insertion required.
     //
-    // This loses the loop-boundary register-reuse optimization (the
-    // whole point of splitting), but it's SOUND. Per-piece assignment
-    // with move insertion at piece boundaries is a future improvement
-    // that requires the codegen to query assignments by (vreg, position),
-    // not just by vreg.
+    // LSRA->XMM extension: the rule now applies to BOTH pools in
+    // parallel. A GPR-class vreg goes into out.assignment[]; an FPR-class
+    // vreg goes into out.assignment_fpr[]. The two arrays are sized in
+    // lockstep at the top of the function (the FPR array stays empty
+    // when no FPR pool exists — the legacy contract). The cross-class
+    // spill check (a vreg with mixed GPR/FPR pieces) is impossible
+    // because `is_fpr` is a property of the vreg's MIR `rc`, constant
+    // across all pieces.
     stdx::flat_map<std::uint32_t, std::int32_t, 64> first_assignment;
     stdx::flat_map<std::uint32_t, bool, 64> any_spill;
     for (const Piece& p : pieces) {
@@ -303,14 +399,27 @@ RegAllocResult linear_scan(MachineGraph& mir,
     for (const Piece& p : pieces) {
         const bool* spill = any_spill.get(p.vreg);
         if (spill && *spill) {
-            out.assignment[p.vreg] = -1;   // spilled: read/write home
+            // Spill to home: -1 in whichever pool the vreg belongs to.
+            if (p.is_fpr) {
+                out.assignment_fpr[p.vreg] = -1;
+            } else {
+                out.assignment[p.vreg] = -1;
+            }
         } else {
             const std::int32_t* a = first_assignment.get(p.vreg);
-            if (a) out.assignment[p.vreg] = *a;
+            if (a) {
+                if (p.is_fpr) {
+                    out.assignment_fpr[p.vreg] = *a;
+                } else {
+                    out.assignment[p.vreg] = *a;
+                }
+            }
         }
     }
     // Spilled vregs keep assignment -1; their operands read/write home slots.
-    out.max_pressure = pressure < available ? pressure : available;
+    const std::uint32_t max_pool = available_gpr > available_fpr ? available_gpr
+                                                                  : available_fpr;
+    out.max_pressure = pressure < max_pool ? pressure : max_pool;
     return out;
 }
 

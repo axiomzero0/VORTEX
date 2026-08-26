@@ -102,9 +102,19 @@ constexpr std::uint8_t kX86Cond[enum_size(MCond::Count)] = {
 }
 
 // Phys reg for a vreg under the assignment, or load/store through home.
+// LSRA->XMM extension: a vreg's resolved location is either
+//   - is_reg=true with reg=GPR encoding byte  (GPR-class vreg, cached)
+//   - is_xmm=true with xmm=XMM encoding byte  (FPR-class vreg, cached)
+//   - both false, slot=home slot             (spilled or uncached)
+// The codegen's GPR-stage helpers (stage_rax / stage_rcx) consume the
+// is_reg branch; the FPR-stage helpers (stage_xmm0 / stage_xmm1) consume
+// the is_xmm branch. A given vreg never has both is_reg and is_xmm
+// (the regalloc routes a vreg to exactly one pool based on its MIR rc).
 struct RegOrSlot {
     bool is_reg{false};
+    bool is_xmm{false};
     std::uint8_t reg{0};
+    std::uint8_t xmm{0};
     std::uint32_t slot{0};
 };
 
@@ -207,6 +217,51 @@ struct GprCache {
     }
 };
 
+/// Pass 54 V3 (LSRA->XMM): the FPR analog of GprCache. Tracks which
+/// physical XMM registers currently hold which FPR-class vreg's value,
+/// so subsequent FP operand reads can use a reg-to-reg movsd (4 bytes,
+/// 1 cycle) instead of a memory load `movsd xmm, [r12 + slot*16 + 8]`
+/// (5-8 bytes, 4-6 cycles L1-dependent). Same invariants as GprCache:
+///   - Cross-block scope (live-interval aware). The LSRA's invariant
+///     (no two simultaneously-live FPR vregs share an XMM) means a
+///     cache entry "XMM x holds FPR vreg v" stays sound until either
+///     v's interval ends or x is clobbered by stage_xmm0/stage_xmm1
+///     (staging) or a CALLri (XMM0-XMM7 are caller-saved under SysV).
+///   - Define after every producing FP op (FADD/FSUB/FMUL/FDIV/
+///     FCONSTri): the result lives in XMM0 (post-op) or in dst_xmm
+///     (post-populate). The cache reflects both.
+///   - Clobber on every FP staging write: stage_xmm0 writes XMM0, so
+///     it must mark XMM0 free in the cache BEFORE any subsequent
+///     resolve in the same op (otherwise we'd read a stale cache entry
+///     — the same IBE-18-class bug GprCache's clobber-on-stage closes).
+///
+/// Self-mov elimination (Pass 54 V2 analog): if the operand's cached
+/// XMM IS XMM0 (the staging register), the cache invariant says
+/// state[XMM0] == r's vreg (resolve checked holds(XMM0, r's vreg)).
+/// XMM0 already holds r's value — nothing to stage. Skipping the
+/// movsd AND the clobber keeps the cache consistent: future resolves
+/// in the same op can still hit the cache for OTHER FPR vregs (e.g.,
+/// the rhs of a binary FP op whose cache entry lives in XMM0 because
+/// the regalloc assigned XMM0 to it).
+struct XmmCache {
+    static constexpr std::uint32_t kFree = 0xFFFFFFFFu;
+    std::array<std::uint32_t, 16> state{};
+
+    void clear() noexcept { state.fill(kFree); }
+
+    void clobber(std::uint8_t xmm) noexcept {
+        if (xmm < 16) state[xmm] = kFree;
+    }
+
+    void define(std::uint8_t xmm, std::uint32_t vreg) noexcept {
+        if (xmm < 16) state[xmm] = vreg;
+    }
+
+    [[nodiscard]] bool holds(std::uint8_t xmm, std::uint32_t vreg) const noexcept {
+        return xmm < 16 && state[xmm] == vreg;
+    }
+};
+
 }  // namespace
 
 CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buffer,
@@ -231,6 +286,16 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     const auto alloc_reg = [&](std::int32_t idx) noexcept -> std::uint8_t {
         if (idx < 0 || static_cast<std::uint32_t>(idx) >= n_alloc) return x86::RAX;
         return target.allocatable[static_cast<std::uint32_t>(idx)];
+    };
+    // LSRA->XMM extension: FPR-pool analog of alloc_reg. Maps an index
+    // into target.allocatable_fpr[] to its XMM encoding byte. Returns
+    // XMM0 as a defensive fallback (the codegen treats out-of-range
+    // FPR indices as "spilled" via the assignment check, so a fallback
+    // here is belt-and-suspenders).
+    const std::uint32_t n_alloc_fpr = target.allocatable_fprs;
+    const auto alloc_fpr = [&](std::int32_t idx) noexcept -> std::uint8_t {
+        if (idx < 0 || static_cast<std::uint32_t>(idx) >= n_alloc_fpr) return x86::XMM0;
+        return target.allocatable_fpr[static_cast<std::uint32_t>(idx)];
     };
 
     // ---- Pass 52: lower ---------------------------------------------------------
@@ -265,6 +330,15 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // skips the mov and the cache clobber, so future resolves in the
     // same op can still hit the cache for other vregs. See stage_rax.
     std::uint32_t self_mov_eliminations = 0;
+    // Pass 54 V3 (LSRA->XMM): FPR analog of gpr_cache. Empty when the
+    // target descriptor doesn't expose an FPR pool (the legacy contract)
+    // — the FPR ops (FADD/FSUB/FMUL/FDIV/FCONSTri/FMOVmr) then read/write
+    // through home slots exactly as they did before. When the pool is
+    // non-empty, the resolve lambda returns is_xmm=true for FPR-class
+    // vregs the regalloc assigned an XMM, and the FP op cases use the
+    // stage_xmm0/stage_xmm1/populate_dst_from_xmm0 path.
+    XmmCache xmm_cache;
+    std::uint32_t xmm_cache_hits = 0;
 
     // Resolve operand (vreg or slot) -> RegOrSlot, given the assignment.
     // IBE-19 fix: spilled VRegs use the MIR node's home_slot (the Tier-0
@@ -280,6 +354,16 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // instead of a memory load (4-7 bytes). On cache miss, fall back to
     // the home slot — the home is always up-to-date because every
     // defining op still writes it (for deopt safety).
+    //
+    // LSRA->XMM extension (Pass 54 V3): mirror the GPR cache check for
+    // FPR-class vregs. The regalloc now produces a parallel
+    // assignment_fpr[] array indexed by vreg; if the vreg is FPR-class
+    // AND assigned an XMM, return is_xmm=true so the FP staging helpers
+    // emit a movsd reg-reg (4 bytes, 1 cycle) instead of a movsd from
+    // memory (5-8 bytes, 4-6 cycles). Falls back to home on cache miss
+    // — the FP home-write discipline (every FPR op writes back to home
+    // for deopt safety, just like the GPR ops) keeps the home slot
+    // authoritative.
     const auto resolve = [&](const MachineOperand& op) noexcept {
         RegOrSlot r;
         if (op.kind == MachineOperand::VReg) {
@@ -289,9 +373,24 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 r.slot = op.vreg;   // fallback (shouldn't happen)
                 return r;
             }
-            // If the regalloc assigned a GPR AND that GPR still holds this
-            // vreg's value (per gpr_cache), use the GPR directly.
-            if (op.vreg < ra.assignment.size() && ra.assignment[op.vreg] >= 0) {
+            // Pass 54 V3: FPR-class vregs go through the XMM cache path.
+            // The reg class is read from the MIR node's `rc` field
+            // (constant per vreg — the regalloc inherited it).
+            const bool is_fpr =
+                lowered.mir.node(op.vreg).rc == MachineRegClass::FPR;
+            if (is_fpr && !ra.assignment_fpr.empty() &&
+                op.vreg < ra.assignment_fpr.size() &&
+                ra.assignment_fpr[op.vreg] >= 0) {
+                std::uint8_t xmm = alloc_fpr(ra.assignment_fpr[op.vreg]);
+                if (xmm_cache.holds(xmm, op.vreg)) {
+                    r.is_xmm = true;
+                    r.xmm = xmm;
+                    ++xmm_cache_hits;
+                }
+            } else if (!is_fpr && op.vreg < ra.assignment.size() &&
+                       ra.assignment[op.vreg] >= 0) {
+                // If the regalloc assigned a GPR AND that GPR still holds this
+                // vreg's value (per gpr_cache), use the GPR directly.
                 std::uint8_t gpr = alloc_reg(ra.assignment[op.vreg]);
                 if (gpr_cache.holds(gpr, op.vreg)) {
                     r.is_reg = true;
@@ -375,6 +474,81 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 gpr_cache.define(dst_gpr, vreg_id);
             }
             // If dst_gpr == RAX, the define above already covers it.
+        }
+    };
+
+    // ===== Pass 54 V3 (LSRA->XMM) FPR-staging helpers =========================
+    // The FPR analogs of stage_rax/stage_rcx/populate_dst_from_rax. XMM0
+    // is the primary FP staging register (analog of RAX); XMM1 is the
+    // secondary (analog of RCX). The SSE2 emit pattern for FADD/FSUB/
+    // FMUL/FDIV is:
+    //   stage_xmm0(lhs, kPayloadOffset);    // movsd xmm0, ?
+    //   stage_xmm1(rhs, kPayloadOffset);    // movsd xmm1, ?
+    //   addsd xmm0, xmm1;                   // result in xmm0
+    //   movsd [home], xmm0;                 // write-back for deopt safety
+    //   populate_dst_from_xmm0(id);         // movsd dst_xmm, xmm0 + cache
+    //
+    // Self-mov elimination (Pass 54 V2 analog): if r.is_xmm &&
+    // r.xmm == XMM0, the cache invariant says state[XMM0] == r's vreg
+    // (resolve checked holds(XMM0, r's vreg)). XMM0 already holds r's
+    // value — nothing to stage. Skipping the movsd AND the clobber
+    // keeps the cache consistent: future resolves in the same op can
+    // still hit the cache for OTHER FPR vregs (e.g., the rhs of a
+    // binary FP op whose cache entry lives in XMM0 because the regalloc
+    // assigned XMM0 to it).
+    const auto stage_xmm0 = [&](const RegOrSlot& r, std::uint8_t tag_off) noexcept {
+        if (r.is_xmm && r.xmm == x86::XMM0) {
+            ++self_mov_eliminations;
+            return;
+        }
+        xmm_cache.clobber(x86::XMM0);
+        if (r.is_xmm) {
+            a.movsd_xmm_xmm(x86::XMM0, r.xmm);
+        } else {
+            a.movsd_xmm_mem(x86::XMM0, frame_base, slot_disp(r.slot, tag_off));
+        }
+    };
+
+    // Stage a RegOrSlot value into XMM1 (second FP staging register).
+    // Same clobber-first discipline as stage_xmm0; same self-mov
+    // elimination when r.is_xmm && r.xmm == XMM1.
+    const auto stage_xmm1 = [&](const RegOrSlot& r, std::uint8_t tag_off) noexcept {
+        if (r.is_xmm && r.xmm == x86::XMM1) {
+            ++self_mov_eliminations;
+            return;
+        }
+        xmm_cache.clobber(x86::XMM1);
+        if (r.is_xmm) {
+            a.movsd_xmm_xmm(x86::XMM1, r.xmm);
+        } else {
+            a.movsd_xmm_mem(x86::XMM1, frame_base, slot_disp(r.slot, tag_off));
+        }
+    };
+
+    // Post-def cache update: after a producing FP op leaves its result
+    // in XMM0 (FADD/FSUB/FMUL/FDIV — XMM0 is the dst per the SSE2 two-
+    // operand form), populate the regalloc-assigned dst_xmm from XMM0,
+    // then mark both XMM0 and dst_xmm in the cache as holding this
+    // vreg's value. Mirrors populate_dst_from_rax exactly.
+    //
+    // XMM0's cache entry is valid until the next FP op's stage_xmm0
+    // clobbers it. dst_xmm's entry is valid for the rest of the block
+    // (or until some FP op explicitly clobbers it via stage_xmm0 or
+    // stage_xmm1 — only happens if dst_xmm is XMM0 or XMM1).
+    //
+    // Fallback when assignment_fpr is empty (legacy contract — no FPR
+    // pool): the vreg was not assigned an XMM, so the cache is left
+    // alone. Subsequent reads of this vreg will fall back to home.
+    const auto populate_dst_from_xmm0 = [&](std::uint32_t vreg_id) noexcept {
+        xmm_cache.define(x86::XMM0, vreg_id);
+        if (!ra.assignment_fpr.empty() && vreg_id < ra.assignment_fpr.size() &&
+            ra.assignment_fpr[vreg_id] >= 0) {
+            std::uint8_t dst_xmm = alloc_fpr(ra.assignment_fpr[vreg_id]);
+            if (dst_xmm != x86::XMM0) {
+                a.movsd_xmm_xmm(dst_xmm, x86::XMM0);
+                xmm_cache.define(dst_xmm, vreg_id);
+            }
+            // If dst_xmm == XMM0, the define above already covers it.
         }
     };
 
@@ -734,24 +908,22 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 case MOp::FSUBrr:
                 case MOp::FMULrr:
                 case MOp::FDIVrr: {
-                    // SSE2 scalar double-precision. No FPR allocation — we
-                    // stage through XMM0/XMM1 (caller-saved scratch under
-                    // SysV). The home slot is the source of truth; we
-                    // reload from home on every use (no caching). This is
-                    // the same write-back discipline as the int fast path
-                    // (which stages through RAX/RCX) — slower than real FPR
-                    // allocation but correct and simple. Pass 53 (LSRA)
-                    // extension to allocate XMM is a future improvement.
+                    // SSE2 scalar double-precision. Pass 54 V3 (LSRA->XMM):
+                    // when the regalloc assigned an XMM to one or both
+                    // operands, the resolve lambda returns is_xmm=true
+                    // and we use movsd reg-reg (4 bytes, 1 cycle) instead
+                    // of movsd from memory (5-8 bytes, 4-6 cycles L1). The
+                    // home slot is still written back for deopt safety
+                    // (every FP defining op materializes to home, just
+                    // like the GPR ops — see MOVri case). After the op,
+                    // populate_dst_from_xmm0 propagates the result into
+                    // the regalloc-assigned dst XMM so subsequent reads
+                    // hit the cache.
                     if (n.operands.size() < 2) break;
                     RegOrSlot lhs = resolve(n.operands[0]);
                     RegOrSlot rhs = resolve(n.operands[1]);
-
-                    // movsd xmm0, [frame_base + lhs.slot * 16 + 8]
-                    a.movsd_xmm_mem(x86::XMM0, frame_base,
-                                    slot_disp(lhs.slot, kPayloadOffset));
-                    // movsd xmm1, [frame_base + rhs.slot * 16 + 8]
-                    a.movsd_xmm_mem(x86::XMM1, frame_base,
-                                    slot_disp(rhs.slot, kPayloadOffset));
+                    stage_xmm0(lhs, kPayloadOffset);
+                    stage_xmm1(rhs, kPayloadOffset);
 
                     bool ok = true;
                     if (n.op == MOp::FADDrr) {
@@ -765,25 +937,30 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     }
                     (void)ok;   // every emit returns true unless buffer exhausted
 
-                    // movsd [frame_base + n.home_slot * 16 + 8], xmm0
+                    // Write-back: payload + tag (FP home discipline — keeps
+                    // the home slot authoritative for deopt + GUARD_FLOAT
+                    // tag-word reads).
                     a.movsd_mem_xmm(frame_base,
                                     slot_disp(n.home_slot, kPayloadOffset),
                                     x86::XMM0);
-                    // Tag write-back: Tag::Float (3).
                     a.mov_mem_imm32(frame_base,
                                     slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagFloat));
+                    // Pass 54 V3: populate dst_xmm from XMM0 so subsequent
+                    // FP reads of this vreg hit the XMM cache.
+                    populate_dst_from_xmm0(id);
                     break;
                 }
                 case MOp::FMOVmr: {
                     // Store FP result from a source vreg to a dest home slot.
-                    // Both operands resolve to home slots (FPR-class vregs
-                    // never register-cached under the current scheme); we
-                    // movsd from src home payload to dst home payload via XMM0.
+                    // Pass 54 V3: when the source vreg is FPR-class and
+                    // cached in an XMM, use movsd reg-reg (4 bytes, 1 cycle)
+                    // instead of movsd from memory (5-8 bytes, 4-6 cycles).
+                    // resolve() returns is_xmm=true in that case; stage_xmm0
+                    // routes it through the right emit path.
                     if (n.operands.size() < 2) break;
                     RegOrSlot src = resolve(n.operands[1]);
-                    a.movsd_xmm_mem(x86::XMM0, frame_base,
-                                    slot_disp(src.slot, kPayloadOffset));
+                    stage_xmm0(src, kPayloadOffset);
                     a.movsd_mem_xmm(frame_base,
                                     slot_disp(n.operands[0].slot,
                                               n.operands[0].tag_off),
@@ -812,10 +989,26 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     a.mov_mem_imm32(frame_base,
                                     slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagFloat));
-                    // Pass 54: populate dst_gpr from RAX (the FP constant
-                    // is stored as a raw bit pattern in the home payload;
-                    // consumers that read the payload can use the GPR).
+                    // Pass 54 V2 (legacy): populate dst_gpr from RAX (the
+                    // FP constant's RAW bit pattern is now in RAX as an
+                    // int64; a GPR-class consumer reading this as int64
+                    // could use it, though in practice the only consumer
+                    // is an FP op which reads through home).
                     populate_dst_from_rax(id);
+                    // Pass 54 V3 (LSRA->XMM): if the regalloc assigned an
+                    // XMM to this FCONSTri's vreg, materialize the FP
+                    // constant directly into that XMM too. We use the
+                    // movq_xmm_r64 form (66 REX.W 0F 6E /r) to move the
+                    // int64 from RAX into the dst XMM's low lane. The
+                    // cache is then marked so subsequent FP reads of this
+                    // vreg hit the XMM. (dst_xmm != XMM0/XMM1, so no
+                    // clobber needed.)
+                    if (!ra.assignment_fpr.empty() && id < ra.assignment_fpr.size() &&
+                        ra.assignment_fpr[id] >= 0) {
+                        std::uint8_t dst_xmm = alloc_fpr(ra.assignment_fpr[id]);
+                        a.movq_xmm_r64(dst_xmm, x86::RAX);
+                        xmm_cache.define(dst_xmm, id);
+                    }
                     break;
                 }
                 case MOp::SETCCri: {
@@ -870,6 +1063,18 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     for (std::uint32_t i = 0; i < n_alloc; ++i) {
                         std::uint8_t gpr = target.allocatable[i];
                         if (gpr != x86::RBX) gpr_cache.clobber(gpr);
+                    }
+                    // Pass 54 V3 (LSRA->XMM): the bridge is a tail-call
+                    // to C++ code; under SysV x86-64 the XMM0-XMM15 file
+                    // is entirely caller-saved (no callee-saved XMMs
+                    // exist). Mark every cached XMM free — the runtime
+                    // may overwrite any of them while running the helper.
+                    // (In practice the bridge returns via longjmp into
+                    // the interpreter and never reads its XMM outputs, but
+                    // the conservative correctness contract is: every
+                    // cached XMM is dead past a CALLri.)
+                    for (std::uint32_t i = 0; i < n_alloc_fpr; ++i) {
+                        xmm_cache.clobber(target.allocatable_fpr[i]);
                     }
                     break;
                 }
@@ -963,6 +1168,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     out.peephole_fusions = peephole_fusions;
     out.gpr_cache_hits = gpr_cache_hits;
     out.self_mov_eliminations = self_mov_eliminations;
+    out.xmm_cache_hits = xmm_cache_hits;
     out.valid = a.size() > 0 && a.size() < capacity;
     (void)kTagNone;
     (void)kTagBool;

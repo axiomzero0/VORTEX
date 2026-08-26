@@ -68,6 +68,20 @@ struct CompiledCode {
     /// register's slot. Each elimination saves 3 bytes and one decode
     /// slot.
     std::uint32_t self_mov_eliminations{0};
+    /// Pass 54 V3 (LSRA->XMM): count of operand reads served from the
+    /// XMM cache instead of from the home slot. Mirrors `gpr_cache_hits`
+    /// but for FPR-class vregs. Zero under the legacy write-through-home
+    /// scheme (no FPR allocation, every FPR op reloads from home);
+    /// positive when the regalloc-aware resolve finds the operand's
+    /// assigned XMM still holding its value. Each hit replaces a
+    /// `movsd xmm, [r12 + slot*16 + 8]` (5-8 bytes, 4-6 cycles L1
+    /// dependent) with a `movsd xmm_dst, xmm_src` (4 bytes, 1 cycle).
+    /// The hot path this fires on is the float-loop pattern: any tight
+    /// loop with FADD/FSUB/FMUL/FDIV chain (e.g., `s += x[i] * y[i]`
+    /// over an array) benefits the most — the loop-carried `s` lives
+    /// in an XMM for the whole loop body, reloaded from home only at
+    /// the loop boundary.
+    std::uint32_t xmm_cache_hits{0};
     bool valid{false};
 };
 
