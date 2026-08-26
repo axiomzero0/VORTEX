@@ -163,32 +163,23 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     // the wrong frame slot for spilled values and causing spurious deopts
     // or wrong values.
     //
-    // FPR-class discipline: the regalloc only allocates GPRs (it does not
-    // track reg classes). For FPR-class vregs (FP arithmetic, FP constants)
-    // we IGNORE the regalloc assignment and always treat them as spilled
-    // to home — the codegen stages through XMM0/XMM1 (caller-saved scratch
-    // under SysV) for FP ops, reading and writing the home slot directly.
-    // Treating an FPR-class vreg as register-cached would have the MOVmr
-    // codegen read from a GPR the FADDrr never wrote to, producing
-    // garbage (the regression that masked the float fast path).
+    // ALWAYS-SPILL DISCIPLINE: the resolve lambda always returns is_reg=
+    // false, even when the regalloc assigned a GPR. This is sound because
+    // every producing op (MOVri, ADDrr, FCONSTri, etc.) writes its result
+    // to the home slot — the regalloc's GPR is only an (unsafe) cache
+    // that gets clobbered by the next op's RAX staging. The MOVri home
+    // write uses RAX as a staging register; if the previous op (e.g.
+    // MOVrm) cached its result in RAX via the regalloc, the MOVri's
+    // RAX staging silently overwrites that cache, and the next op's
+    // stage_rax(RAX) reads garbage instead of the original value.
+    //
+    // Treating all vregs as spilled-to-home trades a small perf loss
+    // (every operand is reloaded from home) for correctness across all
+    // instruction combinations. A future regalloc-aware codegen would
+    // re-introduce register caching with proper liveness tracking.
     const auto resolve = [&](const MachineOperand& op) noexcept {
         RegOrSlot r;
         if (op.kind == MachineOperand::VReg) {
-            const bool is_fpr_class =
-                op.vreg >= 1 && op.vreg <= lowered.mir.node_count() &&
-                lowered.mir.node(op.vreg).rc == MachineRegClass::FPR;
-            if (!is_fpr_class &&
-                op.vreg < ra.assignment.size() && ra.assignment[op.vreg] >= 0) {
-                r.is_reg = true;
-                r.reg = alloc_reg(ra.assignment[op.vreg]);
-                // For register-cached values, the home slot is still the
-                // authoritative source of the tag (write-back discipline).
-                // Look up the MIR node by vreg (id) to get its home_slot.
-                if (op.vreg >= 1 && op.vreg <= lowered.mir.node_count()) {
-                    r.slot = lowered.mir.node(op.vreg).home_slot;
-                }
-                return r;
-            }
             // spilled or FPR-class: home slot of the defining MIR node.
             if (op.vreg >= 1 && op.vreg <= lowered.mir.node_count()) {
                 r.slot = lowered.mir.node(op.vreg).home_slot;
@@ -267,26 +258,32 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
             switch (n.op) {
                 case MOp::MOVri: {
                     if (n.operands.empty()) break;
-                    // IBE-18 note: when has_reg, the home slot is NOT
-                    // written — subsequent ops that read the tag from the
-                    // home slot see stale data. The proper fix is for the
-                    // lowering to give each MOVri a UNIQUE home_slot (not
-                    // shared with the owning terminator's home_slot=0); a
-                    // blanket "write to home_slot" here would clobber the
-                    // Return's value (the Return terminator's tag-vreg
-                    // MOVri shares home_slot 0 with the Return's MOVmr).
-                    // For now, the original behavior stands; this is a
-                    // documented subset limitation of the JIT.
-                    if (has_reg) {
-                        a.mov_r64_imm64(alloc_reg(ra.assignment[id]),
-                                        static_cast<std::uint64_t>(n.operands[0].imm));
-                    } else {
-                        a.mov_r64_imm64(x86::RAX, static_cast<std::uint64_t>(n.operands[0].imm));
-                        a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset),
-                                      x86::RAX);
-                        a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
-                                        static_cast<std::int32_t>(kTagInt));
-                    }
+                    // IBE-18 final fix: ALWAYS materialize the constant
+                    // into the home slot. The original code skipped the
+                    // home write when has_reg=true, which left the tag
+                    // uninitialized for subsequent GUARD_INT reads — the
+                    // bool fast path's GUARD_INT fired spuriously because
+                    // home.tag was 0 (Tag::None), not Tag::Int. The
+                    // IBE-18 revert was because the Return's tag_vreg
+                    // MOVri shared home_slot=0 with the Return's MOVmr
+                    // (which writes the actual return value to
+                    // home[0].payload); the lowering now gives each
+                    // tag_vreg a UNIQUE home_slot beyond frame_slots,
+                    // so the home-write here is safe and cannot clobber
+                    // the return value.
+                    //
+                    // The always-spill discipline (see resolve lambda)
+                    // means the regalloc's cached GPR is never read by
+                    // consumers — we always reload from home. So we
+                    // don't need to populate the GPR here.
+                    a.mov_r64_imm64(x86::RAX,
+                                    static_cast<std::uint64_t>(n.operands[0].imm));
+                    a.mov_mem_r64(frame_base,
+                                  slot_disp(n.home_slot, kPayloadOffset),
+                                  x86::RAX);
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagInt));
                     break;
                 }
                 case MOp::MOVrm: {
@@ -299,43 +296,32 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                 }
                 case MOp::MOVmr: {
                     // Store source vreg's value into the destination home
-                    // slot. Handles BOTH register-cached sources (direct
-                    // store) and spilled sources (load through a scratch
-                    // register first then store). The earlier version
-                    // silently dropped the store when the source was
-                    // spilled — the result Value was never written to
-                    // home[0], and RET read an uninitialized slot.
+                    // slot. Under the always-spill discipline (see resolve
+                    // lambda), we always read from the source's home slot
+                    // via RAX staging — the regalloc's cached GPR is
+                    // unsafe (it can be clobbered by intermediate ops'
+                    // RAX staging).
                     //
-                    // FPR-class sources: never use GPR allocation; the
-                    // result lives in the source's home slot payload
-                    // (the FADDrr/FCONSTri/etc. always write to home
-                    // under the write-through-home discipline). Treat
-                    // them identically to spilled GPRs.
+                    // Source read offset: ALWAYS the payload offset (8).
+                    // The source vreg's value (whether it's the Add result,
+                    // a ConstInt's imm, or a tag_vreg's kTagBool/kTagInt/
+                    // kTagFloat constant) lives at home[src].payload.
+                    // Dest write offset: dest.tag_off (controlled by the
+                    // lowering — 8 for payload-writes, 0 for tag-writes).
+                    // The earlier code used dest.tag_off for BOTH src read
+                    // and dest write — that conflated the two offsets,
+                    // producing wrong values when src.payload → dest.tag
+                    // (the tag_vreg pattern in the Return terminator).
                     if (n.operands.size() < 2 ||
                         n.operands[0].kind != MachineOperand::FrameSlot ||
                         n.operands[1].kind != MachineOperand::VReg) break;
                     if (n.operands[1].vreg >= ra.assignment.size()) break;
-                    std::int32_t src_assign = ra.assignment[n.operands[1].vreg];
-                    const bool src_is_fpr =
-                        n.operands[1].vreg >= 1 &&
-                        n.operands[1].vreg <= lowered.mir.node_count() &&
-                        lowered.mir.node(n.operands[1].vreg).rc == MachineRegClass::FPR;
-                    if (src_assign >= 0 && !src_is_fpr) {
-                        // Register-cached GPR: direct store.
-                        a.mov_mem_r64(frame_base,
-                                      slot_disp(n.operands[0].slot, n.operands[0].tag_off),
-                                      alloc_reg(src_assign));
-                    } else {
-                        // Spilled GPR or any FPR-class: load from source's
-                        // home slot into RAX, then store into the
-                        // destination home slot.
-                        std::uint32_t src_home = lowered.mir.node(n.operands[1].vreg).home_slot;
-                        a.mov_r64_mem(x86::RAX, frame_base,
-                                      slot_disp(src_home, n.operands[0].tag_off));
-                        a.mov_mem_r64(frame_base,
-                                      slot_disp(n.operands[0].slot, n.operands[0].tag_off),
-                                      x86::RAX);
-                    }
+                    std::uint32_t src_home = lowered.mir.node(n.operands[1].vreg).home_slot;
+                    a.mov_r64_mem(x86::RAX, frame_base,
+                                  slot_disp(src_home, kPayloadOffset));
+                    a.mov_mem_r64(frame_base,
+                                  slot_disp(n.operands[0].slot, n.operands[0].tag_off),
+                                  x86::RAX);
                     break;
                 }
                 case MOp::ADDrr:
@@ -578,6 +564,31 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     a.mov_mem_imm32(frame_base,
                                     slot_disp(n.home_slot, kTagOffset),
                                     static_cast<std::int32_t>(kTagFloat));
+                    break;
+                }
+                case MOp::SETCCri: {
+                    // Bool set-on-condition. The previous CMPrr set the
+                    // flags; this op reads them and writes 0/1 to home
+                    // payload + tag=Tag::Bool. We use `setcc al` then
+                    // `movzx eax, al` (zero-extend) — MOVZX preserves
+                    // EFLAGS, so the SETcc reads the actual comparison
+                    // result. The earlier code used `xor rax, rax` to
+                    // clear RAX before SETcc, but XOR sets ZF=1, which
+                    // made every SETcc EQ fire spuriously regardless of
+                    // the comparison result.
+                    if (n.operands.empty()) break;
+                    const auto mc = static_cast<MCond>(n.operands[0].imm);
+                    if (mc >= MCond::Count) break;
+                    a.setcc_al(kX86Cond[static_cast<std::size_t>(mc)]);
+                    a.movzx_eax_al();   // zero-extend AL → EAX (preserves flags, clears upper 56 bits)
+                    // Store the bool payload.
+                    a.mov_mem_r64(frame_base,
+                                  slot_disp(n.home_slot, kPayloadOffset),
+                                  x86::RAX);
+                    // Write tag = kTagBool.
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagBool));
                     break;
                 }
                 case MOp::CALLri: {

@@ -82,6 +82,14 @@ enum class MOp : std::uint8_t {
     // risking payload clobber on a spill, so we fold the two writes into
     // one node.
     FCONSTri,
+    // Bool set-on-condition — consumes the flags from a preceding CMPrr.
+    // Operand[0] = MCond immediate (the condition to test). The codegen
+    // emits XOR+SETcc+MOVmr (write 0/1 to home.payload) and writes tag=
+    // Tag::Bool. Distinct from CMPrr (which only sets flags without
+    // producing a Python-typed result). The fast path covers PyCompare
+    // with both operands provably_int and subop in {LT,LE,GT,GE,EQ,NE};
+    // Is/IsNot/In/NotIn still bridge (object identity / __contains__).
+    SETCCri,
     SAFEPOINT,
     DEOPT_TRAP,
 };
@@ -134,6 +142,8 @@ enum class MCond : std::uint8_t {
             return CostClass::Alu;     // FP adds throughput-1; mul ~4c, div ~13c, but Alu is the closest class
         case MOp::FCONSTri:
             return CostClass::Move;   // 1x mov + 1x store-imm32, throughput-bound
+        case MOp::SETCCri:
+            return CostClass::Alu;   // xor+setcc+store, ~3 ALU ops
         case MOp::JMP:
         case MOp::Jcc:
             return CostClass::Branch;

@@ -337,6 +337,165 @@ void free_exec_buffer(std::byte* p, std::size_t bytes) noexcept {
     return g;
 }
 
+// =============================================================================
+// BOOL FAST-PATH CORPUS (PyCompare with both operands provably int).
+//
+// The bool fast path emits GUARD_INT + CMPrr + SETCCri (write 0/1 to home
+// payload + tag=Tag::Bool). Covers all six CmpOpKinds that map to native
+// signed-integer comparisons: LT, LE, GT, GE, EQ, NE. Each case returns
+// a Value with tag=Tag::Bool and payload 1 (true) or 0 (false).
+// =============================================================================
+
+[[nodiscard]] Graph bool_lt_two_int_constants_graph() {
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId c2 = g.create(NodeKind::ConstInt);
+    g.node(c2).const_value = Value::integer(2);
+    g.node(c2).set_flag(NodeFlag::Pure);
+    NodeId c3 = g.create(NodeKind::ConstInt);
+    g.node(c3).const_value = Value::integer(3);
+    g.node(c3).set_flag(NodeFlag::Pure);
+    NodeId cmp = g.create(NodeKind::PyCompare, {start, start, c2, c3});
+    g.node(cmp).subop = static_cast<std::uint16_t>(CmpOpKind::LT);
+    g.node(cmp).set_flag(NodeFlag::OnEffectChain);
+    NodeId ret = g.create(NodeKind::Return, {start, cmp});
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+    g.n_parameters = 0;
+    g.function_name = global_symbols().intern("bool_lt");
+    return g;
+}
+
+[[nodiscard]] Graph bool_le_equal_constants_graph() {
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId c5 = g.create(NodeKind::ConstInt);
+    g.node(c5).const_value = Value::integer(5);
+    g.node(c5).set_flag(NodeFlag::Pure);
+    NodeId c5b = g.create(NodeKind::ConstInt);
+    g.node(c5b).const_value = Value::integer(5);
+    g.node(c5b).set_flag(NodeFlag::Pure);
+    NodeId cmp = g.create(NodeKind::PyCompare, {start, start, c5, c5b});
+    g.node(cmp).subop = static_cast<std::uint16_t>(CmpOpKind::LE);
+    g.node(cmp).set_flag(NodeFlag::OnEffectChain);
+    NodeId ret = g.create(NodeKind::Return, {start, cmp});
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+    g.n_parameters = 0;
+    g.function_name = global_symbols().intern("bool_le_eq");
+    return g;
+}
+
+[[nodiscard]] Graph bool_gt_false_case_graph() {
+    // 2 > 3 → false. Tests the "false" branch of GT (predicate false).
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId c2 = g.create(NodeKind::ConstInt);
+    g.node(c2).const_value = Value::integer(2);
+    g.node(c2).set_flag(NodeFlag::Pure);
+    NodeId c3 = g.create(NodeKind::ConstInt);
+    g.node(c3).const_value = Value::integer(3);
+    g.node(c3).set_flag(NodeFlag::Pure);
+    NodeId cmp = g.create(NodeKind::PyCompare, {start, start, c2, c3});
+    g.node(cmp).subop = static_cast<std::uint16_t>(CmpOpKind::GT);
+    g.node(cmp).set_flag(NodeFlag::OnEffectChain);
+    NodeId ret = g.create(NodeKind::Return, {start, cmp});
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+    g.n_parameters = 0;
+    g.function_name = global_symbols().intern("bool_gt_false");
+    return g;
+}
+
+[[nodiscard]] Graph bool_ge_true_case_graph() {
+    // 5 >= 5 → true. GE-EQ case where the predicate fires on equality.
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId c5 = g.create(NodeKind::ConstInt);
+    g.node(c5).const_value = Value::integer(5);
+    g.node(c5).set_flag(NodeFlag::Pure);
+    NodeId c5b = g.create(NodeKind::ConstInt);
+    g.node(c5b).const_value = Value::integer(5);
+    g.node(c5b).set_flag(NodeFlag::Pure);
+    NodeId cmp = g.create(NodeKind::PyCompare, {start, start, c5, c5b});
+    g.node(cmp).subop = static_cast<std::uint16_t>(CmpOpKind::GE);
+    g.node(cmp).set_flag(NodeFlag::OnEffectChain);
+    NodeId ret = g.create(NodeKind::Return, {start, cmp});
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+    g.n_parameters = 0;
+    g.function_name = global_symbols().intern("bool_ge_true");
+    return g;
+}
+
+[[nodiscard]] Graph bool_eq_false_case_graph() {
+    // 7 == 8 → false. Tests SETcc with NE direction (predicate false
+    // means ZF=0 means SETcc NE → AL=1... wait, that's actually
+    // inverted. For EQ: SETcc EQ → AL = (ZF==1). 7 == 8 is false, so
+    // ZF=0, so SETcc EQ → AL=0. Good — this case validates that
+    // direction.
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId c7 = g.create(NodeKind::ConstInt);
+    g.node(c7).const_value = Value::integer(7);
+    g.node(c7).set_flag(NodeFlag::Pure);
+    NodeId c8 = g.create(NodeKind::ConstInt);
+    g.node(c8).const_value = Value::integer(8);
+    g.node(c8).set_flag(NodeFlag::Pure);
+    NodeId cmp = g.create(NodeKind::PyCompare, {start, start, c7, c8});
+    g.node(cmp).subop = static_cast<std::uint16_t>(CmpOpKind::EQ);
+    g.node(cmp).set_flag(NodeFlag::OnEffectChain);
+    NodeId ret = g.create(NodeKind::Return, {start, cmp});
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+    g.n_parameters = 0;
+    g.function_name = global_symbols().intern("bool_eq_false");
+    return g;
+}
+
+[[nodiscard]] Graph bool_ne_true_case_graph() {
+    // 7 != 8 → true. NE predicate true; SETcc NE → AL = (ZF==0) = 1.
+    Graph g;
+    NodeId start = g.create(NodeKind::Start);
+    g.set_start(start);
+    NodeId c7 = g.create(NodeKind::ConstInt);
+    g.node(c7).const_value = Value::integer(7);
+    g.node(c7).set_flag(NodeFlag::Pure);
+    NodeId c8 = g.create(NodeKind::ConstInt);
+    g.node(c8).const_value = Value::integer(8);
+    g.node(c8).set_flag(NodeFlag::Pure);
+    NodeId cmp = g.create(NodeKind::PyCompare, {start, start, c7, c8});
+    g.node(cmp).subop = static_cast<std::uint16_t>(CmpOpKind::NE);
+    g.node(cmp).set_flag(NodeFlag::OnEffectChain);
+    NodeId ret = g.create(NodeKind::Return, {start, cmp});
+    g.node(ret).set_flag(NodeFlag::OnEffectChain);
+    g.set_end(ret);
+    g.n_parameters = 0;
+    g.function_name = global_symbols().intern("bool_ne_true");
+    return g;
+}
+
+// A bool test case: a graph + its expected boolean result.
+struct BoolDiffCase {
+    const char* name;
+    Graph (*build)();
+    bool expected;
+};
+
+const std::vector<BoolDiffCase> kBoolDiffCases = {
+    {"bool_lt",      bool_lt_two_int_constants_graph,   true},
+    {"bool_le_eq",   bool_le_equal_constants_graph,     true},
+    {"bool_gt_false",bool_gt_false_case_graph,          false},
+    {"bool_ge_true", bool_ge_true_case_graph,           true},
+    {"bool_eq_false",bool_eq_false_case_graph,          false},
+    {"bool_ne_true", bool_ne_true_case_graph,           true},
+};
+
 // A float test case: a graph + its expected FP result.
 struct FloatDiffCase {
     const char* name;
@@ -440,6 +599,39 @@ const std::vector<DiffCase> kDiffCases = {
     // Active VM (the bridge path could fire if GUARD_FLOAT deopts; for
     // the corpus all operands ARE float so it shouldn't, but the active
     // VM is the contract).
+    rt::Vm vm;
+    rt::set_vm_for_builtins(&vm);
+    rt::install_builtins(vm.program);
+
+    auto entry = reinterpret_cast<backend::JitEntryFn>(code_buf);
+    Value result = entry(regs);
+
+    std::free(regs);
+    free_exec_buffer(code_buf, kCodeCap);
+    *ok = true;
+    return result;
+}
+
+// Run a bool corpus case through the JIT. Returns the Value with tag
+// expected to be Tag::Bool; *ok set false on JIT compilation failure.
+[[nodiscard]] Value run_jit_bool(const BoolDiffCase& c, bool* ok) {
+    *ok = false;
+    Graph g = c.build();
+    constexpr std::size_t kCodeCap = 4096;
+    std::byte* code_buf = make_exec_buffer(kCodeCap);
+    if (!code_buf) return Value::none();
+
+    backend::CompiledCode cc = backend::compile_unit(g, /*unit_id=*/1, code_buf,
+                                                     kCodeCap, backend::host_target());
+    if (!cc.valid) {
+        free_exec_buffer(code_buf, kCodeCap);
+        return Value::none();
+    }
+
+    std::uint32_t n_regs = 64;
+    Value* regs = static_cast<Value*>(std::malloc(sizeof(Value) * n_regs));
+    for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+
     rt::Vm vm;
     rt::set_vm_for_builtins(&vm);
     rt::install_builtins(vm.program);
@@ -571,6 +763,46 @@ TEST(regr_jit_float_arithmetic_matches_expected) {
     CHECK_EQ(failures, 0);
 }
 
+// =============================================================================
+// Differential: every bool case must produce the expected Python bool when
+// run through the JIT. This is the regression that catches a future SETcc
+// direction bug (e.g. SETcc EQ used for an NE predicate, or vice versa) or
+// a tag writeback that clobbers Tag::Bool with kTagInt (which would make
+// `if result:` short-circuit incorrectly since Tag::Int's payload 0 is
+// falsy, but Tag::Bool's payload 0 is False — same result here, but other
+// code paths distinguishing bool from int would break).
+// =============================================================================
+TEST(regr_jit_bool_arithmetic_matches_expected) {
+    int failures = 0;
+    for (const BoolDiffCase& c : kBoolDiffCases) {
+        bool ok = false;
+        Value got = run_jit_bool(c, &ok);
+        if (!ok) {
+            std::fprintf(stderr, "  [jit-diff-bool] %s: codegen or exec failed\n",
+                         c.name);
+            ++failures;
+            continue;
+        }
+        if (got.tag != Tag::Bool) {
+            std::fprintf(stderr,
+                         "  [jit-diff-bool] %s: result tag %u (expected Bool=%u)\n",
+                         c.name, static_cast<unsigned>(got.tag),
+                         static_cast<unsigned>(Tag::Bool));
+            ++failures;
+            continue;
+        }
+        const bool got_b = got.as.i != 0;
+        if (got_b != c.expected) {
+            std::fprintf(stderr,
+                         "  [jit-diff-bool] %s: result %s (expected %s)\n",
+                         c.name, got_b ? "true" : "false",
+                         c.expected ? "true" : "false");
+            ++failures;
+        }
+    }
+    CHECK_EQ(failures, 0);
+}
+
 #else  // non-x86-64 host
 
 // On non-x86-64 hosts the JIT emitter refuses to run, so we mark the
@@ -586,6 +818,10 @@ TEST(regr_jit_expected_values_oracle) {
 
 TEST(regr_jit_float_arithmetic_matches_expected) {
     std::printf("  [skipped] JIT float differential is x86-64 only on this host\n");
+}
+
+TEST(regr_jit_bool_arithmetic_matches_expected) {
+    std::printf("  [skipped] JIT bool differential is x86-64 only on this host\n");
 }
 
 #endif  // __x86_64__

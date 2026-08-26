@@ -178,6 +178,45 @@ public:
         return emit8(modrm(kModReg, 3, reg & 7));
     }
 
+    // --- XOR r64, r/m64 (REX.W 31 /r) — register-to-register xor ---------------------
+    // Used by SETCCri: `xor rax, rax` clears RAX before SETcc writes the
+    // low byte, so the upper 56 bits are zero and `as.i` reads as 0/1
+    // (matching Python bool semantics).
+    [[nodiscard]] bool xor_r64_r64(std::uint8_t dst, std::uint8_t src) noexcept {
+        std::uint8_t rex = REX_W;
+        if (src >= 8) rex |= 0x04;
+        if (dst >= 8) rex |= 0x01;
+        if (!emit8(rex)) return false;
+        if (!emit8(0x31)) return false;
+        return emit8(modrm(kModReg, src & 7, dst & 7));
+    }
+
+    // --- SETcc r8 (0F 9x /r, mod=11) — set byte from flag condition ---------------
+    // The condition is the x86-64 Jcc low nibble (0x04=E, 0x05=NE, etc.).
+    // For AL (reg=0, rm=0), ModRM = 0xC0 | (cond & 0x0F). The previous
+    // SETcc AL form (0F 9x C0) sets only the low 8 bits — callers MUST
+    // zero-extend (e.g. via the `xor_r64_r64(rax, rax)` immediately
+    // before) so `as.i` reads as 0/1 not as a sign-extended byte.
+    [[nodiscard]] bool setcc_al(std::uint8_t cond_low) noexcept {
+        if (!emit8(0x0F)) return false;
+        if (!emit8(static_cast<std::uint8_t>(0x90 | (cond_low & 0x0F)))) return false;
+        return emit8(0xC0);   // ModRM: mod=11, reg=0 (/0 sub-opcode), rm=0 (AL)
+    }
+
+    // --- MOVZX eax, al (0F B6 /r) — zero-extend AL to EAX (and implicitly
+    // zero the upper 32 bits of RAX in 64-bit mode). Crucially, MOVZX
+    // does NOT affect EFLAGS — the previous SETCCri codegen used
+    // `xor rax, rax` to clear RAX before SETcc, but XOR sets ZF=1
+    // (because the XOR result is zero), which then made every subsequent
+    // SETcc EQ fire spuriously (the SETcc reads ZF). MOVZX preserves
+    // the flags from the preceding CMPrr, so SETcc sees the actual
+    // comparison result.
+    [[nodiscard]] bool movzx_eax_al() noexcept {
+        if (!emit8(0x0F)) return false;
+        if (!emit8(0xB6)) return false;
+        return emit8(modrm(kModReg, 0 /* dst=EAX */, 0 /* src=AL */));
+    }
+
     // --- IMUL r64, r/m64 (REX.W 0F AF /r) ------------------------------------------------------
     [[nodiscard]] bool imul_r64_r64(std::uint8_t dst, std::uint8_t src) noexcept {
         std::uint8_t rex = REX_W;

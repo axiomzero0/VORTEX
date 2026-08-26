@@ -462,6 +462,68 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     break;
                 }
                 case NodeKind::PyCompare: {
+                    // Bool fast path: both operands provably int AND the
+                    // subop is one of the signed-integer comparisons
+                    // (LT/LE/GT/GE/EQ/NE). Is/IsNot/In/NotIn still bridge
+                    // — they need object identity / __contains__.
+                    //
+                    // The fast path emits:
+                    //   GUARD_INT (tag check both operands; else deopt)
+                    //   CMPrr (compare payloads; sets flags)
+                    //   SETCCri (write bool 0/1 to home.payload + tag=Bool)
+                    //
+                    // This is the dominant Python comparison surface —
+                    // every `if x == y:`, `while i < n:`,
+                    // `assert a >= 0`, etc. The bridge path was a
+                    // safepoint + interpreter call per comparison; with
+                    // this fast path the comparison stays in registers.
+                    if (n.ins.size() >= 4 && provably_int(g, n.ins[2]) &&
+                        provably_int(g, n.ins[3])) {
+                        const CmpOpKind csub = static_cast<CmpOpKind>(n.subop);
+                        const bool supported_int_cmp =
+                            csub == CmpOpKind::LT || csub == CmpOpKind::LE ||
+                            csub == CmpOpKind::GT || csub == CmpOpKind::GE ||
+                            csub == CmpOpKind::EQ || csub == CmpOpKind::NE;
+                        if (supported_int_cmp) {
+                            std::uint32_t a = materialize(materialize, n.ins[2], mb);
+                            std::uint32_t b = materialize(materialize, n.ins[3], mb);
+
+                            std::uint32_t guard = out.mir.create(
+                                MOp::GUARD_INT, MachineRegClass::GPR, home);
+                            out.mir.add_operand(guard, MachineOperand::reg(a));
+                            out.mir.add_operand(guard, MachineOperand::reg(b));
+                            out.mir.node(guard).is_safepoint = true;
+                            out.mir.node(guard).block = mb;
+                            out.mir.node(guard).frame_state_id =
+                                n.aux1 < g.frame_state_count() ? n.aux1 : 0xFFFFFFFFu;
+                            out.referenced_frame_states.push_back(
+                                out.mir.node(guard).frame_state_id);
+
+                            std::uint32_t cmp = out.mir.create(
+                                MOp::CMPrr, MachineRegClass::GPR, home);
+                            out.mir.node(cmp).block = mb;
+                            out.mir.add_operand(cmp, MachineOperand::reg(a));
+                            out.mir.add_operand(cmp, MachineOperand::reg(b));
+
+                            // Map CmpOpKind -> MCond.
+                            MCond mc = MCond::EQ;
+                            switch (csub) {
+                                case CmpOpKind::LT: mc = MCond::LT; break;
+                                case CmpOpKind::LE: mc = MCond::LE; break;
+                                case CmpOpKind::GT: mc = MCond::GT; break;
+                                case CmpOpKind::GE: mc = MCond::GE; break;
+                                case CmpOpKind::EQ: mc = MCond::EQ; break;
+                                case CmpOpKind::NE: mc = MCond::NE; break;
+                                default: break;
+                            }
+                            std::uint32_t setcc = out.mir.create(
+                                MOp::SETCCri, MachineRegClass::GPR, home);
+                            out.mir.node(setcc).block = mb;
+                            out.mir.add_operand(setcc, MachineOperand::cond_op(mc));
+                            materialized.insert(id, setcc);
+                            break;
+                        }
+                    }
                     std::uint32_t call = out.mir.create(MOp::CALLri, MachineRegClass::GPR, home);
                     out.mir.node(call).block = mb;
                     out.mir.add_operand(call, MachineOperand::imm_op(1));
@@ -586,12 +648,13 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
             // Decide the tag of the return value from the IR source node.
             // Int fast path (ConstInt, int arithmetic) → kTagInt = 2.
             // Float fast path (ConstFloat, float arithmetic) → kTagFloat = 3.
+            // Bool fast path (PyCompare with int operands) → kTagBool = 1.
             // Otherwise the home slot's tag was already written by the
             // helper or the dynamic-op writeback; we leave it alone and
             // skip the tag MOVri+MOVmr pair entirely. The earlier code
-            // hard-coded kTagInt=2 — that clobbered float returns with
-            // Tag::Int, producing wrong results for any float-returning
-            // function.
+            // hard-coded kTagInt=2 — that clobbered float/bool returns
+            // with Tag::Int, producing wrong results for any float-returning
+            // or bool-returning function.
             const Node& src = g.node(n.ins[1]);
             std::uint64_t ret_tag = 0;
             bool know_tag = false;
@@ -607,6 +670,12 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                          src.kind == NodeKind::I2F))) {
                 ret_tag = 3;   // kTagFloat
                 know_tag = true;
+            } else if (src.kind == NodeKind::PyCompare) {
+                // SETCCri wrote tag=kTagBool to its own home; the Return's
+                // MOVmr copies only the payload to slot 0, so slot 0's
+                // tag needs an explicit writeback.
+                ret_tag = 1;   // kTagBool
+                know_tag = true;
             }
 
             if (know_tag) {
@@ -616,7 +685,16 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                 out.mir.add_operand(wb, MachineOperand::slot_op(0, 8 /*payload off*/));
                 out.mir.add_operand(wb, MachineOperand::reg(v));
                 // Write the tag word for the known-type return.
-                std::uint32_t tag_vreg = out.mir.create(MOp::MOVri, MachineRegClass::GPR, 0);
+                // The tag_vreg gets a UNIQUE home_slot beyond frame_slots
+                // (the IBE-18 fix): MOVri always writes to home now, so
+                // sharing home_slot=0 with the Return's MOVmr would
+                // clobber the return value's payload. With a fresh
+                // home_slot, the tag_vreg's MOVri writes to its own slot
+                // and the wb_tag MOVmr reads that tag and writes it to
+                // home[0].tag — no clobber.
+                std::uint32_t tag_home = out.frame_slots;
+                out.frame_slots = tag_home + 1;
+                std::uint32_t tag_vreg = out.mir.create(MOp::MOVri, MachineRegClass::GPR, tag_home);
                 out.mir.node(tag_vreg).block = mb;
                 out.mir.add_operand(tag_vreg, MachineOperand::imm_op(
                     static_cast<std::int64_t>(ret_tag)));
