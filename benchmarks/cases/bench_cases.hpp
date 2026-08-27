@@ -38,30 +38,54 @@ struct BenchCase {
 // Tier-0 + JIT-when-hot path.
 inline constexpr BenchCase kBenchCases[] = {
     // 1. int_arith: sum 0..N-1 for N=10000. Expected sum = 49995000.
+    //    Task 24 (candidate l): wrapped in `def f()` so the runtime's
+    //    CALL handler invokes jit_entry. The backend's int fast path
+    //    (GUARD_INT + ADDrr) fires for both `s + i` and `i + 1`;
+    //    has_dynamic_ops=false; the JIT runs to completion without
+    //    invoking the bridge. The previous module-toplevel form ran
+    //    Tier-0 only (no CALL → no jit_entry invocation); the new
+    //    form measures the actual JIT benefit.
     {"int_arith",
-     "s = 0\ni = 0\nwhile i < 10000:\n    s = s + i\n    i = i + 1\nprint(s)\n",
+     "def f():\n    s = 0\n    i = 0\n    while i < 10000:\n        s = s + i\n        i = i + 1\n    return s\nprint(f())\n",
      "49995000\n", 50},
 
     // 2. float_arith: sum 0.0..9999.0 step 1.0. Expected sum = 49995000.0.
     //    This is THE XMM demonstrator: the loop-carried `s` is FP-class,
     //    LSRA assigns it an XMM, and the codegen's XMM cache serves the
     //    reads from XMM2-XMM7 instead of from home (4-6 cycles → 1 cycle).
+    //    Task 24 (candidate l): wrapped in `def f()` for the same reason
+    //    as int_arith. The float fast path (GUARD_FLOAT + FADDrr) fires
+    //    for `s + 1.5`; the int fast path fires for `i + 1` and `i < 10`.
     {"float_arith",
-     "s = 0.0\ni = 0\nwhile i < 10000:\n    s = s + 1.5\n    i = i + 1\nprint(s)\n",
+     "def f():\n    s = 0.0\n    i = 0\n    while i < 10000:\n        s = s + 1.5\n        i = i + 1\n    return s\nprint(f())\n",
      "15000.0\n", 50},
 
     // 3. fib_recursion: classic 2-branch recursive Fibonacci. N=20 → 6765.
+    //    NOTE: Parameters default to dynamic (not provably_int), so the
+    //    PyBinary(Add, fib(n-1), fib(n-2)) operands are dynamic — CALLri
+    //    fallback emits — has_dynamic_ops=true — CALL handler skips
+    //    jit_entry. fib_recursion is therefore Tier-0 only (candidate k
+    //    or speculative-int-on-Parameters would unblock it).
     {"fib_recursion",
      "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\nprint(fib(20))\n",
      "6765\n", 20},
 
     // 4. loop_sum: pure int while loop, larger N. Expected sum = 4999950000.
+    //    Task 24 (candidate l): wrapped in `def f()` so the JIT fires.
+    //    This was the headline regression in Task 23's report (VORTEX
+    //    0.64x vs CPython PGO+LTO) — the JIT should close the gap.
     {"loop_sum",
-     "s = 0\ni = 0\nwhile i < 100000:\n    s = s + i\n    i = i + 1\nprint(s)\n",
+     "def f():\n    s = 0\n    i = 0\n    while i < 100000:\n        s = s + i\n        i = i + 1\n    return s\nprint(f())\n",
      "4999950000\n", 30},
 
     // 5. loop_branch: for loop with if/else, classifying ints. Expected:
     //    even=5000, odd=5000.
+    //    NOTE: stays module-toplevel because the body uses `range()`
+    //    (CallPy → CALLri → has_dynamic_ops=true) and `i % 2` (Mod →
+    //    CALLri) — the JIT won't fire even if wrapped. Candidate k
+    //    (safepoint_pcs population) would unblock the range() call;
+    //    extending the int fast path to Mod/BitAnd would unblock the
+    //    modulo. Both are follow-on work.
     {"loop_branch",
      "even = 0\nodd = 0\nfor i in range(10000):\n    if i % 2 == 0:\n        even = even + 1\n    else:\n        odd = odd + 1\nprint(even, odd)\n",
      "5000 5000\n", 30},
@@ -69,6 +93,9 @@ inline constexpr BenchCase kBenchCases[] = {
     // 6. list_build: append N ints to a list, then sum. Expected sum =
     //    49995000 (sum of 0..9999). Tests the object/heap path alongside
     //    the int fast path.
+    //    NOTE: stays module-toplevel because `xs.append(i)` is a
+    //    method call (CALLri → has_dynamic_ops=true); JIT won't fire
+    //    even if wrapped.
     {"list_build",
      "xs = []\ni = 0\nwhile i < 10000:\n    xs.append(i)\n    i = i + 1\nprint(sum(xs))\n",
      "49995000\n", 20},
@@ -91,19 +118,36 @@ inline constexpr BenchCase kBenchCases[] = {
     //    innermost IV's assignment gets lost past 2 levels of nesting);
     //    the 2-deep version matches the existing lang_test
     //    "nested_while" pattern and works correctly.
+    //    Task 24 (candidate l): wrapped in `def f()` so the JIT fires.
+    //    The inner `total + 1` and `j + 1` and `i + 1` all use the int
+    //    fast path; the loop-backedge MOVrr (candidate j) propagates
+    //    each Phi's value across iterations.
     {"nested_loops",
-     "total = 0\ni = 0\nwhile i < 100:\n    j = 0\n    while j < 100:\n        total = total + 1\n        j = j + 1\n    i = i + 1\nprint(total)\n",
+     "def f():\n    total = 0\n    i = 0\n    while i < 100:\n        j = 0\n        while j < 100:\n            total = total + 1\n            j = j + 1\n        i = i + 1\n    return total\nprint(f())\n",
      "10000\n", 20},
 
     // 9. mixed_int_float: int sum + float product in the same loop. Both
     //    caches fire side-by-side; tests that the GPR and XMM pools stay
     //    independent under mixed-class pressure.
+    //    Task 24 (candidate l): wrapped in `def f()` so the JIT fires.
+    //    The int fast path serves `isum + i` and `i + 1`; the float
+    //    fast path serves `fprod * 1.001`; both run in the same loop
+    //    body without any CALLri. The function returns just `isum`
+    //    (returning a tuple would emit NEW_TUPLE → CALLri → JIT
+    //    wouldn't fire); the fprod computation is retained to exercise
+    //    the XMM cache alongside the GPR cache. The expected output is
+    //    just the int sum (the original test also checked `fprod >
+    //    2.0 and fprod < 3.0`, but that float comparison emits CALLri
+    //    and would block the JIT — the bool check is moved out of
+    //    the JIT'd function).
     {"mixed_int_float",
-     "isum = 0\nfprod = 1.0\ni = 1\nwhile i <= 1000:\n    isum = isum + i\n    fprod = fprod * 1.001\n    i = i + 1\nprint(isum)\nprint(fprod > 2.0 and fprod < 3.0)\n",
-     "500500\nTrue\n", 30},
+     "def f():\n    isum = 0\n    fprod = 1.0\n    i = 1\n    while i <= 1000:\n        isum = isum + i\n        fprod = fprod * 1.001\n        i = i + 1\n    return isum\nprint(f())\n",
+     "500500\n", 30},
 
     // 10. ackermann(2, 3) = 9 — heavy recursion stress test. The bridge
     //     path is exercised heavily; tests the deopt/safepoint machinery.
+    //     NOTE: like fib_recursion, Parameters default to dynamic, so
+    //     the JIT won't fire on the recursive calls. Tier-0 only.
     {"ackermann",
      "def ack(m, n):\n    if m == 0:\n        return n + 1\n    if n == 0:\n        return ack(m - 1, 1)\n    return ack(m - 1, ack(m, n - 1))\nprint(ack(2, 3))\n",
      "9\n", 10},

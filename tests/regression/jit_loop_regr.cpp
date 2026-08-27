@@ -91,6 +91,12 @@ TEST(jit_loop_regr_parsed_int_loop_fires_jit) {
 TEST(jit_loop_regr_parsed_float_loop_fires_jit) {
     bool ok = false;
     std::string out = vortex_test::capture_stdout(kFloatAccumSrc, &ok);
+    if (!ok || out != "15.0\n") {
+        std::fprintf(stderr, "jit_loop_regr_parsed_float_loop_fires_jit: ok=%d "
+                             "out=[%.*s] (size=%zu) expected=[15.0\\n]\n",
+                     static_cast<int>(ok),
+                     static_cast<int>(out.size()), out.data(), out.size());
+    }
     CHECK(ok);
     // 10 * 1.5 = 15.0 (IEEE 754 exact — no rounding).
     CHECK_EQ(out, "15.0\n");

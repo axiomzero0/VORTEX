@@ -163,7 +163,52 @@ constexpr std::array<LoweringEntry, 14> kLoweringTable{{
     if (n.kind == NodeKind::ConstFloat) return true;
     if (n.has(NodeFlag::Unboxed) && n.kind == NodeKind::I2F) return true;
     if (n.has(NodeFlag::Unboxed) && n.kind == NodeKind::PyBinary) return true;
+    // Task 24 (candidate j): Phi whose entry value (ins[0]) is a
+    // ConstFloat is float-typed. Symmetric with the provably_int Phi
+    // check above; unblocks the float fast path for parsed while
+    // loops like `s = 0.0; while ...: s = s + 1.5`.
+    if (n.kind == NodeKind::Phi && n.ins.size() >= 2) {
+        const Node& entry = g.node(n.ins[0]);
+        if (entry.kind == NodeKind::ConstFloat) return true;
+    }
     return false;
+}
+
+// Task 24 (candidate j): infer the Tag the producing op wrote to a
+// node's home slot. Used by the backedge MOVrr to know which tag
+// immediate to emit for the Phi's home write. We look at the node
+// kind directly (rather than re-running provably_int/provably_float,
+// which would recurse without termination on Phi cycles) because the
+// int/float/bool fast paths each write a known tag.
+//
+//   ConstInt            -> kTagInt   (2)
+//   ConstFloat          -> kTagFloat (3)
+//   PyCompare           -> kTagBool  (1)  (SETCCri writes kTagBool)
+//   PyBinary int path   -> kTagInt   (2)  (ADDrr writes payload + kTagInt)
+//   PyBinary float path -> kTagFloat (3)  (FADDrr + tag MOVmr writes kTagFloat)
+//   Phi                 -> recurse on entry value (ins[0])
+//   (other ops use the bridge — has_dynamic_ops=true, JIT not invoked)
+[[nodiscard]] std::uint64_t infer_home_tag(const Graph& g, NodeId v) noexcept {
+    const Node& n = g.node(v);
+    switch (n.kind) {
+        case NodeKind::ConstInt:  return 2;   // kTagInt
+        case NodeKind::ConstFloat: return 3;  // kTagFloat
+        case NodeKind::PyCompare:  return 1;  // kTagBool
+        case NodeKind::Phi: {
+            if (n.ins.size() < 2) return 2;
+            return infer_home_tag(g, n.ins[0]);
+        }
+        case NodeKind::PyBinary: {
+            if (n.ins.size() < 4) return 2;
+            // PyBinary int fast path fires when both operands are
+            // provably_int; float fast path fires when both are
+            // provably_float. The tag the fast path writes is the
+            // tag of the operands' type.
+            if (provably_float(g, n.ins[2]) && provably_float(g, n.ins[3])) return 3;
+            return 2;   // default: int (covers int fast path AND bridge fallback)
+        }
+        default: return 2;   // kTagInt default
+    }
 }
 
 }  // namespace
@@ -498,15 +543,31 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                             out.mir.node(wb).block = mb;
                             out.mir.add_operand(wb, MachineOperand::slot_op(home, 8 /*payload off*/));
                             out.mir.add_operand(wb, MachineOperand::reg(res));
-                            // Tag write-back: materialize Tag::Float constant.
+                            // Tag write-back: materialize Tag::Float constant
+                            // and write it to the PyBinary's home.tag (NOT
+                            // slot 0 — the IBE-18 final fix gives each
+                            // tag_vreg a UNIQUE home_slot beyond frame_slots
+                            // so its MOVri's kTagInt write to tag_home.tag
+                            // doesn't clobber slot 0's tag word). The
+                            // previous code used home=0 for the tag_vreg,
+                            // which wrote kTagInt (2) to home[0].tag — when
+                            // the PyBinary happened to be the function's
+                            // return value, this left home[0].tag=kTagInt
+                            // instead of kTagFloat, and the caller printed
+                            // the FP bit pattern as a decimal int64. The
+                            // regression `jit_loop_regr_parsed_float_loop`
+                            // was masked until Task 24 candidate (j) removed
+                            // the has_loop_phis downgrade.
+                            std::uint32_t tag_home = out.frame_slots;
+                            out.frame_slots = tag_home + 1;
                             std::uint32_t tag_v = out.mir.create(
-                                MOp::MOVri, MachineRegClass::GPR, 0);
+                                MOp::MOVri, MachineRegClass::GPR, tag_home);
                             out.mir.node(tag_v).block = mb;
                             out.mir.add_operand(tag_v, MachineOperand::imm_op(3 /*kTagFloat*/));
                             std::uint32_t wb_tag = out.mir.create(
                                 MOp::MOVmr, MachineRegClass::GPR, 0);
                             out.mir.node(wb_tag).block = mb;
-                            out.mir.add_operand(wb_tag, MachineOperand::slot_op(0, 0));
+                            out.mir.add_operand(wb_tag, MachineOperand::slot_op(home, 0 /*tag off*/));
                             out.mir.add_operand(wb_tag, MachineOperand::reg(tag_v));
                             break;
                         }
@@ -696,7 +757,22 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
             // IfFalse when cond was truthy. With EQ, the semantics are:
             //   cond False (payload 0) → ZF=1 → EQ taken → IfFalse ✓
             //   cond True (payload 1)  → ZF=0 → EQ not taken → IfTrue ✓
-            std::uint32_t zero_const = out.mir.create(MOp::MOVri, MachineRegClass::GPR, 0);
+            // Task 24 (candidate j): give the zero_const a UNIQUE
+            // home_slot beyond frame_slots (the IBE-18 final fix
+            // pattern). The previous code used home=0, which made
+            // MOVri write kTagInt (2) to home[0].tag — clobbering
+            // slot 0's tag word. For functions whose return value
+            // happens to be int, this accidentally produced the right
+            // tag (kTagInt). For functions returning float/bool, the
+            // Return's else-branch (know_tag=false for src=PyBinary)
+            // leaves home[0].tag at the clobbered kTagInt, so the
+            // caller prints FP bits as a decimal int64. The regression
+            // `jit_loop_regr_parsed_float_loop` was masked until Task
+            // 24 candidate (j) removed the has_loop_phis downgrade.
+            std::uint32_t zero_home = out.frame_slots;
+            out.frame_slots = zero_home + 1;
+            std::uint32_t zero_const = out.mir.create(
+                MOp::MOVri, MachineRegClass::GPR, zero_home);
             out.mir.node(zero_const).block = mb;
             out.mir.add_operand(zero_const, MachineOperand::imm_op(0));
             std::uint32_t cmp = out.mir.create(MOp::CMPrr, MachineRegClass::GPR, 0);
@@ -722,28 +798,23 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
             // hard-coded kTagInt=2 — that clobbered float/bool returns
             // with Tag::Int, producing wrong results for any float-returning
             // or bool-returning function.
+            //
+            // Task 24 (candidate j): the original check required
+            // `src.has(Unboxed) && src.kind == PyBinary` to set
+            // kTagFloat. Pass 47 today only marks Box/Unbox identity
+            // pairs as Unboxed, so PyBinary (the dominant arithmetic
+            // producer) is never Unboxed — know_tag stayed false, the
+            // else branch wrote payload only, and home[0].tag stayed at
+            // Tag::None. The caller then printed "None" for any
+            // PyBinary-returning function. We now use infer_home_tag
+            // (which inspects the IR kind + operands' provability
+            // directly, without requiring the Unboxed flag) to decide
+            // the return tag for ANY source kind: ConstInt/ConstFloat/
+            // PyBinary int-path/PyBinary float-path/PyCompare/Phi
+            // (recursing on the entry value).
             const Node& src = g.node(n.ins[1]);
-            std::uint64_t ret_tag = 0;
-            bool know_tag = false;
-            if (src.kind == NodeKind::ConstInt ||
-                (src.has(NodeFlag::Unboxed) &&
-                 (src.kind == NodeKind::Add || src.kind == NodeKind::Sub ||
-                  src.kind == NodeKind::Mul || src.kind == NodeKind::Neg))) {
-                ret_tag = 2;   // kTagInt
-                know_tag = true;
-            } else if (src.kind == NodeKind::ConstFloat ||
-                       (src.has(NodeFlag::Unboxed) &&
-                        (src.kind == NodeKind::PyBinary ||
-                         src.kind == NodeKind::I2F))) {
-                ret_tag = 3;   // kTagFloat
-                know_tag = true;
-            } else if (src.kind == NodeKind::PyCompare) {
-                // SETCCri wrote tag=kTagBool to its own home; the Return's
-                // MOVmr copies only the payload to slot 0, so slot 0's
-                // tag needs an explicit writeback.
-                ret_tag = 1;   // kTagBool
-                know_tag = true;
-            }
+            std::uint64_t ret_tag = infer_home_tag(g, n.ins[1]);
+            bool know_tag = true;   // infer_home_tag always returns a tag
 
             if (know_tag) {
                 // Write the return value's payload into home slot 0 payload.
@@ -780,6 +851,106 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
             std::uint32_t ret = out.mir.create(MOp::RET, MachineRegClass::GPR, 0);
             out.mir.node(ret).block = mb;
         });
+
+        // ---- Task 24 (candidate j): Phi backedge MOVrr + unconditional JMP -
+        //
+        // The lowering's materialize() treats Phi as a load from home
+        // slot (correct for READING the current value). But the backedge
+        // update (Phi.home <- backedge_value at the JUMP site) is NOT
+        // materialized by anything else. Without this emission, JIT'd
+        // loops compute wrong answers: the Phi home slot keeps its
+        // entry value forever, so every iteration recomputes
+        // (entry_value + i) = i — the accumulator never grows.
+        //
+        // We walk every successor S of B that is a Loop or Region merge
+        // block leader. For each such S, find B's predecessor index in
+        // S.ins (the position of B in the merge's predecessor list); for
+        // each Phi P whose control input (P.ins.back()) == S, materialize
+        // P.ins[pred_idx] (the backedge value coming from THIS block) and
+        // emit a MOVmr writing its payload to P.home.payload, plus a
+        // tag-MOVmr writing the inferred source tag to P.home.tag.
+        //
+        // If S's MIR block id != B's + 1 (backedge OR forward jump over
+        // the next block in layout), also emit an unconditional JMP MOp
+        // targeting S's MIR block. The codegen's JMP case reads
+        // succs[0] from the MIR block's succs vector — the lowering
+        // populates succs in stage 1 (line ~271). When S is adjacent
+        // (succ_id == mb+1), fallthrough suffices and we skip the JMP.
+        for (NodeId s_node : block_succs(g, leader)) {
+            const Node& sn = g.node(s_node);
+            if (sn.kind != NodeKind::Loop && sn.kind != NodeKind::Region) continue;
+            // Find B's predecessor index in S.ins.
+            std::uint32_t pred_idx = 0xFFFFFFFFu;
+            for (std::size_t k = 0; k < sn.ins.size(); ++k) {
+                if (sn.ins[k] == leader) {
+                    pred_idx = static_cast<std::uint32_t>(k);
+                    break;
+                }
+            }
+            if (pred_idx == 0xFFFFFFFFu) continue;
+            // For each Phi P whose control input is this merge S,
+            // copy the corresponding backedge value to P.home.
+            g.for_each_live([&](NodeId id) {
+                const Node& n = g.node(id);
+                if (n.kind != NodeKind::Phi) return;
+                if (n.ins.size() <= pred_idx) return;
+                // The Phi's last input is the region/loop block leader.
+                if (n.ins.empty() || n.ins.back() != s_node) return;
+                NodeId backedge_val = n.ins[pred_idx];
+                // Self-loop guard: the frontend initially creates
+                // Phi.ins[1] = phi itself (placeholder); patch_loop
+                // later replaces it. If patch_loop didn't fire (e.g.,
+                // no backedge taken), skip — the Phi is effectively
+                // a constant equal to its entry value, and the
+                // runtime's phi_init already populates the home slot.
+                if (backedge_val == id) return;
+                std::uint32_t src = materialize(materialize, backedge_val, mb);
+                std::uint32_t phi_home = id;
+                if (phi_home + 1 > out.frame_slots) out.frame_slots = phi_home + 1;
+                // Payload write: mem[phi_home].payload = src.
+                std::uint32_t wb_payload = out.mir.create(
+                    MOp::MOVmr, MachineRegClass::GPR, phi_home);
+                out.mir.node(wb_payload).block = mb;
+                out.mir.add_operand(wb_payload,
+                                    MachineOperand::slot_op(phi_home, 8 /*payload off*/));
+                out.mir.add_operand(wb_payload, MachineOperand::reg(src));
+                // Tag write: materialize the inferred tag constant,
+                // then MOVmr to phi_home.tag. Mirrors the Return
+                // terminator's tag-vreg pattern (IBE-18 final fix:
+                // tag_vreg gets a unique home_slot beyond frame_slots
+                // so its MOVri write doesn't clobber the payload
+                // write above).
+                std::uint64_t phi_tag = infer_home_tag(g, backedge_val);
+                std::uint32_t tag_home = out.frame_slots;
+                out.frame_slots = tag_home + 1;
+                std::uint32_t tag_v = out.mir.create(
+                    MOp::MOVri, MachineRegClass::GPR, tag_home);
+                out.mir.node(tag_v).block = mb;
+                out.mir.add_operand(tag_v, MachineOperand::imm_op(
+                    static_cast<std::int64_t>(phi_tag)));
+                std::uint32_t wb_tag = out.mir.create(
+                    MOp::MOVmr, MachineRegClass::GPR, 0);
+                out.mir.node(wb_tag).block = mb;
+                out.mir.add_operand(wb_tag,
+                                    MachineOperand::slot_op(phi_home, 0 /*tag off*/));
+                out.mir.add_operand(wb_tag, MachineOperand::reg(tag_v));
+            });
+            // Emit JMP if S is not fallthrough-adjacent (backedge OR
+            // forward jump over the next block in layout). Fallthrough
+            // = S's MIR block id == mb+1 AND no cold blocks in between
+            // (cold-block handling is deferred — the simple loop case
+            // doesn't involve cold blocks).
+            if (const std::uint32_t* sm = block_map.get(s_node)) {
+                if (*sm != mb + 1) {
+                    std::uint32_t jmp = out.mir.create(
+                        MOp::JMP, MachineRegClass::GPR, 0);
+                    out.mir.node(jmp).block = mb;
+                    // No operands — the codegen's JMP case reads
+                    // succs[0] from the MIR block's succs vector,
+                    // which stage 1 already populated with S's mb.
+                }
+            }
+        }
     }
 
     return out;

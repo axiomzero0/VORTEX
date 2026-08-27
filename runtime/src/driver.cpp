@@ -200,48 +200,60 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
                     if (cc.frame_slots > cu->n_registers) {
                         cu->n_registers = cc.frame_slots;
                     }
-                    // Task 24: record each Phi's entry value so the
-                    // CALL handler can initialize the home slot before
-                    // calling jit_entry. Without this, the JIT would
-                    // read Value::none() from Phi slots (the Frame
-                    // constructor fills with none(); only bind_parameters
-                    // populates Parameter slots, never Phi slots) and
-                    // every GUARD_INT would fail on the first read.
-                    // Conservative: only Phis whose entry input (ins[0])
-                    // is a ConstInt. ConstFloat / Parameter / arbitrary
-                    // entry values need a richer table (future task).
-                    bool has_loop_phis = false;
+                    // Task 24 (candidate j): record each Phi's entry
+                    // value so the CALL handler can initialize the
+                    // home slot before calling jit_entry. Without
+                    // this, the JIT would read Value::none() from Phi
+                    // slots (the Frame constructor fills with none();
+                    // only bind_parameters populates Parameter slots,
+                    // never Phi slots) and every GUARD_INT / GUARD_FLOAT
+                    // would fail on the first read.
+                    //
+                    // Handles ConstInt (-> Value::integer) and ConstFloat
+                    // (-> Value::real, via bit-reinterpret of the int64
+                    // transport). Parameters / arbitrary entry values
+                    // need a richer table (future task).
+                    //
+                    // Task 24 (candidate j): the backend now emits the
+                    // backedge MOVrr at the JUMP site (see
+                    // backend/lowering.cpp's Phi backedge emission),
+                    // so the Phi home slot is correctly updated at the
+                    // end of each loop iteration. The previous
+                    // has_loop_phis downgrade (force has_dynamic_ops =
+                    // true to skip jit_entry) is REMOVED — parsed
+                    // while loops with ConstInt/ConstFloat entry Phis
+                    // now JIT correctly.
                     lowered.graph.for_each_live([&](ir::NodeId id) {
                         const ir::Node& n = lowered.graph.node(id);
                         if (n.kind != ir::NodeKind::Phi) return;
                         if (n.ins.size() < 2) return;
-                        has_loop_phis = true;   // any Phi means loop-backedge
                         const ir::Node& entry = lowered.graph.node(n.ins[0]);
-                        if (entry.kind != ir::NodeKind::ConstInt) return;
-                        cu->phi_init_node_ids.push_back(
-                            static_cast<std::uint32_t>(id));
-                        cu->phi_init_values.push_back(
-                            entry.const_value.as.i);
+                        if (entry.kind == ir::NodeKind::ConstInt) {
+                            cu->phi_init_node_ids.push_back(
+                                static_cast<std::uint32_t>(id));
+                            cu->phi_init_values.push_back(
+                                entry.const_value.as.i);
+                            cu->phi_init_is_float.push_back(0);
+                        } else if (entry.kind == ir::NodeKind::ConstFloat) {
+                            cu->phi_init_node_ids.push_back(
+                                static_cast<std::uint32_t>(id));
+                            // Bit-reinterpret the double as int64 for
+                            // transport; the CALL handler reinterprets
+                            // back to double when writing Value::real.
+                            std::int64_t bits;
+                            std::memcpy(&bits, &entry.const_value.as.f,
+                                        sizeof(double));
+                            cu->phi_init_values.push_back(bits);
+                            cu->phi_init_is_float.push_back(1);
+                        }
+                        // Else: Parameter / arbitrary entry — phi_init
+                        // doesn't handle yet (the entry value depends
+                        // on runtime context). Such Phis would deopt
+                        // on first read; the unit either runs Tier-0
+                        // (via has_dynamic_ops from elsewhere) or the
+                        // deopt path handles it (once safepoint_pcs
+                        // is populated — candidate k).
                     });
-                    // Task 24: the backend's lowering.cpp currently
-                    // treats Phi nodes as "pure data inputs — no MIR
-                    // emitted" (line ~297). The loop backedge update
-                    // (s.Phi.home <- PyBinary(s+i).home at the JUMP)
-                    // is NOT materialized by the backend — only the
-                    // scheduler emits the equivalent MOVE for Tier-0.
-                    // This means JIT'd loops produce wrong answers
-                    // (s stays at its entry value forever). Until the
-                    // backend emits the backedge MOVrr, conservatively
-                    // downgrade units with any Phi to has_dynamic_ops =
-                    // true so the CALL handler skips jit_entry and
-                    // runs Tier-0 (which correctly handles the backedge
-                    // via MOVE). The eager JIT wiring stays in place;
-                    // the Phi-backedge-MOVrr gap is a follow-on task.
-                    if (has_loop_phis) {
-                        cu->has_dynamic_ops = true;
-                        // Leave jit_entry installed (for telemetry /
-                        // future fix); just don't invoke it yet.
-                    }
                     // Task 24: safepoint_pcs population is NOT yet
                     // wired (would need a NodeId→Tier-0 PC map from
                     // the scheduler). For units with

@@ -765,8 +765,23 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 for (std::size_t i = 0; i < n_init; ++i) {
                     std::uint32_t node_id = unit->phi_init_node_ids[i];
                     if (node_id < f.n_regs) {
-                        f.regs[node_id] = Value::integer(
-                            unit->phi_init_values[i]);
+                        // Task 24 (candidate j): ConstFloat entries
+                        // are bit-reinterpreted back to double here.
+                        // The driver pushes int64 bits for transport;
+                        // we reinterpret to double and wrap in
+                        // Value::real (tag=Tag::Float).
+                        const bool is_float =
+                            i < unit->phi_init_is_float.size() &&
+                            unit->phi_init_is_float[i] != 0;
+                        if (is_float) {
+                            double fv;
+                            std::memcpy(&fv, &unit->phi_init_values[i],
+                                        sizeof(double));
+                            f.regs[node_id] = Value::real(fv);
+                        } else {
+                            f.regs[node_id] = Value::integer(
+                                unit->phi_init_values[i]);
+                        }
                     }
                 }
                 auto entry = reinterpret_cast<backend::JitEntryFn>(entry_raw);

@@ -121,9 +121,17 @@ struct RegOrSlot {
 /// A rel32 patch site to be resolved at the end of emission: the Jcc/JMP at
 /// `site` should jump to `target_block_start_offset`. Block starts are
 /// resolved by looking up the block id -> block_start offset map.
+///
+/// Task 24 (candidate j): track whether the site is a JMP (E9, 5 bytes
+/// total, rel starts at site+1) or a Jcc (0F 8x, 6 bytes total, rel
+/// starts at site+2). The two have different patch functions: patch_rel32
+/// for JMP, patch_jcc for Jcc. Calling the wrong patcher corrupts the
+/// rel32 (wrong write offset + wrong rel formula), making every patched
+/// jump land at a bogus address — typically segfaulting the JIT.
 struct PatchSite {
     std::size_t site{0};
     std::uint32_t target_block{0};   // MIR block id; 0xFFFFFFFFu = past_cold
+    bool is_jmp{false};              // true = JMP (patch_rel32), false = Jcc (patch_jcc)
 };
 
 /// Pass 54 (peephole) constant cache.
@@ -826,6 +834,24 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     }
                     break;
                 }
+                case MOp::JMP: {
+                    // Task 24 (candidate j): unconditional JMP emitted by
+                    // the lowering at backedge sites (loop body → loop
+                    // header) and forward-jump sites (if-true arm → merge
+                    // over the if-false arm). The target is the SOLE
+                    // successor in the MIR block's succs vector.
+                    std::size_t site = a.jmp_rel32();
+                    const auto& succs = lowered.mir.blocks[block_id].succs;
+                    if (!succs.empty()) {
+                        patches.push_back(PatchSite{site, succs[0], /*is_jmp=*/true});
+                    } else {
+                        // No successor recorded: patch to past_cold as a
+                        // safe fallback. Should not happen (a JMP without
+                        // a target is a malformed block), but defensive.
+                        patches.push_back(PatchSite{site, 0xFFFFFFFFu, /*is_jmp=*/true});
+                    }
+                    break;
+                }
                 case MOp::GUARD_INT: {
                     if (n.operands.size() < 2) break;
                     RegOrSlot lhs = resolve(n.operands[0]);
@@ -1133,7 +1159,15 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
         emit_block_body(bi);
     }
 
-    // ---- patch phase: resolve every Jcc rel32 to its block_start offset -----
+    // ---- patch phase: resolve every Jcc/JMP rel32 to its block_start offset -
+    // Task 24 (candidate j): JMP sites use patch_rel32 (5-byte instruction,
+    // rel = target - (site+5), write at site+1); Jcc sites use patch_jcc
+    // (6-byte instruction, rel = target - (site+6), write at site+2). The
+    // two patchers MUST NOT be swapped — calling patch_jcc on a JMP site
+    // writes the rel32 to the wrong byte (site+2 instead of site+1) AND
+    // uses the wrong rel formula, producing bogus jump targets that segfault
+    // the JIT. The is_jmp flag on PatchSite routes each site to the
+    // correct patcher.
     for (const PatchSite& p : patches) {
         if (p.target_block == 0xFFFFFFFFu) {
             // Fallthrough to past_cold: patch to the position AFTER the cold region.
@@ -1141,18 +1175,30 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
             // we emitted there); execution falls through naturally past the cold
             // region only if it skipped into a handler that itself returned —
             // which Catch handlers do via the same RET path. For the common
-            // case where the Jcc at the hot tail targets the past_cold boundary
-            // we use the cold_offset target (the start of the cold region is
-            // also "past the hot body" by construction).
-            a.patch_jcc(p.site, out.cold_offset);
+            // case where the Jcc/JMP at the hot tail targets the past_cold
+            // boundary we use the cold_offset target (the start of the cold
+            // region is also "past the hot body" by construction).
+            if (p.is_jmp) {
+                a.patch_rel32(p.site, out.cold_offset);
+            } else {
+                a.patch_jcc(p.site, out.cold_offset);
+            }
         } else {
             const std::size_t* target = block_start.get(p.target_block);
             if (target) {
-                a.patch_jcc(p.site, *target);
+                if (p.is_jmp) {
+                    a.patch_rel32(p.site, *target);
+                } else {
+                    a.patch_jcc(p.site, *target);
+                }
             } else {
                 // Target block was never emitted (e.g. unreachable
                 // successor). Patch to past_cold as a safe fallthrough.
-                a.patch_jcc(p.site, out.cold_offset);
+                if (p.is_jmp) {
+                    a.patch_rel32(p.site, out.cold_offset);
+                } else {
+                    a.patch_jcc(p.site, out.cold_offset);
+                }
             }
         }
     }

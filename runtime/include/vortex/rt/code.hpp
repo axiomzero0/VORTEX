@@ -130,18 +130,22 @@ struct CodeUnit {
     /// Task 24: initial values for Phi home slots at function entry.
     /// Populated by the driver after compile_unit, by walking the IR
     /// graph and recording each Phi whose entry input (ins[0]) is a
-    /// ConstInt. The CALL handler writes these to regs[phi_node_id]
-    /// before calling jit_entry — without this, the JIT's prologue
-    /// (which assumes the entry block's home slots are populated by
-    /// the runtime, the way Tier-0's LOAD_CONST+MOVE prologue does)
-    /// would read Value::none() and every GUARD_INT would fail on
-    /// the first read.
+    /// ConstInt or ConstFloat. The CALL handler writes these to
+    /// regs[phi_node_id] before calling jit_entry — without this, the
+    /// JIT's prologue (which assumes the entry block's home slots are
+    /// populated by the runtime, the way Tier-0's LOAD_CONST+MOVE
+    /// prologue does) would read Value::none() and every GUARD_INT /
+    /// GUARD_FLOAT would fail on the first read.
     ///
-    /// (std::uint32_t node_id, std::int64_t value) — small_vector
-    /// of pairs. Spilled across pairs for cache-friendly iteration
-    /// during the CALL hot path.
+    /// Three parallel arrays:
+    ///   phi_init_node_ids[i]  = the Phi's IR NodeId (= home slot index)
+    ///   phi_init_values[i]    = the entry value (int64 — for floats,
+    ///                           the bit-reinterpreted double bits)
+    ///   phi_init_is_float[i]  = 1 if Value::real should be used,
+    ///                           0 if Value::integer
     stdx::small_vector<std::uint32_t, 8> phi_init_node_ids{};
     stdx::small_vector<std::int64_t, 8>  phi_init_values{};
+    stdx::small_vector<std::uint8_t, 8>  phi_init_is_float{};
 
     // --- JIT safepoint → Tier-0 resume-point map (Rule 4) ---------------------
     // Indexed by the safepoint_index that the JIT's deopt stub passes to
