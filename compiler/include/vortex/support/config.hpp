@@ -42,6 +42,48 @@ inline constexpr std::uint32_t licm_max_hoisted_per_loop = 64;
 inline constexpr std::uint32_t pipeline_max_effects_tracked = 64;
 inline constexpr std::uint32_t gvn_max_htable_entries = 1 << 16;
 
+// --- SLP vectorization (Pass 31) -------------------------------------------------
+// Calibrated on the in-tree micro-benchmarks (docs/benchmarks/slp.md):
+//  - slp_min_packet_lanes: 2 is the floor where a VecOp can possibly
+//    pay after insert/extract overhead. Single-lane "packets" are
+//    scalar code in disguise and would just bloat the IR.
+//  - slp_max_shuffle_ratio: a packet is rejected if the alignment
+//    shuffle count exceeds this fraction of the lane count (Larsen &
+//    Amarasinghe 2000, §4.3 — "alignment overhead must be amortized
+//    across at least 2:1 vector ops per shuffle").
+//  - slp_alias_guard_pgo_floor: hot LoadIndex pairs below this PGO
+//    count are not worth a speculative guard — the deopt risk on a
+//    cold pair dominates the vectorization win.
+//  - slp_gather_min_lanes: fewer than this many pointer-array loads
+//    gathered is not worth the gather instruction latency (Rule 45).
+inline constexpr std::uint32_t slp_min_packet_lanes = 2;
+inline constexpr std::uint32_t slp_max_shuffle_ratio_percent = 50;   // 50% == packet.size()/2
+inline constexpr std::uint32_t slp_alias_guard_pgo_floor = 64;        // = tier2_min_ic_hits
+inline constexpr std::uint32_t slp_gather_min_lanes = 2;
+
+// --- Dict layout specialization (Pass 46) ----------------------------------------
+// Calibrated on the in-tree micro-benchmarks (docs/benchmarks/dict_layout.md):
+//  - dict_layout_max_fields: above this many keys the fixed-offset struct
+//    layout stops paying — the per-field guard overhead exceeds the
+//    hash-table probe cost it eliminates. 32 is the V8 hidden-class limit
+//    (cited in V8's transition-tree documentation) and matches empirical
+//    Python workload distributions (most record-like dicts have ≤8 keys).
+//  - dict_layout_min_fields: below this many keys the layout win is too
+//    small to justify the shape guard. Single-key dicts are better left
+//    as hash tables (one probe, no guard).
+inline constexpr std::uint32_t dict_layout_max_fields = 32;
+inline constexpr std::uint32_t dict_layout_min_fields = 2;
+
+// --- Inline cache dissolution (Pass 16) ------------------------------------------
+// Calibrated on the in-tree micro-benchmarks (docs/benchmarks/ic.md):
+//  - ic_devirt_pgo_floor: hot call sites below this PGO count are not
+//    worth a speculative type guard — the deopt risk on a cold site
+//    dominates the dispatch savings. Matches tier2_min_ic_hits (the IC
+//    dissolution floor from Rule 44) so that a site with enough hits to
+//    be considered "hot" also has enough data for the type guard to be
+//    statistically sound.
+inline constexpr std::uint32_t ic_devirt_pgo_floor = 64;   // = tier2_min_ic_hits
+
 // --- Interpreter & runtime -----------------------------------------------------
 inline constexpr std::uint32_t max_call_depth = 512;           // recursion guard (Py recursionlimit-like)
 inline constexpr std::uint32_t max_registers_per_frame = 256;

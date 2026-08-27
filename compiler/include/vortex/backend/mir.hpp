@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "vortex/backend/target.hpp"
+#include "vortex/ir/node.hpp"
 #include "vortex/stdx/small_vector.hpp"
 
 namespace vortex::backend {
@@ -163,6 +164,34 @@ enum class MCond : std::uint8_t {
         case MOp::SAFEPOINT:
         case MOp::DEOPT_TRAP:
             return CostClass::Branch;
+    }
+    return CostClass::Alu;
+}
+
+/// Arch-neutral cost classification for IR-level binary ops (Rule 45).
+/// Mid-level passes (SLP, vectorization) that need to weigh a packet's
+/// scalar-vs-vector cost go through this — never through opcode-shaped
+/// literals in pass logic. The BinOpKind→CostClass mapping is semantic
+/// (Mul is always CostClass::Mul on every architecture); the actual
+/// cycle cost is queried separately via TargetDescriptor::latency().
+[[nodiscard]] constexpr CostClass cost_class(ir::BinOpKind op) noexcept {
+    switch (op) {
+        case ir::BinOpKind::Mul:
+        case ir::BinOpKind::Pow:
+        case ir::BinOpKind::MatMul:
+            return CostClass::Mul;
+        case ir::BinOpKind::TrueDiv:
+        case ir::BinOpKind::FloorDiv:
+        case ir::BinOpKind::Mod:
+            return CostClass::Div;
+        case ir::BinOpKind::Add:
+        case ir::BinOpKind::Sub:
+        case ir::BinOpKind::LShift:
+        case ir::BinOpKind::RShift:
+        case ir::BinOpKind::BitAnd:
+        case ir::BinOpKind::BitOr:
+        case ir::BinOpKind::BitXor:
+            return CostClass::Alu;
     }
     return CostClass::Alu;
 }

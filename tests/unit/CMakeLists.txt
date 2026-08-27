@@ -7,6 +7,9 @@ add_executable(vortex_unit_tests
     frontend_test.cpp
     lang_test.cpp
     backend_test.cpp
+    p16_ic_monomorphism_test.cpp
+    p31_slp_test.cpp
+    p46_dict_layout_test.cpp
 )
 target_link_libraries(vortex_unit_tests PRIVATE vortex_compiler vortex_runtime)
 vortex_set_target_flags(vortex_unit_tests)
