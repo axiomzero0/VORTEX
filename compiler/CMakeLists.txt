@@ -33,6 +33,7 @@ add_library(vortex_compiler STATIC
     src/passes/p14_demand_driven_alias.cpp
     src/passes/p15_shape_analysis.cpp
     src/passes/p16_ic_monomorphism.cpp
+    src/passes/p16b_polymorphic_dispatch.cpp
     src/passes/p17_mro_linearization.cpp
     src/passes/p18_side_effect_analysis.cpp
     src/passes/p19_callgraph_pgo.cpp

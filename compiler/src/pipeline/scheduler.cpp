@@ -522,7 +522,8 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
             return;
         case NodeKind::CallPy:
         case NodeKind::CallDirect:
-        case NodeKind::GuardedDirectCall: {
+        case NodeKind::GuardedDirectCall:
+        case NodeKind::DispatchCache: {
             std::uint32_t data_start = 2;
             NodeId callee = n.ins[data_start];
             std::uint32_t argc = n.aux0;

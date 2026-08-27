@@ -8,6 +8,7 @@ add_executable(vortex_unit_tests
     lang_test.cpp
     backend_test.cpp
     p16_ic_monomorphism_test.cpp
+    p16b_polymorphic_dispatch_test.cpp
     p31_slp_test.cpp
     p46_dict_layout_test.cpp
     p47_box_unbox_test.cpp

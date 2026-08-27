@@ -84,6 +84,22 @@ inline constexpr std::uint32_t dict_layout_min_fields = 2;
 //    statistically sound.
 inline constexpr std::uint32_t ic_devirt_pgo_floor = 64;   // = tier2_min_ic_hits
 
+// --- Inline cache polymorphism tiers (Pass 16b) ----------------------------------
+// Calibrated on V8/SpiderMonkey IC tiering research (docs/benchmarks/ic.md):
+//  - ic_mono_max_types: 1 type. The site is monomorphic — P16 dissolves it
+//    into a GuardedDirectCall with a single type guard.
+//  - ic_poly_max_types: 4 types. The site is polymorphic — P16b emits a
+//    DispatchCache node carrying the type→target mappings. The backend
+//    lowers this to a linear type-check chain (future: SIMD comparison).
+//    V8 uses 4 as the polymorphic ceiling before megamorphic fallback.
+//  - ic_mega_pgo_floor: above this many observed types (in the PGO
+//    histogram stored in the CallPy node's aux0), the site is megamorphic
+//    — the pass declines to emit an IC and falls back to standard dispatch.
+//    20 matches V8's megamorphic threshold (cited in V8's IC internals doc).
+inline constexpr std::uint32_t ic_mono_max_types = 1;
+inline constexpr std::uint32_t ic_poly_max_types = 4;
+inline constexpr std::uint32_t ic_mega_pgo_floor = 20;
+
 // --- Interpreter & runtime -----------------------------------------------------
 inline constexpr std::uint32_t max_call_depth = 512;           // recursion guard (Py recursionlimit-like)
 inline constexpr std::uint32_t max_registers_per_frame = 256;

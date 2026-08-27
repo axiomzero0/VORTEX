@@ -90,6 +90,10 @@ struct P16_ICMonomorphism {
     static constexpr const char* name = "16_ic_mono";
     [[nodiscard]] Result<PassResult> run(ir::Graph& g, const PassContext& c) noexcept;
 };
+struct P16b_PolymorphicDispatch {
+    static constexpr const char* name = "16b_ic_poly";
+    [[nodiscard]] Result<PassResult> run(ir::Graph& g, const PassContext& c) noexcept;
+};
 struct P17_MROLinearization {
     static constexpr const char* name = "17_mro";
     [[nodiscard]] Result<PassResult> run(ir::Graph& g, const PassContext& c) noexcept;

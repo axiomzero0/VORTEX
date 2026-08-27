@@ -34,6 +34,7 @@ using OptPipeline = std::tuple<
     P14_DemandDrivenAlias,
     P15_ShapeAnalysis,
     P16_ICMonomorphism,
+    P16b_PolymorphicDispatch,
     P17_MROLinearization,
     P18_SideEffectAnalysis,
     // Phase 3: interprocedural & speculative inlining
@@ -106,6 +107,7 @@ struct TierFilter {
         // keep the baseline JIT's compile time bounded.
         return n != "08_sccp" && n != "10_early_gvn" && n != "11_andersen" &&
                n != "12_cfl_alias" && n != "14_demand_alias" && n != "16_ic_mono" &&
+               n != "16b_ic_poly" &&
                n != "20_spec_inline" && n != "21_partial_inline" &&
                n != "22_recursive_inline" && n != "26_ipcp" && n != "28_spec_licm" &&
                n != "30_unroll" && n != "31_slp" && n != "32_loop_vec" &&
