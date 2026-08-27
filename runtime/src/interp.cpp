@@ -1471,7 +1471,98 @@ L_PY_BINOP: {
     Value b = regs[cur->b];
     Value out;
     bool ok = false;
-    switch (static_cast<BinOpKind>(cur->imm)) {
+    const auto op = static_cast<BinOpKind>(cur->imm);
+
+    // --- Inline fast paths for the dominant numeric cases ---
+    // These eliminate 3-4 function calls (values_add → numeric_binop →
+    // lambda → int_fits_i64) per operation. For tight int loops this is
+    // the difference between 2x and 10x vs CPython.
+    //
+    // The fast path checks tag equality (one branch), then does the op
+    // inline with __builtin_*_overflow. Only on overflow / div-by-zero
+    // / mixed types does it fall through to the generic path.
+    if (a.tag == Tag::Int && b.tag == Tag::Int) {
+        const std::int64_t x = a.as.i, y = b.as.i;
+        std::int64_t r = 0;
+        switch (op) {
+            case BinOpKind::Add:
+                if (!__builtin_add_overflow(x, y, &r)) [[likely]] {
+                    out = Value::integer(r); ok = true; break;
+                }
+                // overflow → fall through to generic (bignum) path
+                break;
+            case BinOpKind::Sub:
+                if (!__builtin_sub_overflow(x, y, &r)) [[likely]] {
+                    out = Value::integer(r); ok = true; break;
+                }
+                break;
+            case BinOpKind::Mul:
+                if (!__builtin_mul_overflow(x, y, &r)) [[likely]] {
+                    out = Value::integer(r); ok = true; break;
+                }
+                break;
+            case BinOpKind::Mod:
+                if (y != 0) [[likely]] {
+                    // Python modulo: result has same sign as divisor.
+                    // C++ % has sign of dividend — adjust.
+                    std::int64_t r = x % y;
+                    if (r != 0 && ((r < 0) != (y < 0))) r += y;
+                    out = Value::integer(r); ok = true; break;
+                }
+                // div by zero → fall through to generic (raises)
+                break;
+            case BinOpKind::FloorDiv:
+                if (y != 0) [[likely]] {
+                    // Python floor div: round toward negative infinity
+                    std::int64_t q = x / y;
+                    std::int64_t rem = x % y;
+                    if ((rem != 0) && ((rem < 0) != (y < 0))) --q;
+                    out = Value::integer(q); ok = true;
+                }
+                break;
+            case BinOpKind::BitAnd: out = Value::integer(x & y); ok = true; break;
+            case BinOpKind::BitOr:  out = Value::integer(x | y); ok = true; break;
+            case BinOpKind::BitXor: out = Value::integer(x ^ y); ok = true; break;
+            case BinOpKind::LShift:
+                if (y >= 0 && y < 63) { out = Value::integer(x << y); ok = true; }
+                break;
+            case BinOpKind::RShift:
+                if (y >= 0 && y < 63) { out = Value::integer(x >> y); ok = true; }
+                break;
+            default: break;  // Pow, MatMul, TrueDiv → generic path
+        }
+        if (ok) {
+            write_reg(cur->dst, out);
+            ++f.pc; VM_LOAD(); VM_DISPATCH();
+        }
+    } else if (a.tag == Tag::Float && b.tag == Tag::Float) {
+        const double x = a.as.f, y = b.as.f;
+        switch (op) {
+            case BinOpKind::Add:      out = Value::real(x + y); ok = true; break;
+            case BinOpKind::Sub:      out = Value::real(x - y); ok = true; break;
+            case BinOpKind::Mul:      out = Value::real(x * y); ok = true; break;
+            case BinOpKind::TrueDiv:
+                if (y != 0.0) { out = Value::real(x / y); ok = true; }
+                break;
+            case BinOpKind::FloorDiv:
+                if (y != 0.0) { out = Value::real(std::floor(x / y)); ok = true; }
+                break;
+            case BinOpKind::Mod:
+                if (y != 0.0) {
+                    double r = std::fmod(x, y);
+                    if ((r != 0.0) && ((r < 0.0) != (y < 0.0))) r += y;
+                    out = Value::real(r); ok = true;
+                }
+                break;
+            default: break;
+        }
+        if (ok) {
+            write_reg(cur->dst, out);
+            ++f.pc; VM_LOAD(); VM_DISPATCH();
+        }
+    }
+
+    switch (op) {
         case BinOpKind::Add: {
             // str + str, list + list fast paths
             if (a.tag == Tag::Obj && b.tag == Tag::Obj && a.as.obj && b.as.obj &&
@@ -1630,6 +1721,35 @@ L_PY_CMP: {
     Value a = regs[cur->a];
     Value b = regs[cur->b];
     bool result = false;
+
+    // Inline int+int fast path — eliminates the values_compare function
+    // call for the dominant case (loop conditions, equality checks).
+    if (a.tag == Tag::Int && b.tag == Tag::Int) {
+        const std::int64_t x = a.as.i, y = b.as.i;
+        switch (static_cast<CmpOpKind>(cur->imm)) {
+            case CmpOpKind::LT: result = x <  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::LE: result = x <= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::GT: result = x >  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::GE: result = x >= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::EQ: result = x == y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::NE: result = x != y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            default: break;  // Is/IsNot/In/NotIn → generic path
+        }
+    }
+    // Float+float fast path
+    if (a.tag == Tag::Float && b.tag == Tag::Float) {
+        const double x = a.as.f, y = b.as.f;
+        switch (static_cast<CmpOpKind>(cur->imm)) {
+            case CmpOpKind::LT: result = x <  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::LE: result = x <= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::GT: result = x >  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::GE: result = x >= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::EQ: result = x == y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::NE: result = x != y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            default: break;
+        }
+    }
+
     if (!values_compare(a, b, cur->imm, result)) {
         if (!has_pending()) raise_builtin(rt.type_type_error, "'...' not supported between instances");
         RAISE_CHECK(false);
