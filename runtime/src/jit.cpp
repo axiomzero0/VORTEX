@@ -15,12 +15,18 @@
 //
 // vortex_deopt_entry is in deopt.cpp — same transition, but invoked on
 // guard failure rather than dynamic-op fallback.
+//
+// Task 24: vortex_rt_munmap_jit_buffer — extern "C" shim for munmap,
+// used by the CodeUnit destructor to free the RWX JIT buffer without
+// pulling <sys/mman.h> into every TU that includes code.hpp.
 // =============================================================================
 
 #include "vortex/rt/interp.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace vortex::rt {
 inline namespace abi_v1 {
@@ -72,8 +78,16 @@ extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id
                      unit->safepoint_pcs.size());
         std::abort();
     } else {
-        std::fputs("VORTEX jit bridge: no safepoint table — falling back to "
-                   "pc=0\n", stderr);
+        // Task 24: no safepoint_pcs populated. This indicates the
+        // driver installed jit_entry for a unit with has_dynamic_ops ==
+        // false (no CALLri fallback), but the JIT'd code STILL emitted
+        // a CALLri somewhere. That's a backend bug — the has_dynamic_ops
+        // flag should have been set. Abort to surface the bug clearly
+        // rather than silently returning wrong values.
+        std::fputs("VORTEX jit bridge: no safepoint table — backend bug? "
+                   "(has_dynamic_ops should have gated jit_entry off)\n",
+                   stderr);
+        std::abort();
     }
 
     Value out;
@@ -82,4 +96,12 @@ extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id
         return vortex::Value::none();
     }
     return out;
+}
+
+extern "C" void vortex_rt_munmap_jit_buffer(void* buf, std::size_t cap) noexcept {
+    if (!buf) return;
+    long pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0) pagesz = 4096;
+    std::size_t mapped = ((cap + pagesz - 1) / pagesz) * pagesz;
+    munmap(buf, mapped);
 }

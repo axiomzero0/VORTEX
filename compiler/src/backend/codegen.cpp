@@ -302,6 +302,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     LoweringResult lowered = lower_to_mir(g, target);
     if (lowered.mir.node_count() == 0) return out;
     out.frame_slots = lowered.frame_slots;
+    out.has_dynamic_ops = lowered.has_dynamic_ops;   // Task 24
 
     // ---- Pass 53: allocate --------------------------------------------------------
     stdx::small_vector<LiveInterval, 64> intervals;

@@ -17,8 +17,20 @@ target_include_directories(vortex_bench PRIVATE
     ${CMAKE_SOURCE_DIR}/tests/unit        # for harness.hpp (unused but harmless)
 )
 target_link_libraries(vortex_bench PRIVATE
-    vortex_runtime
+    "-Wl,--start-group"
     vortex_compiler
+    vortex_runtime
+    "-Wl,--end-group"
 )
+# Task 24: codegen.cpp (in vortex_compiler) takes the address of
+# vortex_deopt_entry / vortex_jit_bridge (defined in vortex_runtime).
+# The driver's new eager JIT wiring pulls codegen.o into the link
+# (because compile_program now references backend::compile_unit). The
+# single-pass static-linker doesn't re-scan vortex_runtime.a after
+# codegen.o's late-arriving undefined refs surface. --start-group /
+# --end-group forces re-scanning until the undefined pool stabilizes.
+# The flags are embedded in target_link_libraries (NOT
+# target_link_options) so they wrap the static libs in the right
+# position on the command line.
 # The benchmark uses set_vm_for_builtins / install_builtins from the
 # runtime; links transitively through vortex_runtime.

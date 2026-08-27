@@ -5,7 +5,10 @@
 #include "vortex/rt/driver.hpp"
 
 #include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
 
+#include "vortex/backend/codegen.hpp"
 #include "vortex/backend/target.hpp"
 #include "vortex/frontend/lowering.hpp"
 #include "vortex/frontend/parser.hpp"
@@ -17,6 +20,23 @@
 
 namespace vortex::rt {
 inline namespace abi_v1 {
+
+namespace {
+/// Task 24: page-aligned RWX buffer for JIT-compiled machine code.
+/// Allocated via mmap; freed by CodeUnit's destructor via the
+/// vortex_rt_munmap_jit_buffer shim (see runtime/src/jit.cpp).
+/// Returns nullptr on failure (the driver logs and falls back to
+/// Tier-0 execution for this unit).
+[[nodiscard]] std::byte* make_jit_buffer(std::size_t bytes) noexcept {
+    long pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0) pagesz = 4096;
+    std::size_t mapped = ((bytes + pagesz - 1) / pagesz) * pagesz;
+    void* p = mmap(nullptr, mapped, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    return static_cast<std::byte*>(p);
+}
+}  // namespace
 
 CompileOutcome compile_program(Vm& vm, std::string_view source,
                                SymbolId module_name,
@@ -134,6 +154,117 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
             outcome.diagnostic = scheduled.error();
             return outcome;
         }
+
+        // Task 24: JIT-compile the unit eagerly. We attempt this for
+        // EVERY unit (module toplevel included) and let the backend
+        // decide via has_dynamic_ops whether the result is safe to
+        // invoke from the CALL handler. Module-toplevel units rarely
+        // JIT cleanly because they typically contain print()/CallPy
+        // ops, but functions with provably-typed arithmetic DO.
+        //
+        // We don't gate on backedge_count/call_count yet — that's the
+        // tiering trigger work (Path A v2). For now: every unit gets
+        // JIT'd at compile time. The CALL handler falls back to
+        // Tier-0 (exec_frame) when has_dynamic_ops is true.
+        //
+        // The IR graph (lowered.graph) is alive for the duration of
+        // this loop iteration; compile_unit takes a const ref so it
+        // can be safely borrowed here.
+        if (!lowered.is_generator) {
+            constexpr std::size_t kJitCodeCapacity = 64 * 1024;  // 64 KB per unit
+            std::byte* jit_buf = make_jit_buffer(kJitCodeCapacity);
+            if (jit_buf) {
+                backend::CompiledCode cc =
+                    backend::compile_unit(lowered.graph, cu->id, jit_buf,
+                                          kJitCodeCapacity,
+                                          backend::host_target());
+                if (cc.valid) {
+                    // Install: the function pointer is the start of
+                    // the buffer (the codegen emits a prologue at
+                    // offset 0). Store the buffer/capacity so the
+                    // CodeUnit destructor can munmap it.
+                    cu->jit_code_buffer = jit_buf;
+                    cu->jit_code_capacity = cc.code_size > 0
+                                               ? cc.code_size
+                                               : kJitCodeCapacity;
+                    cu->jit_entry.store(jit_buf, std::memory_order_release);
+                    cu->current_tier.store(1, std::memory_order_release);
+                    cu->has_dynamic_ops = cc.has_dynamic_ops;
+                    // Task 24: the JIT's home slots are IR NodeIds
+                    // (per backend/lowering.cpp: `std::uint32_t home = id;`).
+                    // The scheduler's `n_registers` is set independently
+                    // based on what IT considers live — for parsed while
+                    // loops with Phis the JIT's frame_slots (max NodeId+1)
+                    // can exceed n_registers, and the JIT would write past
+                    // the regs array. Bump n_registers to cover.
+                    if (cc.frame_slots > cu->n_registers) {
+                        cu->n_registers = cc.frame_slots;
+                    }
+                    // Task 24: record each Phi's entry value so the
+                    // CALL handler can initialize the home slot before
+                    // calling jit_entry. Without this, the JIT would
+                    // read Value::none() from Phi slots (the Frame
+                    // constructor fills with none(); only bind_parameters
+                    // populates Parameter slots, never Phi slots) and
+                    // every GUARD_INT would fail on the first read.
+                    // Conservative: only Phis whose entry input (ins[0])
+                    // is a ConstInt. ConstFloat / Parameter / arbitrary
+                    // entry values need a richer table (future task).
+                    bool has_loop_phis = false;
+                    lowered.graph.for_each_live([&](ir::NodeId id) {
+                        const ir::Node& n = lowered.graph.node(id);
+                        if (n.kind != ir::NodeKind::Phi) return;
+                        if (n.ins.size() < 2) return;
+                        has_loop_phis = true;   // any Phi means loop-backedge
+                        const ir::Node& entry = lowered.graph.node(n.ins[0]);
+                        if (entry.kind != ir::NodeKind::ConstInt) return;
+                        cu->phi_init_node_ids.push_back(
+                            static_cast<std::uint32_t>(id));
+                        cu->phi_init_values.push_back(
+                            entry.const_value.as.i);
+                    });
+                    // Task 24: the backend's lowering.cpp currently
+                    // treats Phi nodes as "pure data inputs — no MIR
+                    // emitted" (line ~297). The loop backedge update
+                    // (s.Phi.home <- PyBinary(s+i).home at the JUMP)
+                    // is NOT materialized by the backend — only the
+                    // scheduler emits the equivalent MOVE for Tier-0.
+                    // This means JIT'd loops produce wrong answers
+                    // (s stays at its entry value forever). Until the
+                    // backend emits the backedge MOVrr, conservatively
+                    // downgrade units with any Phi to has_dynamic_ops =
+                    // true so the CALL handler skips jit_entry and
+                    // runs Tier-0 (which correctly handles the backedge
+                    // via MOVE). The eager JIT wiring stays in place;
+                    // the Phi-backedge-MOVrr gap is a follow-on task.
+                    if (has_loop_phis) {
+                        cu->has_dynamic_ops = true;
+                        // Leave jit_entry installed (for telemetry /
+                        // future fix); just don't invoke it yet.
+                    }
+                    // Task 24: safepoint_pcs population is NOT yet
+                    // wired (would need a NodeId→Tier-0 PC map from
+                    // the scheduler). For units with
+                    // has_dynamic_ops == false, no CALLri exists and
+                    // no bridge call can fire, so safepoint_pcs
+                    // stays empty safely. For units with
+                    // has_dynamic_ops == true, the CALL handler
+                    // skips jit_entry anyway (falls back to Tier-0).
+                    // Future task: populate safepoint_pcs so units
+                    // with dynamic ops can also be JIT'd.
+                } else {
+                    // compile_unit reported the graph couldn't be
+                    // lowered (likely contains ops the backend's MIR
+                    // table doesn't handle yet, or the codegen ran
+                    // out of buffer space). Fall back to Tier-0;
+                    // munmap the unused buffer.
+                    vortex_rt_munmap_jit_buffer(jit_buf, kJitCodeCapacity);
+                }
+            }
+            // If make_jit_buffer returned nullptr (mmap failed), the
+            // unit runs Tier-0 only — no JIT, but no fault either.
+        }
+
         vm.program.units[cu->id] = cu;
         if (p.def == nullptr) module_unit_id = cu->id;
 

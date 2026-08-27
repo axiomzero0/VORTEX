@@ -17,12 +17,22 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 #include "vortex/common/value.hpp"
 #include "vortex/rt/object.hpp"
 #include "vortex/stdx/small_vector.hpp"
 #include "vortex/support/symbol_table.hpp"
+
+// Task 24: extern "C" shim for munmap. Defined in runtime/src/jit.cpp
+// (which already includes <sys/mman.h>). The CodeUnit destructor calls
+// this to free the RWX JIT buffer without forcing every TU that
+// includes code.hpp to pull <sys/mman.h>. Declared BEFORE the
+// vortex::rt namespace opens so the CodeUnit destructor's name lookup
+// finds it (the destructor body is parsed at the class definition
+// point, where only prior declarations are visible).
+extern "C" void vortex_rt_munmap_jit_buffer(void* buf, std::size_t cap) noexcept;
 
 namespace vortex::rt {
 
@@ -103,6 +113,35 @@ struct CodeUnit {
     std::atomic<void*> jit_entry{nullptr};   // safepoint-swapped machine code
     void* jit_metadata{nullptr};             // deopt tables, owned by backend
     std::uint32_t deopt_count{0};            // telemetry (Rule 26)
+    /// Task 24: RWX mmap'd buffer holding the JIT-compiled machine code.
+    /// Owned by the runtime; freed in the destructor. Allocated by the
+    /// driver when `backend::compile_unit` succeeds; null when the unit
+    /// runs Tier-0 only.
+    std::byte* jit_code_buffer{nullptr};
+    std::size_t jit_code_capacity{0};
+    /// Task 24: true if the JIT'd code for this unit contains any CALLri
+    /// fallback (PyBinary/PyCompare/CallPy/etc. without a fast path).
+    /// Copied from `backend::CompiledCode::has_dynamic_ops` by the
+    /// driver. The CALL handler consults this to decide whether to
+    /// invoke jit_entry: when true, calling jit_entry would hit the
+    /// bridge path which needs safepoint_pcs populated (not yet
+    /// implemented); fall back to exec_frame instead.
+    bool has_dynamic_ops{false};
+    /// Task 24: initial values for Phi home slots at function entry.
+    /// Populated by the driver after compile_unit, by walking the IR
+    /// graph and recording each Phi whose entry input (ins[0]) is a
+    /// ConstInt. The CALL handler writes these to regs[phi_node_id]
+    /// before calling jit_entry — without this, the JIT's prologue
+    /// (which assumes the entry block's home slots are populated by
+    /// the runtime, the way Tier-0's LOAD_CONST+MOVE prologue does)
+    /// would read Value::none() and every GUARD_INT would fail on
+    /// the first read.
+    ///
+    /// (std::uint32_t node_id, std::int64_t value) — small_vector
+    /// of pairs. Spilled across pairs for cache-friendly iteration
+    /// during the CALL hot path.
+    stdx::small_vector<std::uint32_t, 8> phi_init_node_ids{};
+    stdx::small_vector<std::int64_t, 8>  phi_init_values{};
 
     // --- JIT safepoint → Tier-0 resume-point map (Rule 4) ---------------------
     // Indexed by the safepoint_index that the JIT's deopt stub passes to
@@ -116,6 +155,15 @@ struct CodeUnit {
         Runtime& rt = Runtime::instance();
         for (Value& v : constants) {
             if (v.tag == Tag::Obj && v.as.obj) rt.decref(v.as.obj);
+        }
+        // Task 24: free the RWX mmap'd JIT code buffer (if any).
+        // We don't pull <sys/mman.h> into every TU that includes this
+        // header; instead the runtime exposes a small C shim
+        // `vortex_rt_munmap_jit_buffer(buf, cap)` defined in
+        // runtime/src/jit.cpp, which calls munmap.
+        if (jit_code_buffer) {
+            vortex_rt_munmap_jit_buffer(jit_code_buffer, jit_code_capacity);
+            jit_code_buffer = nullptr;
         }
     }
 };

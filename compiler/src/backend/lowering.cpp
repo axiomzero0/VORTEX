@@ -118,6 +118,30 @@ constexpr std::array<LoweringEntry, 14> kLoweringTable{{
     const Node& n = g.node(v);
     if (n.kind == NodeKind::ConstInt) return true;
     if (n.has(NodeFlag::Unboxed)) return true;
+    // Task 24: Phi whose entry value (ins[0]) is a ConstInt is treated
+    // as int-typed. This is the conservative form of type inference
+    // sufficient to specialize the common Python idiom
+    //   i = 0
+    //   while i < N:
+    //       s = s + i
+    //       i = i + 1
+    // where `s` and `i` are loop-header Phis with ConstInt entry values.
+    // Without this check, the backend emits CALLri for every `+` and
+    // every `<` in the loop body, which calls vortex_jit_bridge on every
+    // iteration; without a populated safepoint_pcs table the bridge falls
+    // back to pc=0 and infinite-loops.
+    //
+    // Conservatively, we only look at the ENTRY input (ins[0]). The
+    // backedge input (ins[1]) is the value after one loop iteration;
+    // for `s = s + i` the backedge is a PyBinary(Add) result, which we
+    // don't yet prove int-typed without a fixpoint pass. The GUARD_INT
+    // the backend emits catches the rare case where the assumption is
+    // wrong (e.g., a future iteration produces a non-int) — deopt
+    // triggers, the runtime falls back to Tier-0 from the safepoint.
+    if (n.kind == NodeKind::Phi && n.ins.size() >= 2) {
+        const Node& entry = g.node(n.ins[0]);
+        if (entry.kind == NodeKind::ConstInt) return true;
+    }
     // Parameters default to guarded (dynamic) — never assume.
     return false;
 }
@@ -493,6 +517,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(0));   // helper idx filled by codegen
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
                 case NodeKind::PyCompare: {
@@ -563,6 +588,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(1));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
                 case NodeKind::CallPy:
@@ -574,6 +600,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(2));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
                 case NodeKind::LoadGlobal:
@@ -584,6 +611,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(3));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
                 case NodeKind::StoreGlobal:
@@ -595,6 +623,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(4));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
                 case NodeKind::Iter:
@@ -606,6 +635,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(5));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
                 case NodeKind::NewList:
@@ -615,6 +645,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.node(call).block = mb;
                     out.mir.add_operand(call, MachineOperand::imm_op(6));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
                 case NodeKind::Guard: {
@@ -623,6 +654,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(7));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     if (n.aux1 < g.frame_state_count()) {
                         out.referenced_frame_states.push_back(n.aux1);
                     }
@@ -635,6 +667,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                     out.mir.add_operand(call, MachineOperand::imm_op(8));
                     out.mir.add_operand(call, MachineOperand::slot_op(home));
                     out.mir.node(call).is_safepoint = true;
+                    out.has_dynamic_ops = true;   // Task 24: bridge would fire.
                     break;
                 }
             }

@@ -24,6 +24,7 @@ add_executable(vortex_regression_tests
     pipeline_ir_fingerprint_regr.cpp
     determinism_regr.cpp
     jit_differential_regr.cpp
+    jit_loop_regr.cpp
     pass_budget_guards_regr.cpp
     opt_in_toggle_regr.cpp
 )

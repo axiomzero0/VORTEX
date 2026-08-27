@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "vortex/backend/codegen.hpp"   // Task 24: JitEntryFn for CALL fast path
+
 #include "vortex/frontend/lowering.hpp"
 #include "vortex/support/config.hpp"
 #include "vortex/support/symbol_table.hpp"
@@ -729,6 +731,52 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
 
             Frame f(unit);
             if (!bind_parameters(f, fn, args, argc, kw_names, nkw)) return false;
+
+            // Task 24: JIT fast path. The driver installs
+            // `unit->jit_entry` eagerly for non-generator units; the
+            // backend reports `has_dynamic_ops == true` when the
+            // lowered code contains any CALLri fallback (PyBinary /
+            // PyCompare / CallPy / LoadGlobal / StoreGlobal / LoadAttr /
+            // StoreAttr / LoadIndex / StoreIndex / ListAppend / Iter /
+            // IterNext / Yield / NewList / NewTuple / NewDict /
+            // Guard-with-no-frame-state). When the unit has no dynamic
+            // ops, the JIT'd code runs to completion without invoking
+            // vortex_jit_bridge — safe to call directly. When it does
+            // have dynamic ops, the bridge would need safepoint_pcs
+            // (not yet populated); fall back to Tier-0 instead.
+            //
+            // The acquire load pairs the release store in the driver
+            // (memory_order_release on jit_entry.store) — the caller
+            // observes the JIT'd code's writes (via the mmap'd buffer)
+            // only after the store is visible.
+            void* entry_raw = unit->jit_entry.load(std::memory_order_acquire);
+            if (entry_raw && !unit->has_dynamic_ops && !unit->is_generator) {
+                // Task 24: initialize Phi home slots from their entry
+                // values before calling jit_entry. The Tier-0
+                // interpreter's prologue (LOAD_CONST + MOVE) does
+                // this for the bytecode path; the JIT bypasses that
+                // prologue, so we replicate it here. Without this,
+                // every GUARD_INT would fail on the first read
+                // (Phis start as Value::none()). The driver
+                // populates phi_init_node_ids/values during
+                // compile_program by walking the IR for Phis with
+                // ConstInt entry inputs.
+                const std::size_t n_init = unit->phi_init_node_ids.size();
+                for (std::size_t i = 0; i < n_init; ++i) {
+                    std::uint32_t node_id = unit->phi_init_node_ids[i];
+                    if (node_id < f.n_regs) {
+                        f.regs[node_id] = Value::integer(
+                            unit->phi_init_values[i]);
+                    }
+                }
+                auto entry = reinterpret_cast<backend::JitEntryFn>(entry_raw);
+                ++call_depth;
+                Value rv = entry(f.regs);
+                --call_depth;
+                out = rv;
+                return true;
+            }
+
             ++call_depth;
             ExecStatus st = exec_frame(f);
             --call_depth;

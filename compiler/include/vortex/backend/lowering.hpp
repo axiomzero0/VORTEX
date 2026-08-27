@@ -35,6 +35,15 @@ struct LoweringResult {
     std::uint32_t frame_slots{0};
     /// FrameState ids referenced by guards (for the unwind table).
     stdx::small_vector<std::uint32_t, 8> referenced_frame_states{};
+    /// Task 24: true if any CALLri fallback (PyBinary/PyCompare/CallPy/
+    /// LoadGlobal/StoreGlobal/LoadAttr/StoreAttr/LoadIndex/StoreIndex/
+    /// ListAppend/Iter/GetIterCheck/IterNext/Yield/NewList/NewTuple/
+    /// NewDict/Guard-with-no-frame-state) was emitted. Copied into
+    /// CompiledCode by the codegen; propagated to CodeUnit by the
+    /// runtime driver. The runtime uses this to skip jit_entry for
+    /// functions that would require the bridge path (which needs a
+    /// populated safepoint_pcs table — not yet implemented).
+    bool has_dynamic_ops{false};
 };
 
 /// Pass 52 entry point. `target` supplies the cost/SIMD capabilities.

@@ -83,6 +83,18 @@ struct CompiledCode {
     /// the loop boundary.
     std::uint32_t xmm_cache_hits{0};
     bool valid{false};
+    /// Task 24: true if this unit's MIR contains ANY CALLri fallback
+    /// (PyBinary/PyCompare/CallPy/etc. without a fast path). Set by the
+    /// backend lowering when it emits a CALLri for a node that has no
+    /// int/float/bool specialization. The runtime uses this to decide
+    /// whether to call jit_entry or fall back to Tier-0:
+    ///   has_dynamic_ops == false  → safe to JIT (no bridge call will fire)
+    ///   has_dynamic_ops == true   → CALLri will call vortex_jit_bridge,
+    ///                               which (without a populated
+    ///   safepoint_pcs table) would resume at pc=0 and infinite-loop.
+    ///   Until the safepoint_pcs mapping is wired, the runtime falls
+    ///   back to Tier-0 for units with dynamic ops.
+    bool has_dynamic_ops{false};
 };
 
 /// Entry-point signature the runtime calls. SysV return convention for a
