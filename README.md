@@ -4,7 +4,7 @@ Tiered optimizing compiler infrastructure for Python 3.16, written in C++26.
 
 ## Documentation
 
-- **[VORTEX Compiler Laws & Architecture Specification](docs/LAWS.md)** — the
+- [VORTEX Compiler Laws & Architecture Specification](docs/LAWS.md) the
   authoritative, uncompressed transcription of the laws that govern the VORTEX
   compiler. Every commit to `compiler/`, `runtime/`, `tools/`, and `tests/`
   must comply. CI verifies them. **There are no exceptions.**
@@ -31,12 +31,12 @@ ctest --test-dir build
 
 ## Tiers
 
-1. **Tier 0**: Direct-threaded register interpreter (computed goto, the
+1. Tier 0: Direct-threaded register interpreter (computed goto, the
    ultimate fallback).
-2. **Tier 1**: Baseline JIT (budget-constrained, linear-time passes only).
-3. **Tier 2**: Optimizing JIT (PGO-driven, guard-emitting, full 51-pass
+2. Tier 1: Baseline JIT (budget-constrained, linear-time passes only).
+3. Tier 2: Optimizing JIT (PGO-driven, guard-emitting, full 51-pass
    pipeline).
-4. **Tier 3**: AOT/static (proofs only, zero guards).
+4. Tier 3: AOT/static (proofs only, zero guards).
 
 ## Opt-out flags
 
