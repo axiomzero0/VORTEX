@@ -591,6 +591,26 @@ Value time_time(void*, Value*, std::uint32_t) noexcept {
                        1e6);
 }
 
+/// time.perf_counter() — fractional seconds, highest-available resolution.
+/// Uses steady_clock (monotonic, nanosecond precision on Linux). Returns
+/// a float matching CPython's perf_counter semantics.
+Value time_perf_counter(void*, Value*, std::uint32_t) noexcept {
+    return Value::real(std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count());
+}
+
+/// time.perf_counter_ns() — integer nanoseconds, highest-available
+/// resolution. This is the workhorse for in-process benchmarking: it
+/// avoids the float-conversion overhead of perf_counter() and gives
+/// sub-microsecond timing precision on modern x86-64.
+Value time_perf_counter_ns(void*, Value*, std::uint32_t) noexcept {
+    return Value::integer(static_cast<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count()));
+}
+
 // --- random module (xorshift64 — deterministic under seed()) --------------------------
 std::uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 
@@ -745,6 +765,14 @@ PyModuleObj* load_native_module(std::uint32_t name_symbol) noexcept {
         dict_set(mod->ns, Value::integer(global_symbols().intern("time")),
                  Value::object(reinterpret_cast<PyObj*>(
                      rt.new_native(global_symbols().intern("time"), time_time, nullptr))));
+        dict_set(mod->ns, Value::integer(global_symbols().intern("perf_counter")),
+                 Value::object(reinterpret_cast<PyObj*>(
+                     rt.new_native(global_symbols().intern("perf_counter"),
+                                   time_perf_counter, nullptr))));
+        dict_set(mod->ns, Value::integer(global_symbols().intern("perf_counter_ns")),
+                 Value::object(reinterpret_cast<PyObj*>(
+                     rt.new_native(global_symbols().intern("perf_counter_ns"),
+                                   time_perf_counter_ns, nullptr))));
     } else if (name == "random") {
         known = true;
         auto add = [&](const char* n, NativeFn fn) {
