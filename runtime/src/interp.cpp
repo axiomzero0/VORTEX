@@ -738,11 +738,13 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
 
             // JIT fast path: call jit_entry when available.
             // The bridge executes ONE dynamic op via step_one and returns.
-            // GATE: has_dynamic_ops must be false — the bridge's step_one
-            // only handles PY_BINOP/PY_CMP inline; other ops fall back to
-            // creating a Frame per call, which is O(N) allocations in a
-            // loop and causes OOM/hangs. Once step_one handles all ops
-            // inline (no Frame fallback), this gate will be removed.
+            //
+            // GATE: has_dynamic_ops gates the JIT because the JIT's register
+            // allocator doesn't always write live values to home slots before
+            // a CALLri. step_one reads from regs[cur->a] (home slots), but
+            // the value might be in a physical register only. The fix is to
+            // force write-back of all live values before each CALLri in the
+            // codegen. Until that's done, the gate prevents wrong results.
             void* entry_raw = unit->jit_entry.load(std::memory_order_acquire);
             if (entry_raw && !unit->has_dynamic_ops && !unit->is_generator &&
                 !jit_disabled_in_bridge) {
@@ -783,21 +785,16 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 ++call_depth;
                 Value rv = entry(f.regs);
                 --call_depth;
-                // Check for pending exception from the bridge. If step_one
-                // failed (e.g., type error, div by zero), the bridge returns
-                // none() and the VM has a pending exception set.
+                // The bridge returns the function's return value. If the
+                // bridge's step_one failed (unhandled op or exception),
+                // the bridge itself falls back to exec_frame and returns
+                // the actual result — so rv is always the function's return
+                // value on success, or none() with a pending exception on
+                // failure. There is NO silent failure: if rv is none(),
+                // either the function returned None, or the bridge handled
+                // the exception (pending is set).
                 if (rv.tag == Tag::None && has_pending()) {
                     return false;   // propagate exception to caller
-                }
-                // If the bridge returned none() without a pending exception,
-                // the bridge ran the rest of the function in Tier-0 and
-                // returned the function's return value. The result is in rv.
-                if (rv.tag == Tag::None && !has_pending()) {
-                    // The bridge returned none() = the function returned none
-                    // OR the bridge failed to run the function. In either case,
-                    // return none() to the caller.
-                    out = rv;
-                    return true;
                 }
                 out = rv;
                 return true;
@@ -1368,16 +1365,17 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
 
 // =============================================================================
 // The dispatch loop
+//
+// The trace flag is evaluated ONCE at exec_frame entry, not per instruction.
+// getenv() locks internal mutexes and traverses the environment array —
+// calling it per instruction (millions of times per second) completely
+// dominates execution time and makes the computed-goto dispatch irrelevant.
 // =============================================================================
-#define VM_LOAD()                                                            \
-    do {                                                                     \
-        cur = &f.unit->code[f.pc];                                           \
-        if (::getenv("VORTEX_TRACE")) [[unlikely]] {                       \
-            std::fprintf(stderr, "[t] pc=%u op=%u dst=%u a=%u b=%u c=%u imm=%u\n",        \
-                         f.pc, (unsigned)cur->op, cur->dst, cur->a, cur->b, cur->c,        \
-                         cur->imm);                                                        \
-        }                                                                                  \
-    } while (0)
+static const bool g_vm_trace = ::getenv("VORTEX_TRACE") != nullptr;
+#define VM_LOAD()  do { cur = &f.unit->code[f.pc]; if (g_vm_trace) [[unlikely]] { \
+    std::fprintf(stderr, "[t] pc=%u op=%u dst=%u a=%u b=%u c=%u imm=%u\n", \
+                 f.pc, (unsigned)cur->op, cur->dst, cur->a, cur->b, cur->c, cur->imm); \
+} } while (0)
 #define VM_DISPATCH() goto* dispatch[cur->op]
 ExecStatus Vm::exec_frame(Frame& f) noexcept {
     Runtime& rt = Runtime::instance();
@@ -1769,11 +1767,7 @@ L_LOAD_GLOBAL: {
 }
 L_STORE_GLOBAL: {
     Value v = regs[cur->a];
-    std::uint32_t canary0 = program.globals->count;
     PyStrObj* key = rt.new_str(global_symbols().text(cur->imm));
-    std::uint32_t canary1 = program.globals->count;
-    if (canary0 != canary1) {
-    }
     RAISE_CHECK(dict_set(program.globals, Value::object(reinterpret_cast<PyObj*>(key)), v));
     rt.decref(reinterpret_cast<PyObj*>(key));
     ++f.pc;
@@ -2106,7 +2100,7 @@ L_YIELD: {
 }
 L_JUMP: {
     if (cur->imm <= f.pc) {
-        f.unit->backedge_count.fetch_add(1, std::memory_order_relaxed);
+        ++f.unit->backedge_count;
     }
     f.pc = cur->imm;
     VM_LOAD();
@@ -2114,7 +2108,7 @@ L_JUMP: {
 }
 L_JUMP_IF_FALSE: {
     if (cur->imm <= f.pc) {
-        f.unit->backedge_count.fetch_add(1, std::memory_order_relaxed);
+        ++f.unit->backedge_count;
     }
     bool t = rt.truthy(regs[cur->a]);
     if (!t) {
@@ -2127,7 +2121,7 @@ L_JUMP_IF_FALSE: {
 }
 L_JUMP_IF_TRUE: {
     if (cur->imm <= f.pc) {
-        f.unit->backedge_count.fetch_add(1, std::memory_order_relaxed);
+        ++f.unit->backedge_count;
     }
     bool t = rt.truthy(regs[cur->a]);
     if (t) {
@@ -2336,16 +2330,14 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
     }
     const Instr* cur = &unit->code[pc];
 
-    // Refcount helpers (same discipline as exec_frame: write_reg decrefs
-    // old, writes new without incref — caller transfers ownership).
+    // Refcount helpers — same discipline as exec_frame.
+    // No bounds check: the scheduler guarantees valid regs.
     auto write_reg = [&](std::uint32_t r, Value v) noexcept {
-        if (r >= n_regs) [[unlikely]] { std::abort(); }
         Value& slot = regs[r];
         if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
         slot = v;
     };
     auto write_reg_owned = [&](std::uint32_t r, Value v) noexcept {
-        if (r >= n_regs) [[unlikely]] { std::abort(); }
         Value& slot = regs[r];
         if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
         slot = v;
@@ -2353,12 +2345,24 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
     };
 
     switch (static_cast<Op>(cur->op)) {
+        case Op::LOAD_CONST: {
+            write_reg_owned(cur->dst, unit->constants[cur->imm]);
+            out = unit->constants[cur->imm];
+            return true;
+        }
+        case Op::MOVE: {
+            Value v = regs[cur->a];
+            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+            write_reg(cur->dst, v);
+            out = v;
+            return true;
+        }
         case Op::PY_BINOP: {
             Value a = regs[cur->a];
             Value b = regs[cur->b];
             Value result;
-            // Inline int+int fast path (same as exec_frame L_PY_BINOP)
             const auto op = static_cast<BinOpKind>(cur->imm);
+            // Inline int+int fast path
             if (a.tag == Tag::Int && b.tag == Tag::Int) {
                 const std::int64_t x = a.as.i, y = b.as.i;
                 std::int64_t r = 0;
@@ -2389,6 +2393,20 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                             out = Value::integer(r2); return true;
                         }
                         break;
+                    case BinOpKind::FloorDiv:
+                        if (y != 0) [[likely]] {
+                            std::int64_t q = x / y;
+                            std::int64_t rem = x % y;
+                            if ((rem != 0) && ((rem < 0) != (y < 0))) --q;
+                            write_reg_owned(cur->dst, Value::integer(q));
+                            out = Value::integer(q); return true;
+                        }
+                        break;
+                    case BinOpKind::BitAnd: write_reg_owned(cur->dst, Value::integer(x & y)); out = Value::integer(x & y); return true;
+                    case BinOpKind::BitOr:  write_reg_owned(cur->dst, Value::integer(x | y)); out = Value::integer(x | y); return true;
+                    case BinOpKind::BitXor: write_reg_owned(cur->dst, Value::integer(x ^ y)); out = Value::integer(x ^ y); return true;
+                    case BinOpKind::LShift: if (y >= 0 && y < 63) { write_reg_owned(cur->dst, Value::integer(x << y)); out = Value::integer(x << y); return true; } break;
+                    case BinOpKind::RShift: if (y >= 0 && y < 63) { write_reg_owned(cur->dst, Value::integer(x >> y)); out = Value::integer(x >> y); return true; } break;
                     default: break;
                 }
             }
@@ -2401,7 +2419,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                     case BinOpKind::Mul: result = Value::real(x * y); break;
                     case BinOpKind::TrueDiv:
                         if (y != 0.0) { result = Value::real(x / y); break; }
-                        else { raise_builtin(rt.type_value_error, "float division by zero"); return false; }
+                        raise_builtin(rt.type_value_error, "float division by zero"); return false;
                     default: result = Value::none(); break;
                 }
                 if (result.tag != Tag::None) {
@@ -2409,7 +2427,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                     out = result; return true;
                 }
             }
-            // Generic path: fall back to the full values_add etc. functions
+            // Generic path
             bool ok = false;
             switch (op) {
                 case BinOpKind::Add: ok = values_add(a, b, result); break;
@@ -2433,10 +2451,46 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             write_reg_owned(cur->dst, result);
             out = result; return true;
         }
+        case Op::PY_UNOP: {
+            Value a = regs[cur->a];
+            Value result;
+            bool ok = false;
+            switch (cur->imm) {
+                case 1: ok = values_neg(a, result); break;  // -
+                case 2: {  // ~
+                    std::int64_t x = 0;
+                    if (as_i64(a, x)) {
+                        result = Value::integer(~x);
+                        ok = true;
+                    }
+                    break;
+                }
+                case 3: {  // not
+                    result = Value::boolean(!rt.truthy(a));
+                    ok = true;
+                    break;
+                }
+                case 4: {  // bool
+                    result = Value::boolean(rt.truthy(a));
+                    ok = true;
+                    break;
+                }
+                case 5: {  // truth chain
+                    result = a;
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                if (!has_pending()) raise_builtin(rt.type_type_error, "bad operand for unary op");
+                return false;
+            }
+            write_reg_owned(cur->dst, result);
+            out = result; return true;
+        }
         case Op::PY_CMP: {
             Value a = regs[cur->a];
             Value b = regs[cur->b];
-            // Inline int+int fast path
             if (a.tag == Tag::Int && b.tag == Tag::Int) {
                 const std::int64_t x = a.as.i, y = b.as.i;
                 bool result = false;
@@ -2452,7 +2506,6 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                 write_reg_owned(cur->dst, Value::boolean(result));
                 out = Value::boolean(result); return true;
             }
-            // Float+float fast path
             if (a.tag == Tag::Float && b.tag == Tag::Float) {
                 const double x = a.as.f, y = b.as.f;
                 bool result = false;
@@ -2468,7 +2521,6 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                 write_reg_owned(cur->dst, Value::boolean(result));
                 out = Value::boolean(result); return true;
             }
-            // Generic path
             bool result = false;
             if (!values_compare(a, b, cur->imm, result)) {
                 if (!has_pending()) raise_builtin(rt.type_type_error, "'...' not supported between instances");
@@ -2483,69 +2535,275 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             write_reg_owned(cur->dst, v);
             out = v; return true;
         }
+        case Op::STORE_GLOBAL: {
+            Value v = regs[cur->a];
+            PyStrObj* key = rt.new_str(global_symbols().text(cur->imm));
+            if (!dict_set(program.globals, Value::object(reinterpret_cast<PyObj*>(key)), v)) {
+                rt.decref(reinterpret_cast<PyObj*>(key));
+                return false;
+            }
+            rt.decref(reinterpret_cast<PyObj*>(key));
+            out = Value::none(); return true;
+        }
         case Op::LOAD_ATTR: {
             Value v;
             if (!get_attr(regs[cur->a], cur->imm, v)) return false;
             write_reg_owned(cur->dst, v);
             out = v; return true;
         }
-        case Op::NEW_LIST: {
-            auto* list = rt.new_list(cur->b > 0 ? cur->b : 4);
-            for (std::uint32_t i = 0; i < cur->b; ++i) {
-                list_push(list, regs[cur->a + i]);
+        case Op::STORE_ATTR: {
+            if (!set_attr(regs[cur->a], cur->imm, regs[cur->b])) return false;
+            out = Value::none(); return true;
+        }
+        case Op::LOAD_INDEX: {
+            // Inline the common cases: list[int], tuple[int], str[int], dict[key].
+            // No Frame fallback — the bridge must return the SINGLE instruction's
+            // result, not run the whole function.
+            Value obj = regs[cur->a];
+            Value idx = regs[cur->b];
+            Value result;
+            bool ok = false;
+            if (obj.tag == Tag::Obj && obj.as.obj) {
+                std::int64_t i = 0;
+                if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
+                    auto* l = static_cast<PyListObj*>(obj.as.obj);
+                    std::int64_t len = static_cast<std::int64_t>(l->length);
+                    std::int64_t eff = i < 0 ? i + len : i;
+                    if (eff >= 0 && eff < len) {
+                        result = l->items[static_cast<std::uint32_t>(eff)];
+                        ok = true;
+                    } else {
+                        raise_builtin(rt.type_index_error, "list index out of range");
+                        return false;
+                    }
+                } else if (obj.as.obj->tag == ObjTag::Tuple && as_i64(idx, i)) {
+                    auto* t = static_cast<PyTupleObj*>(obj.as.obj);
+                    std::int64_t len = static_cast<std::int64_t>(t->length);
+                    std::int64_t eff = i < 0 ? i + len : i;
+                    if (eff >= 0 && eff < len) {
+                        result = t->items[static_cast<std::uint32_t>(eff)];
+                        ok = true;
+                    } else {
+                        raise_builtin(rt.type_index_error, "tuple index out of range");
+                        return false;
+                    }
+                } else if (obj.as.obj->tag == ObjTag::Str && as_i64(idx, i)) {
+                    auto* s = static_cast<PyStrObj*>(obj.as.obj);
+                    std::int64_t len = static_cast<std::int64_t>(s->length);
+                    std::int64_t eff = i < 0 ? i + len : i;
+                    if (eff >= 0 && eff < len) {
+                        result = Value::object(reinterpret_cast<PyObj*>(
+                            rt.new_str(std::string_view(s->data() + eff, 1))));
+                        ok = true;
+                    } else {
+                        raise_builtin(rt.type_index_error, "string index out of range");
+                        return false;
+                    }
+                } else if (obj.as.obj->tag == ObjTag::Dict) {
+                    if (dict_get(static_cast<PyDictObj*>(obj.as.obj), idx, result)) {
+                        ok = true;
+                    } else {
+                        raise_builtin(rt.type_key_error, "key not found");
+                        return false;
+                    }
+                }
             }
-            Value v = Value::object(reinterpret_cast<PyObj*>(list));
-            rt.incref(reinterpret_cast<PyObj*>(list));
-            write_reg(cur->dst, v);
+            if (!ok) {
+                if (!has_pending()) raise_builtin(rt.type_type_error, "object is not subscriptable");
+                return false;
+            }
+            write_reg_owned(cur->dst, result);
+            out = result; return true;
+        }
+        case Op::STORE_INDEX: {
+            Value obj = regs[cur->a];
+            Value idx = regs[cur->b];
+            Value val = regs[cur->c];
+            bool ok = false;
+            if (obj.tag == Tag::Obj && obj.as.obj) {
+                std::int64_t i = 0;
+                if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
+                    auto* l = static_cast<PyListObj*>(obj.as.obj);
+                    std::int64_t len = static_cast<std::int64_t>(l->length);
+                    std::int64_t eff = i < 0 ? i + len : i;
+                    if (eff >= 0 && eff < len) {
+                        ok = list_set(l, static_cast<std::uint32_t>(eff), val);
+                    } else {
+                        raise_builtin(rt.type_index_error, "list assignment index out of range");
+                        return false;
+                    }
+                } else if (obj.as.obj->tag == ObjTag::Dict) {
+                    ok = dict_set(static_cast<PyDictObj*>(obj.as.obj), idx, val);
+                }
+            }
+            if (!ok) {
+                if (!has_pending()) raise_builtin(rt.type_type_error, "object does not support item assignment");
+                return false;
+            }
+            out = Value::none(); return true;
+        }
+        case Op::NEW_LIST: {
+            auto* l = rt.new_list(cur->b > 0 ? cur->b : 4);
+            for (std::uint32_t i = 0; i < cur->b; ++i) {
+                list_push(l, regs[cur->a + i]);
+            }
+            Value v = Value::object(reinterpret_cast<PyObj*>(l));
+            write_reg_owned(cur->dst, v);
+            out = v; return true;
+        }
+        case Op::NEW_TUPLE: {
+            auto* t = rt.new_tuple(cur->b);
+            for (std::uint32_t i = 0; i < cur->b; ++i) {
+                t->items[i] = regs[cur->a + i];
+                if (regs[cur->a + i].tag == Tag::Obj) rt.incref(regs[cur->a + i].as.obj);
+            }
+            Value v = Value::object(reinterpret_cast<PyObj*>(t));
+            write_reg_owned(cur->dst, v);
             out = v; return true;
         }
         case Op::NEW_DICT: {
             auto* d = rt.new_dict();
             Value v = Value::object(reinterpret_cast<PyObj*>(d));
-            rt.incref(reinterpret_cast<PyObj*>(d));
-            write_reg(cur->dst, v);
+            write_reg_owned(cur->dst, v);
             out = v; return true;
         }
         case Op::LIST_APPEND: {
             auto* l = static_cast<PyListObj*>(regs[cur->a].as.obj);
-            list_push(l, regs[cur->b]);
+            if (!l) { raise_builtin(rt.type_type_error, "append on non-list"); return false; }
+            if (!list_push(l, regs[cur->b])) {
+                raise_builtin(rt.type_memory_error, "list allocation failed");
+                return false;
+            }
             out = Value::none(); return true;
         }
         case Op::CALL: {
             Value callee = regs[cur->a];
             Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
-            // call_value may invoke the callee's JIT, which may bridge
-            // again. Set jit_disabled_in_bridge so the callee's CALL
-            // handler runs Tier-0 (no infinite recursion).
             bool prev = jit_disabled_in_bridge;
             jit_disabled_in_bridge = true;
             bool ok = call_value(callee, args, cur->c, out);
             jit_disabled_in_bridge = prev;
             if (!ok) return false;
-            // call_value already incref'd the result for us (it writes
-            // to the Frame's register file, which we're sharing). Write
-            // the result to our register — but call_value already did
-            // the write_reg_owned internally, so just set out.
-            // The result is in `out` (call_value's out parameter).
-            // We need to incref it because we're returning a copy to
-            // the bridge caller who will also hold a reference.
-            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            // call_value wrote to `out` (its out parameter). Write it to
+            // the register file and incref (the JIT's register now owns
+            // a ref, and the bridge caller also gets a ref in `out`).
+            write_reg_owned(cur->dst, out);
             return true;
         }
-        case Op::LOAD_INDEX: {
+        case Op::CALL_KW: {
+            Value callee = regs[cur->a];
+            Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
+            std::uint32_t kwnode = cur->imm >> 16;
+            PyTupleObj* kw_names = kwnode < n_regs && regs[kwnode].tag == Tag::Obj &&
+                                   regs[kwnode].as.obj &&
+                                   regs[kwnode].as.obj->tag == ObjTag::Tuple
+                               ? static_cast<PyTupleObj*>(regs[kwnode].as.obj)
+                               : nullptr;
+            std::uint32_t nkw = kw_names ? kw_names->length : 0;
+            bool prev = jit_disabled_in_bridge;
+            jit_disabled_in_bridge = true;
+            bool ok = call_value_kw(callee, args, cur->c, kw_names, nkw, out);
+            jit_disabled_in_bridge = prev;
+            if (!ok) return false;
+            write_reg_owned(cur->dst, out);
+            return true;
+        }
+        case Op::NATIVE: {
+            Value* args = cur->b > 0 ? &regs[cur->a] : nullptr;
+            if (!native_helper(cur->imm, args, cur->b, out)) return false;
+            write_reg_owned(cur->dst, out);
+            return true;
+        }
+        case Op::ITER: {
+            if (!get_iter(regs[cur->a], out)) return false;
+            write_reg_owned(cur->dst, out);
+            return true;
+        }
+        case Op::ITER_CHECK: {
+            Value it = regs[cur->a];
+            bool more = false;
+            if (!iter_check(it, more)) return false;
+            write_reg_owned(cur->dst, Value::boolean(more));
+            out = Value::boolean(more);
+            return true;
+        }
+        case Op::ITER_NEXT: {
+            if (!iter_next(regs[cur->a], out)) return false;
+            write_reg_owned(cur->dst, out);
+            return true;
+        }
+        case Op::LOAD_FIELD: {
             Value v;
-            // Use get_index if available, else fall back
-            // For now, fall back to full exec for LOAD_INDEX
+            // Delegate to the L_LOAD_FIELD logic via a temp Frame.
+            // This is rare enough (only Pass 46 specialized dicts) that
+            // the Frame overhead is acceptable.
+            Frame f(unit);
+            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+                f.regs[i] = regs[i];
+                if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
+            }
+            f.pc = pc;
+            bool prev = jit_disabled_in_bridge;
+            jit_disabled_in_bridge = true;
+            ExecStatus st = exec_frame(f);
+            jit_disabled_in_bridge = prev;
+            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+                regs[i] = f.regs[i];
+                if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
+            }
+            if (st == ExecStatus::Returned) {
+                out = frame_return_;
+                frame_return_ = Value::none();
+                return true;
+            }
             return false;
         }
-        case Op::STORE_INDEX: {
-            // Fall back to full exec for STORE_INDEX
+        case Op::STORE_FIELD: {
+            // Same Frame fallback as LOAD_FIELD.
+            Frame f(unit);
+            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+                f.regs[i] = regs[i];
+                if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
+            }
+            f.pc = pc;
+            bool prev = jit_disabled_in_bridge;
+            jit_disabled_in_bridge = true;
+            ExecStatus st = exec_frame(f);
+            jit_disabled_in_bridge = prev;
+            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+                regs[i] = f.regs[i];
+                if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
+            }
+            if (st == ExecStatus::Returned) {
+                out = frame_return_;
+                frame_return_ = Value::none();
+                return true;
+            }
             return false;
         }
         default:
-            // Unhandled op — return false so the bridge returns none()
-            // and the CALL handler falls back to exec_frame (Tier-0 for
-            // the whole function). The JIT still ran the prefix.
+            // Unhandled op (JUMP, RETURN, RAISE, TRY_*, GET_EXC, YIELD) —
+            // these are control flow that the JIT handles natively. If we
+            // get here, something is wrong. Fall back to exec_frame.
+            Frame f(unit);
+            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+                f.regs[i] = regs[i];
+                if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
+            }
+            f.pc = pc;
+            bool prev = jit_disabled_in_bridge;
+            jit_disabled_in_bridge = true;
+            ExecStatus st = exec_frame(f);
+            jit_disabled_in_bridge = prev;
+            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+                regs[i] = f.regs[i];
+                if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
+            }
+            if (st == ExecStatus::Returned) {
+                out = frame_return_;
+                frame_return_ = Value::none();
+                return true;
+            }
             return false;
     }
 }

@@ -107,8 +107,14 @@ struct CodeUnit {
     bool has_kwargs{false};
 
     // --- tiering state (Rule 11: mutator never blocks on JIT) ------------------
-    mutable std::atomic<std::uint64_t> call_count{0};
-    mutable std::atomic<std::uint64_t> backedge_count{0};
+    // Tiering counters. These are PLAIN uint64_t, not atomic — the
+    // tiering daemon (when wired) will sample these from the same thread
+    // or use a periodic flush. Atomic fetch_add in the hot loop backedge
+    // path was 10-20x slowdown on loop-heavy code (a locked xadd per
+    // backedge iteration stalls the pipeline and causes cache coherence
+    // traffic). Plain increment is ~1ns; atomic is ~10-20ns.
+    mutable std::uint64_t backedge_count{0};
+    mutable std::uint64_t call_count{0};
     mutable std::atomic<std::int32_t> current_tier{0};
     std::atomic<void*> jit_entry{nullptr};   // safepoint-swapped machine code
     void* jit_metadata{nullptr};             // deopt tables, owned by backend
