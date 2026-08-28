@@ -155,6 +155,20 @@ struct CodeUnit {
     // JIT code is installed; zero entries means "no JIT installed".
     stdx::small_vector<std::uint32_t, 16> safepoint_pcs{};
 
+    // --- IR NodeId → Tier-0 PC map (for the JIT bridge) ------------------------
+    // The JIT bridge receives an IR NodeId (the CALLri's home slot) as
+    // op_hint. It uses this map to find the corresponding Tier-0
+    // instruction, executes that ONE instruction, and returns to the
+    // JIT. This is what makes the bridge RETURN instead of being a
+    // one-way JMP — the JIT runs the whole function, only bridging for
+    // individual dynamic ops.
+    //
+    // Populated by the driver after scheduling. The key is the IR NodeId
+    // (= home slot index); the value is the Tier-0 PC (index into `code`).
+    // Uses a flat linear array indexed by NodeId for O(1) lookup — the
+    // array is sized to max_node_id + 1, with 0xFFFF'FFFF for unmapped.
+    stdx::small_vector<std::uint32_t, 256> node_id_to_pc{};
+
     ~CodeUnit() {
         Runtime& rt = Runtime::instance();
         for (Value& v : constants) {

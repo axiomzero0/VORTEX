@@ -409,6 +409,15 @@ public:
         return emit8(0xE0);
     }
 
+    // --- CALL rax (FF D0) — indirect call through a register -----------------------------
+    // Unlike JMP, CALL pushes the return address and the callee RETs back
+    // to the instruction after the CALL. This is what makes the bridge
+    // RETURN to the JIT instead of being a one-way trip.
+    [[nodiscard]] bool call_rax() noexcept {
+        if (!emit8(0xFF)) return false;
+        return emit8(0xD0);
+    }
+
     static constexpr std::size_t k_invalid_site = static_cast<std::size_t>(-1);
 
 private:

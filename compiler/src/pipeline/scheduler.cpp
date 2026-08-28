@@ -827,11 +827,20 @@ Result<void> Scheduler::run() noexcept {
         b->start_pc = next_pc;
         next_pc += static_cast<std::uint32_t>(b->body.size() + b->term.size());
     }
+    // Size the node_id_to_pc map to cover all IR node ids. The bridge
+    // uses this for O(1) NodeId→PC lookup. 0xFFFF'FFFF = unmapped.
+    unit_.node_id_to_pc.resize(g_.node_count(), 0xFFFF'FFFFu);
     for (NodeId leader : order) {
         BlockInfo* b = block(leader);
         for (const Instr& i : b->body) {
+            std::uint32_t pc = static_cast<std::uint32_t>(unit_.code.size());
             unit_.code.push_back(rt::Instr{static_cast<std::uint16_t>(i.op), i.dst, i.a, i.b,
                                            i.c, i.imm});
+            // Record NodeId→PC for the bridge. i.dst is the NodeId for
+            // effect ops (set in emit_effect_op: i.dst = id).
+            if (i.dst < unit_.node_id_to_pc.size()) {
+                unit_.node_id_to_pc[i.dst] = pc;
+            }
         }
         for (const Instr& i : b->term) {
             unit_.code.push_back(rt::Instr{static_cast<std::uint16_t>(i.op), i.dst, i.a, i.b,

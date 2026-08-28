@@ -1067,39 +1067,46 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     break;
                 }
                 case MOp::CALLri: {
-                    // All dynamic ops call through the interpreter bridge.
-                    // The bridge signature is void(void* regs, uint32_t unit_id,
+                    // Dynamic ops call through the interpreter bridge.
+                    // The bridge signature: Value(void* regs_raw, uint32_t unit_id,
                     // uint64_t op_hint) under SysV: RDI = regs base, RSI =
-                    // unit_id, RDX = op_hint (helper idx from the MIR operand).
-                    // Record a safepoint BEFORE the call: pc_offset =
-                    // current size; the bridge address is baked directly
-                    // into the code (it's a process-local symbol).
-                    std::uint64_t op_hint = n.operands.empty() ? 0 :
-                        static_cast<std::uint64_t>(n.operands[0].imm);
+                    // unit_id, RDX = op_hint.
+                    //
+                    // op_hint = the IR NodeId (n.home) of this CALLri site.
+                    // The bridge uses unit->node_id_to_pc[op_hint] to find
+                    // the corresponding Tier-0 instruction, executes that ONE
+                    // instruction, and returns. This is what makes the bridge
+                    // RETURN to the JIT — the JIT continues after the CALL,
+                    // only paying the bridge cost for the one dynamic op.
+                    //
+                    // CALL (not JMP): pushes the return address so the bridge
+                    // can RET back to the next JIT instruction. Stack is
+                    // 16-byte aligned at the CALL site (5 pushes + original
+                    // CALL = 48 bytes = 3×16, already aligned).
+                    std::uint64_t op_hint = static_cast<std::uint64_t>(n.home_slot);
                     emit_safepoint(n.frame_state_id, 0);
-                    // RDI = regs base (frame_base); RSI = unit_id; RDX = op_hint
+                    // RDI = regs base (frame_base); RSI = unit_id; RDX = NodeId
                     a.mov_r64_r64(x86::RDI, frame_base);
                     a.mov_r64_imm64(x86::RSI, unit_id);
                     a.mov_r64_imm64(x86::RDX, op_hint);
                     a.mov_r64_imm64(x86::RAX, reinterpret_cast<std::uint64_t>(&vortex_jit_bridge));
-                    a.jmp_rax_placeholder();
-                    // Pass 54: a call (or jmp to bridge — same ABI clobber
-                    // set) clobbers ALL caller-saved GPRs per SysV. Mark
-                    // every allocatable caller-saved GPR free in the cache;
+                    a.call_rax();
+                    // After the bridge returns, the result Value is in
+                    // RAX (tag) + RDX (payload). The bridge already wrote
+                    // the result to the home slot (via the Tier-0 instruction's
+                    // dst register), so the JIT's home-slot discipline picks
+                    // it up on the next read. No explicit write-back needed.
+                    //
+                    // Pass 54: a call clobbers ALL caller-saved GPRs per SysV.
+                    // Mark every allocatable caller-saved GPR free in the cache;
                     // the only survivor is RBX (callee-saved).
                     for (std::uint32_t i = 0; i < n_alloc; ++i) {
                         std::uint8_t gpr = target.allocatable[i];
                         if (gpr != x86::RBX) gpr_cache.clobber(gpr);
                     }
-                    // Pass 54 V3 (LSRA->XMM): the bridge is a tail-call
-                    // to C++ code; under SysV x86-64 the XMM0-XMM15 file
-                    // is entirely caller-saved (no callee-saved XMMs
-                    // exist). Mark every cached XMM free — the runtime
-                    // may overwrite any of them while running the helper.
-                    // (In practice the bridge returns via longjmp into
-                    // the interpreter and never reads its XMM outputs, but
-                    // the conservative correctness contract is: every
-                    // cached XMM is dead past a CALLri.)
+                    // Pass 54 V3 (LSRA->XMM): the bridge is a call to C++
+                    // code; under SysV x86-64 the XMM0-XMM15 file is entirely
+                    // caller-saved. Mark every cached XMM free.
                     for (std::uint32_t i = 0; i < n_alloc_fpr; ++i) {
                         xmm_cache.clobber(target.allocatable_fpr[i]);
                     }

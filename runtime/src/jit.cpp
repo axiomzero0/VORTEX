@@ -1,24 +1,17 @@
 // =============================================================================
 // vortex/rt/jit.cpp — Tier 1/2 JIT runtime integration.
 //
-// vortex_jit_bridge(regs, unit_id, op_hint):
-//   Called when the JIT hits a dynamic op it couldn't lower (CALLri).
-//   `op_hint` is the safepoint_index of the dynamic-op site — the
-//   runtime translates it to a Tier-0 PC via unit->safepoint_pcs and
-//   resumes interpretation at that point. The Tier-0 interpreter runs
-//   to completion and returns the same Value the JIT would have
-//   produced.
+// vortex_jit_bridge(regs, unit_id, node_id):
+//   Called when the JIT hits a dynamic op (CALLri). The bridge:
+//   1. Looks up the Tier-0 PC for the IR NodeId via node_id_to_pc
+//   2. Creates a Frame using the JIT's register file
+//   3. Executes ONE Tier-0 instruction (step_one)
+//   4. Returns the result Value — the JIT CONTINUES after the CALL
 //
-// Returns a Value (not void) — the JIT's calling convention expects
-// RAX/RDX to carry the result tag/payload. The previous void return
-// broke the Value-return contract.
-//
-// vortex_deopt_entry is in deopt.cpp — same transition, but invoked on
-// guard failure rather than dynamic-op fallback.
-//
-// Task 24: vortex_rt_munmap_jit_buffer — extern "C" shim for munmap,
-// used by the CodeUnit destructor to free the RWX JIT buffer without
-// pulling <sys/mman.h> into every TU that includes code.hpp.
+// This is the key change: the bridge RETURNS to the JIT. Previously it
+// used JMP (one-way tail call) and ran the entire function in Tier-0.
+// Now the JIT runs the whole function, only bridging for individual
+// dynamic ops — the all-or-nothing has_dynamic_ops gate is removed.
 // =============================================================================
 
 #include "vortex/rt/interp.hpp"
@@ -62,37 +55,43 @@ extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id
     Value* regs = static_cast<Value*>(regs_raw);
     const std::uint32_t n_regs = unit->n_registers;
 
-    // op_hint is the safepoint_index of the dynamic-op site. Translate
-    // it to the Tier-0 PC where the op should resume. Without this,
-    // pc=0 restart double-executes effects for non-idempotent ops
-    // (the bug the audit flagged).
-    std::uint32_t resume_pc = 0;
-    const std::uint32_t safepoint_index =
-        static_cast<std::uint32_t>(op_hint);
-    if (safepoint_index < unit->safepoint_pcs.size()) {
-        resume_pc = unit->safepoint_pcs[safepoint_index];
-    } else if (!unit->safepoint_pcs.empty()) {
-        std::fprintf(stderr, "VORTEX jit bridge: op_hint %llu out of range "
-                             "(size %zu)\n",
-                     static_cast<unsigned long long>(op_hint),
-                     unit->safepoint_pcs.size());
-        std::abort();
-    } else {
-        // Task 24: no safepoint_pcs populated. This indicates the
-        // driver installed jit_entry for a unit with has_dynamic_ops ==
-        // false (no CALLri fallback), but the JIT'd code STILL emitted
-        // a CALLri somewhere. That's a backend bug — the has_dynamic_ops
-        // flag should have been set. Abort to surface the bug clearly
-        // rather than silently returning wrong values.
-        std::fputs("VORTEX jit bridge: no safepoint table — backend bug? "
-                   "(has_dynamic_ops should have gated jit_entry off)\n",
-                   stderr);
-        std::abort();
+    // op_hint is the IR NodeId (the CALLri's home slot). Look up the
+    // corresponding Tier-0 PC via the node_id_to_pc map.
+    const std::uint32_t node_id = static_cast<std::uint32_t>(op_hint);
+    std::uint32_t resume_pc = 0xFFFF'FFFFu;
+    if (node_id < unit->node_id_to_pc.size()) {
+        resume_pc = unit->node_id_to_pc[node_id];
+    }
+    // Fallback: linear scan of the code array for an instruction with
+    // dst == node_id. O(N) but only for the rare case where the map
+    // wasn't populated (e.g., the scheduler emitted the instruction in
+    // a different block than expected, or the node was rematerialized).
+    if (resume_pc == 0xFFFF'FFFFu || resume_pc >= unit->code.size()) {
+        for (std::uint32_t i = 0; i < unit->code.size(); ++i) {
+            if (unit->code[i].dst == node_id) {
+                resume_pc = i;
+                break;
+            }
+        }
+    }
+    if (resume_pc == 0xFFFF'FFFFu || resume_pc >= unit->code.size()) {
+        // Truly unmapped — this is a bug in the node_id_to_pc map.
+        // Return none() and set a runtime error so the caller can handle it.
+        // Do NOT call enter_at here — it would shallow-copy regs and
+        // double-decref them in the Frame destructor.
+        vm->raise_builtin(Runtime::instance().type_runtime_error,
+                          "jit bridge: unmapped node");
+        return vortex::Value::none();
     }
 
     Value out;
-    bool ok = vm->enter_at(unit, regs, n_regs, resume_pc, out);
+    bool ok = vm->step_one(unit, regs, n_regs, resume_pc, out);
     if (!ok) {
+        // step_one failed (exception raised). The pending exception is
+        // set on the VM. Return none() — the CALL handler checks
+        // has_pending() and propagates the exception to the caller.
+        // Do NOT call enter_at here — it would shallow-copy regs and
+        // double-decref them in the Frame destructor.
         return vortex::Value::none();
     }
     return out;

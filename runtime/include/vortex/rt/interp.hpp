@@ -76,6 +76,13 @@ public:
     [[nodiscard]] bool enter_at(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                                 std::uint32_t pc, Value& out) noexcept;
 
+    /// Execute ONE Tier-0 instruction at `pc`, reading/writing `regs`
+    /// directly. Used by the JIT bridge — no Frame allocation overhead.
+    /// Returns true on success (result in `out`), false on exception.
+    /// On exception, the caller should fall back to enter_at.
+    [[nodiscard]] bool step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
+                                std::uint32_t pc, Value& out) noexcept;
+
     /// Native helper dispatch for CallNative IR ops.
     [[nodiscard]] bool native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
                                      Value& out) noexcept;
