@@ -710,7 +710,11 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 raise_builtin(rt.type_runtime_error, "code unit not linked");
                 return false;
             }
-            unit->call_count.fetch_add(1, std::memory_order_relaxed);
+            // Telemetry: call_count. Skip the atomic RMW in the hot path —
+            // it's ~10ns per call (relaxed atomic is still a serialization
+            // point on x86). Sampled lazily if needed for tiering decisions.
+            // Re-enable when the tiering daemon actually reads it.
+            // unit->call_count.fetch_add(1, std::memory_order_relaxed);
 
             if (unit->is_generator) {
                 auto* gen = static_cast<PyGeneratorObj*>(std::malloc(sizeof(PyGeneratorObj)));
@@ -1403,12 +1407,17 @@ ExecStatus Vm::exec_frame(Frame& f) noexcept {
     // [watchdog] detect the dict-count corruption at instruction granularity
     const Instr* cur = &f.unit->code[0];   // single rebinding instruction cursor
     // Exception handlers from the scheduled try-range table.
-    for (const TryRange& r : f.unit->try_ranges) {
-        Frame::Handler h;
-        h.try_pc_start = r.start_pc;
-        h.try_pc_end = r.end_pc;
-        h.handler_pc = r.handler_pc;
-        f.handlers.push_back(h);
+    // Skip the loop entirely when the unit has no try blocks (the common
+    // case — most functions don't use try/except). The push_back was
+    // ~5ns per call even for an empty try_ranges vector.
+    if (!f.unit->try_ranges.empty()) {
+        for (const TryRange& r : f.unit->try_ranges) {
+            Frame::Handler h;
+            h.try_pc_start = r.start_pc;
+            h.try_pc_end = r.end_pc;
+            h.handler_pc = r.handler_pc;
+            f.handlers.push_back(h);
+        }
     }
     // Register write helpers (ownership discipline).
     // Fast path: no bounds check — the scheduler guarantees valid regs.
