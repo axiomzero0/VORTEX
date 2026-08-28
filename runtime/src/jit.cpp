@@ -87,11 +87,40 @@ extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id
     Value out;
     bool ok = vm->step_one(unit, regs, n_regs, resume_pc, out);
     if (!ok) {
-        // step_one failed (exception raised). The pending exception is
-        // set on the VM. Return none() — the CALL handler checks
-        // has_pending() and propagates the exception to the caller.
-        // Do NOT call enter_at here — it would shallow-copy regs and
-        // double-decref them in the Frame destructor.
+        // step_one failed (exception or unhandled op).
+        // If there's a pending exception, propagate it.
+        if (vm->has_pending()) {
+            return vortex::Value::none();
+        }
+        // Unhandled op: run the rest of the function in Tier-0.
+        // We can't return to the JIT with a wrong result (the JIT would
+        // silently produce incorrect values). Instead, create a Frame,
+        // copy regs (with incref), run exec_frame with jit_disabled_in_bridge
+        // = true to prevent recursion, copy results back, and return
+        // the function's return value.
+        Frame f(unit);
+        Runtime& rt = Runtime::instance();
+        for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+            f.regs[i] = regs[i];
+            if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
+        }
+        f.pc = resume_pc;
+        bool prev = vm->jit_disabled_in_bridge;
+        vm->jit_disabled_in_bridge = true;
+        ExecStatus st = vm->exec_frame(f);
+        vm->jit_disabled_in_bridge = prev;
+        // Copy results back to the JIT's register file.
+        for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
+            regs[i] = f.regs[i];
+            // The Frame's destructor will decref its copy; the JIT's copy
+            // needs its own incref.
+            if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
+        }
+        if (st == ExecStatus::Returned) {
+            out = vm->frame_return_;
+            vm->frame_return_ = vortex::Value::none();
+            return out;
+        }
         return vortex::Value::none();
     }
     return out;

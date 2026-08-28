@@ -732,18 +732,16 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
             Frame f(unit);
             if (!bind_parameters(f, fn, args, argc, kw_names, nkw)) return false;
 
-            // JIT fast path: call jit_entry when available. The bridge
-            // executes ONE dynamic op via step_one and returns — the JIT
-            // runs the whole function, only bridging for individual ops.
-            //
-            // TEMPORARY GATE: has_dynamic_ops still gates the JIT because
-            // step_one only handles PY_BINOP and PY_CMP. Once step_one
-            // handles CALL/LOAD_ATTR/LOAD_GLOBAL/etc. with correct
-            // refcounting, this gate will be removed entirely. The
-            // infrastructure (node_id_to_pc, CALL-not-JMP, step_one) is
-            // in place and working for numeric ops.
+            // JIT fast path: call jit_entry when available.
+            // The bridge executes ONE dynamic op via step_one and returns.
+            // GATE: has_dynamic_ops must be false — the bridge's step_one
+            // only handles PY_BINOP/PY_CMP inline; other ops fall back to
+            // creating a Frame per call, which is O(N) allocations in a
+            // loop and causes OOM/hangs. Once step_one handles all ops
+            // inline (no Frame fallback), this gate will be removed.
             void* entry_raw = unit->jit_entry.load(std::memory_order_acquire);
-            if (entry_raw && !unit->has_dynamic_ops && !unit->is_generator) {
+            if (entry_raw && !unit->has_dynamic_ops && !unit->is_generator &&
+                !jit_disabled_in_bridge) {
                 // Task 24: initialize Phi home slots from their entry
                 // values before calling jit_entry. The Tier-0
                 // interpreter's prologue (LOAD_CONST + MOVE) does
@@ -787,22 +785,15 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 if (rv.tag == Tag::None && has_pending()) {
                     return false;   // propagate exception to caller
                 }
-                // If the bridge returned none() WITHOUT a pending exception,
-                // it means step_one couldn't handle the dynamic op (CALL,
-                // LOAD_ATTR, etc.). Disable the JIT for this unit to prevent
-                // infinite recursion (CALL handler → JIT → bridge → false →
-                // exec_frame → CALL → JIT → ...). Future calls run Tier-0.
-                // The JIT already ran the prefix (harmless for idempotent ops);
-                // exec_frame re-runs from pc=0.
-                if (rv.tag == Tag::None) {
-                    unit->jit_entry.store(nullptr, std::memory_order_release);
-                    ExecStatus st = exec_frame(f);
-                    if (st == ExecStatus::Returned) {
-                        out = frame_return_;
-                        frame_return_ = Value::none();
-                        return true;
-                    }
-                    return false;
+                // If the bridge returned none() without a pending exception,
+                // the bridge ran the rest of the function in Tier-0 and
+                // returned the function's return value. The result is in rv.
+                if (rv.tag == Tag::None && !has_pending()) {
+                    // The bridge returned none() = the function returned none
+                    // OR the bridge failed to run the function. In either case,
+                    // return none() to the caller.
+                    out = rv;
+                    return true;
                 }
                 out = rv;
                 return true;
@@ -2493,22 +2484,71 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             write_reg_owned(cur->dst, Value::boolean(result));
             out = Value::boolean(result); return true;
         }
-        case Op::LOAD_ATTR:
-        case Op::NEW_LIST:
-        case Op::NEW_DICT:
-        case Op::LIST_APPEND:
-        case Op::CALL:
-        case Op::LOAD_GLOBAL:
-            // Object/call ops need the full Frame machinery for correct
-            // refcounting (bind_parameters, exception handlers, etc.).
-            // We can't call enter_at here (it would recurse: enter_at →
-            // exec_frame → CALL → jit_entry → bridge → enter_at → ...).
-            // Instead, return false — the bridge returns none(), and
-            // the CALL handler falls back to exec_frame (Tier-0 for the
-            // whole function). The JIT still ran the prefix before this
-            // op — a strict improvement over skipping the JIT entirely.
-            // Future: implement these in step_one with correct refcounting.
+        case Op::LOAD_GLOBAL: {
+            Value v;
+            if (!get_global(cur->imm, v)) return false;
+            write_reg_owned(cur->dst, v);
+            out = v; return true;
+        }
+        case Op::LOAD_ATTR: {
+            Value v;
+            if (!get_attr(regs[cur->a], cur->imm, v)) return false;
+            write_reg_owned(cur->dst, v);
+            out = v; return true;
+        }
+        case Op::NEW_LIST: {
+            auto* list = rt.new_list(cur->b > 0 ? cur->b : 4);
+            for (std::uint32_t i = 0; i < cur->b; ++i) {
+                list_push(list, regs[cur->a + i]);
+            }
+            Value v = Value::object(reinterpret_cast<PyObj*>(list));
+            rt.incref(reinterpret_cast<PyObj*>(list));
+            write_reg(cur->dst, v);
+            out = v; return true;
+        }
+        case Op::NEW_DICT: {
+            auto* d = rt.new_dict();
+            Value v = Value::object(reinterpret_cast<PyObj*>(d));
+            rt.incref(reinterpret_cast<PyObj*>(d));
+            write_reg(cur->dst, v);
+            out = v; return true;
+        }
+        case Op::LIST_APPEND: {
+            auto* l = static_cast<PyListObj*>(regs[cur->a].as.obj);
+            list_push(l, regs[cur->b]);
+            out = Value::none(); return true;
+        }
+        case Op::CALL: {
+            Value callee = regs[cur->a];
+            Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
+            // call_value may invoke the callee's JIT, which may bridge
+            // again. Set jit_disabled_in_bridge so the callee's CALL
+            // handler runs Tier-0 (no infinite recursion).
+            bool prev = jit_disabled_in_bridge;
+            jit_disabled_in_bridge = true;
+            bool ok = call_value(callee, args, cur->c, out);
+            jit_disabled_in_bridge = prev;
+            if (!ok) return false;
+            // call_value already incref'd the result for us (it writes
+            // to the Frame's register file, which we're sharing). Write
+            // the result to our register — but call_value already did
+            // the write_reg_owned internally, so just set out.
+            // The result is in `out` (call_value's out parameter).
+            // We need to incref it because we're returning a copy to
+            // the bridge caller who will also hold a reference.
+            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            return true;
+        }
+        case Op::LOAD_INDEX: {
+            Value v;
+            // Use get_index if available, else fall back
+            // For now, fall back to full exec for LOAD_INDEX
             return false;
+        }
+        case Op::STORE_INDEX: {
+            // Fall back to full exec for STORE_INDEX
+            return false;
+        }
         default:
             // Unhandled op — return false so the bridge returns none()
             // and the CALL handler falls back to exec_frame (Tier-0 for

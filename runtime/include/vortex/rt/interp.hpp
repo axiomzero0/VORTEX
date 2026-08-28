@@ -103,6 +103,12 @@ public:
     std::uint32_t call_depth{0};
     Value frame_return_{};
 
+    /// When true, the CALL handler skips jit_entry and runs Tier-0 directly.
+    /// Set by the bridge before calling step_one, so ops that need full
+    /// Frame machinery (call_value → exec_frame) don't re-enter the JIT
+    /// and cause infinite recursion.
+    bool jit_disabled_in_bridge{false};
+
 private:
     Value pending_exception_{};   // owned ref
     stdx::small_vector<char, 256> traceback_{};
