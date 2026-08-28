@@ -1499,49 +1499,49 @@ L_PY_BINOP: {
         switch (op) {
             case BinOpKind::Add:
                 if (!__builtin_add_overflow(x, y, &r)) [[likely]] {
-                    out = Value::integer(r); ok = true; break;
+                    write_reg(cur->dst, Value::integer(r));
+                    ++f.pc; VM_LOAD(); VM_DISPATCH();
                 }
-                // overflow → fall through to generic (bignum) path
                 break;
             case BinOpKind::Sub:
                 if (!__builtin_sub_overflow(x, y, &r)) [[likely]] {
-                    out = Value::integer(r); ok = true; break;
+                    write_reg(cur->dst, Value::integer(r));
+                    ++f.pc; VM_LOAD(); VM_DISPATCH();
                 }
                 break;
             case BinOpKind::Mul:
                 if (!__builtin_mul_overflow(x, y, &r)) [[likely]] {
-                    out = Value::integer(r); ok = true; break;
+                    write_reg(cur->dst, Value::integer(r));
+                    ++f.pc; VM_LOAD(); VM_DISPATCH();
                 }
                 break;
             case BinOpKind::Mod:
                 if (y != 0) [[likely]] {
-                    // Python modulo: result has same sign as divisor.
-                    // C++ % has sign of dividend — adjust.
-                    std::int64_t r = x % y;
-                    if (r != 0 && ((r < 0) != (y < 0))) r += y;
-                    out = Value::integer(r); ok = true; break;
+                    std::int64_t r2 = x % y;
+                    if (r2 != 0 && ((r2 < 0) != (y < 0))) r2 += y;
+                    write_reg(cur->dst, Value::integer(r2));
+                    ++f.pc; VM_LOAD(); VM_DISPATCH();
                 }
-                // div by zero → fall through to generic (raises)
                 break;
             case BinOpKind::FloorDiv:
                 if (y != 0) [[likely]] {
-                    // Python floor div: round toward negative infinity
                     std::int64_t q = x / y;
                     std::int64_t rem = x % y;
                     if ((rem != 0) && ((rem < 0) != (y < 0))) --q;
-                    out = Value::integer(q); ok = true;
+                    write_reg(cur->dst, Value::integer(q));
+                    ++f.pc; VM_LOAD(); VM_DISPATCH();
                 }
                 break;
-            case BinOpKind::BitAnd: out = Value::integer(x & y); ok = true; break;
-            case BinOpKind::BitOr:  out = Value::integer(x | y); ok = true; break;
-            case BinOpKind::BitXor: out = Value::integer(x ^ y); ok = true; break;
+            case BinOpKind::BitAnd: write_reg(cur->dst, Value::integer(x & y)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case BinOpKind::BitOr:  write_reg(cur->dst, Value::integer(x | y)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case BinOpKind::BitXor: write_reg(cur->dst, Value::integer(x ^ y)); ++f.pc; VM_LOAD(); VM_DISPATCH();
             case BinOpKind::LShift:
-                if (y >= 0 && y < 63) { out = Value::integer(x << y); ok = true; }
+                if (y >= 0 && y < 63) { write_reg(cur->dst, Value::integer(x << y)); ++f.pc; VM_LOAD(); VM_DISPATCH(); }
                 break;
             case BinOpKind::RShift:
-                if (y >= 0 && y < 63) { out = Value::integer(x >> y); ok = true; }
+                if (y >= 0 && y < 63) { write_reg(cur->dst, Value::integer(x >> y)); ++f.pc; VM_LOAD(); VM_DISPATCH(); }
                 break;
-            default: break;  // Pow, MatMul, TrueDiv → generic path
+            default: break;
         }
         if (ok) {
             write_reg(cur->dst, out);
