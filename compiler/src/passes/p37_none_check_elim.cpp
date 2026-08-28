@@ -33,8 +33,8 @@ namespace {
         case NodeKind::Len:
             return true;
         case NodeKind::ConstPy:
-            return n.const_value.tag == Tag::Bool || n.const_value.tag == Tag::Int ||
-                   n.const_value.tag == Tag::Float;
+            return n.const_value.tag() == Tag::Bool || n.const_value.tag() == Tag::Int ||
+                   n.const_value.tag() == Tag::Float;
         default:
             return false;
     }
@@ -63,9 +63,9 @@ Result<PassResult> P37_NoneCheckElimination::run(Graph& g, const PassContext& c)
         NodeId subject = invalid_node;
         const Node& a = g.node(cmp.ins[2]);
         const Node& b = g.node(cmp.ins[3]);
-        if (a.kind == NodeKind::ConstPy && a.const_value.tag == Tag::None) {
+        if (a.kind == NodeKind::ConstPy && a.const_value.tag() == Tag::None) {
             subject = cmp.ins[3];
-        } else if (b.kind == NodeKind::ConstPy && b.const_value.tag == Tag::None) {
+        } else if (b.kind == NodeKind::ConstPy && b.const_value.tag() == Tag::None) {
             subject = cmp.ins[2];
         }
         if (subject == invalid_node) return;

@@ -178,7 +178,7 @@ struct CodeUnit {
     ~CodeUnit() {
         Runtime& rt = Runtime::instance();
         for (Value& v : constants) {
-            if (v.tag == Tag::Obj && v.as.obj) rt.decref(v.as.obj);
+            if (v.tag() == Tag::Obj && v.as_obj()) rt.decref(v.as_obj());
         }
         // Task 24: free the RWX mmap'd JIT code buffer (if any).
         // We don't pull <sys/mman.h> into every TU that includes this
@@ -243,10 +243,10 @@ struct Frame {
     ~Frame() {
         Runtime& rt = Runtime::instance();
         for (std::uint32_t i = 0; i < n_regs; ++i) {
-            if (regs && regs[i].tag == Tag::Obj && regs[i].as.obj) rt.decref(regs[i].as.obj);
+            if (regs && regs[i].tag() == Tag::Obj && regs[i].as_obj()) rt.decref(regs[i].as_obj());
         }
-        if (current_exception.tag == Tag::Obj && current_exception.as.obj) {
-            rt.decref(current_exception.as.obj);
+        if (current_exception.tag() == Tag::Obj && current_exception.as_obj()) {
+            rt.decref(current_exception.as_obj());
         }
         // Only free if we spilled to heap (regs != inline_regs).
         if (regs && regs != inline_regs) std::free(regs);

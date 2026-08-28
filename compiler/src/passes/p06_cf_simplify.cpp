@@ -24,10 +24,10 @@ bool fold_if(Graph& g, NodeId id) noexcept {
     if (n.kind != NodeKind::If || n.ins.size() < 2) return false;
     const Node& cond = g.node(n.ins[1]);
     bool truth = false;
-    if (cond.kind == NodeKind::ConstPy && cond.const_value.tag == Tag::Bool) {
-        truth = cond.const_value.as.i != 0;
+    if (cond.kind == NodeKind::ConstPy && cond.const_value.tag() == Tag::Bool) {
+        truth = cond.const_value.as_i() != 0;
     } else if (cond.kind == NodeKind::ConstInt) {
-        truth = cond.const_value.as.i != 0;
+        truth = cond.const_value.as_i() != 0;
     } else {
         return false;
     }

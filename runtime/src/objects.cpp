@@ -491,8 +491,8 @@ void Runtime::decref(PyObj* o) noexcept {
             }
             case ObjTag::Cell: {
                 auto* c = static_cast<PyCellObj*>(o);
-                if (c->value.tag == Tag::Obj && c->value.as.obj) {
-                    decref(c->value.as.obj);
+                if (c->value.tag() == Tag::Obj && c->value.as_obj()) {
+                    decref(c->value.as_obj());
                 }
                 break;
             }
@@ -500,8 +500,8 @@ void Runtime::decref(PyObj* o) noexcept {
             // (see Vm::load_attr). Release it on final decref.
             case ObjTag::BoundMethod: {
                 auto* bm = static_cast<PyBoundMethodObj*>(o);
-                if (bm->recv.tag == Tag::Obj && bm->recv.as.obj) {
-                    decref(bm->recv.as.obj);
+                if (bm->recv.tag() == Tag::Obj && bm->recv.as_obj()) {
+                    decref(bm->recv.as_obj());
                 }
                 break;
             }
@@ -512,7 +512,7 @@ void Runtime::decref(PyObj* o) noexcept {
                 auto* l = static_cast<PyListObj*>(o);
                 if (l->items) {
                     for (std::uint32_t i = 0; i < l->length; ++i) {
-                        if (l->items[i].tag == Tag::Obj) decref(l->items[i].as.obj);
+                        if (l->items[i].tag() == Tag::Obj) decref(l->items[i].as_obj());
                     }
                     std::free(l->items);
                 }
@@ -523,7 +523,7 @@ void Runtime::decref(PyObj* o) noexcept {
                 auto* t = static_cast<PyTupleObj*>(o);
                 if (t->items) {
                     for (std::uint32_t i = 0; i < t->length; ++i) {
-                        if (t->items[i].tag == Tag::Obj) decref(t->items[i].as.obj);
+                        if (t->items[i].tag() == Tag::Obj) decref(t->items[i].as_obj());
                     }
                     std::free(t->items);
                 }
@@ -535,8 +535,8 @@ void Runtime::decref(PyObj* o) noexcept {
                 if (d->entries) {
                     for (std::uint32_t i = 0; i < d->capacity; ++i) {
                         if (d->entries[i].used) {
-                            if (d->entries[i].key.tag == Tag::Obj) decref(d->entries[i].key.as.obj);
-                            if (d->entries[i].value.tag == Tag::Obj) decref(d->entries[i].value.as.obj);
+                            if (d->entries[i].key.tag() == Tag::Obj) decref(d->entries[i].key.as_obj());
+                            if (d->entries[i].value.tag() == Tag::Obj) decref(d->entries[i].value.as_obj());
                         }
                     }
                     std::free(d->entries);
@@ -548,7 +548,7 @@ void Runtime::decref(PyObj* o) noexcept {
                 auto* inst = static_cast<PyInstanceObj*>(o);
                 if (inst->slots) {
                     for (std::uint32_t i = 0; i < inst->slot_capacity; ++i) {
-                        if (inst->slots[i].tag == Tag::Obj) decref(inst->slots[i].as.obj);
+                        if (inst->slots[i].tag() == Tag::Obj) decref(inst->slots[i].as_obj());
                     }
                     std::free(inst->slots);
                 }
@@ -759,12 +759,12 @@ PyCellObj* Runtime::new_cell(Value v) noexcept {
     c->refcount = 1;   // MUST own: region memory is NOT zeroed
     c->flags = 0;   // MUST clear: garbage kUnbound bits corrupted closure reads
     c->value = v;
-    if (v.tag == Tag::Obj) {
-        if (v.as.obj == nullptr) {
+    if (v.tag() == Tag::Obj) {
+        if (v.as_obj() == nullptr) {
             c->flags |= PyCellObj::kUnbound;
             c->value = Value::none();
         } else {
-            incref(v.as.obj);
+            incref(v.as_obj());
         }
     }
     ++allocations;
@@ -821,7 +821,7 @@ PyInstanceObj* Runtime::new_exception(PyTypeObj* type, Value* args,
         PyTupleObj* tup = new_tuple(argc);
         for (std::uint32_t i = 0; i < argc; ++i) {
             tup->items[i] = args[i];
-            if (args[i].tag == Tag::Obj) incref(args[i].as.obj);
+            if (args[i].tag() == Tag::Obj) incref(args[i].as_obj());
         }
         exc->slots[slot] = Value::object(reinterpret_cast<PyObj*>(tup));
     }
@@ -865,13 +865,13 @@ bool Runtime::shape_find(ShapeNode* shape, std::uint32_t symbol,
 }
 
 PyTypeObj* Runtime::type_of(const Value& v) noexcept {
-    switch (v.tag) {
+    switch (v.tag()) {
         case Tag::None: return nullptr;
         case Tag::Bool: return nullptr;
         case Tag::Int: return type_int;
         case Tag::Float: return nullptr;
         case Tag::Obj: {
-            PyObj* o = v.as.obj;
+            PyObj* o = v.as_obj();
             switch (o->tag) {
                 case ObjTag::Long: return type_int;
                 case ObjTag::Instance: return static_cast<PyInstanceObj*>(o)->type;
@@ -898,13 +898,13 @@ bool Runtime::exception_matches(PyInstanceObj* exc, std::uint32_t type_name_symb
 }
 
 bool Runtime::truthy(const Value& v) noexcept {
-    switch (v.tag) {
+    switch (v.tag()) {
         case Tag::None: return false;
-        case Tag::Bool: return v.as.i != 0;
-        case Tag::Int: return v.as.i != 0;
-        case Tag::Float: return v.as.f != 0.0;
+        case Tag::Bool: return v.as_i() != 0;
+        case Tag::Int: return v.as_i() != 0;
+        case Tag::Float: return v.as_f() != 0.0;
         case Tag::Obj: {
-            PyObj* o = v.as.obj;
+            PyObj* o = v.as_obj();
             switch (o->tag) {
                 case ObjTag::Str: return static_cast<PyStrObj*>(o)->length != 0;
                 case ObjTag::List: return static_cast<PyListObj*>(o)->length != 0;
@@ -929,30 +929,30 @@ bool Runtime::eq(const Value& a, const Value& b) noexcept {
     // for True == 1 because tags differed. Promote either Bool operand
     // to Int, then fall through to the numeric comparison.
     auto is_bool_int = [](Tag t) { return t == Tag::Bool || t == Tag::Int; };
-    if ((a.tag == Tag::Bool || a.tag == Tag::Int) &&
-        (b.tag == Tag::Bool || b.tag == Tag::Int)) {
-        std::int64_t av = a.tag == Tag::Bool ? (a.as.i ? 1 : 0) : a.as.i;
-        std::int64_t bv = b.tag == Tag::Bool ? (b.as.i ? 1 : 0) : b.as.i;
+    if ((a.tag() == Tag::Bool || a.tag() == Tag::Int) &&
+        (b.tag() == Tag::Bool || b.tag() == Tag::Int)) {
+        std::int64_t av = a.tag() == Tag::Bool ? (a.as_i() ? 1 : 0) : a.as_i();
+        std::int64_t bv = b.tag() == Tag::Bool ? (b.as_i() ? 1 : 0) : b.as_i();
         return av == bv;
     }
     // numeric tower equality
-    if (a.tag == Tag::Int && b.tag == Tag::Int) return a.as.i == b.as.i;
-    if (a.tag == Tag::Float && b.tag == Tag::Float) return a.as.f == b.as.f;
-    if ((a.tag == Tag::Int && b.tag == Tag::Float) || (a.tag == Tag::Float && b.tag == Tag::Int)) {
-        double x = a.tag == Tag::Int ? static_cast<double>(a.as.i) : a.as.f;
-        double y = b.tag == Tag::Int ? static_cast<double>(b.as.i) : b.as.f;
+    if (a.tag() == Tag::Int && b.tag() == Tag::Int) return a.as_i() == b.as_i();
+    if (a.tag() == Tag::Float && b.tag() == Tag::Float) return a.as_f() == b.as_f();
+    if ((a.tag() == Tag::Int && b.tag() == Tag::Float) || (a.tag() == Tag::Float && b.tag() == Tag::Int)) {
+        double x = a.tag() == Tag::Int ? static_cast<double>(a.as_i()) : a.as_f();
+        double y = b.tag() == Tag::Int ? static_cast<double>(b.as_i()) : b.as_f();
         return x == y;
     }
     // Bool vs Float: True == 1.0 should hold.
-    if ((a.tag == Tag::Bool && b.tag == Tag::Float) ||
-        (a.tag == Tag::Float && b.tag == Tag::Bool)) {
-        double x = a.tag == Tag::Bool ? (a.as.i ? 1.0 : 0.0) : a.as.f;
-        double y = b.tag == Tag::Bool ? (b.as.i ? 1.0 : 0.0) : b.as.f;
+    if ((a.tag() == Tag::Bool && b.tag() == Tag::Float) ||
+        (a.tag() == Tag::Float && b.tag() == Tag::Bool)) {
+        double x = a.tag() == Tag::Bool ? (a.as_i() ? 1.0 : 0.0) : a.as_f();
+        double y = b.tag() == Tag::Bool ? (b.as_i() ? 1.0 : 0.0) : b.as_f();
         return x == y;
     }
-    if (a.tag != Tag::Obj || b.tag != Tag::Obj) return a.tag == b.tag && a.as.i == b.as.i;
-    PyObj* oa = a.as.obj;
-    PyObj* ob = b.as.obj;
+    if (a.tag() != Tag::Obj || b.tag() != Tag::Obj) return a.tag() == b.tag() && a.as_i() == b.as_i();
+    PyObj* oa = a.as_obj();
+    PyObj* ob = b.as_obj();
     if (oa == ob) return true;
     if (oa->tag != ob->tag) return false;
     switch (oa->tag) {
@@ -1000,25 +1000,25 @@ bool Runtime::eq(const Value& a, const Value& b) noexcept {
 }
 
 std::uint32_t Runtime::hash(const Value& v) noexcept {
-    switch (v.tag) {
+    switch (v.tag()) {
         case Tag::None: return 2;
         // OBJ-14 fix: hash(True) must equal hash(1) and hash(False) must
         // equal hash(0) — Python's invariant that equal values hash
         // equal. Previously True hashed to 3 while 1 hashed to 1; dicts
         // and sets silently broken when mixing bool/int keys.
         case Tag::Bool: {
-            std::int64_t x = v.as.i ? 1 : 0;
+            std::int64_t x = v.as_i() ? 1 : 0;
             if (x >= 0 && x <= 0xFFFFFFFFll) return static_cast<std::uint32_t>(x);
             return fold64(static_cast<std::uint64_t>(x));
         }
         case Tag::Int: {
-            std::int64_t x = v.as.i;
+            std::int64_t x = v.as_i();
             if (x >= 0 && x <= 0xFFFFFFFFll) return static_cast<std::uint32_t>(x);
             return fold64(static_cast<std::uint64_t>(x));
         }
-        case Tag::Float: return fold64(static_cast<std::uint64_t>(v.as.f));
+        case Tag::Float: return fold64(static_cast<std::uint64_t>(v.as_f()));
         case Tag::Obj: {
-            PyObj* o = v.as.obj;
+            PyObj* o = v.as_obj();
             switch (o->tag) {
                 case ObjTag::Str: {
                     auto* s = static_cast<PyStrObj*>(o);
@@ -1048,21 +1048,21 @@ std::uint32_t Runtime::hash(const Value& v) noexcept {
 // =============================================================================
 void Runtime::repr_into(const Value& v, stdx::small_vector<char, 128>& out) noexcept {
     char buf[32];
-    switch (v.tag) {
+    switch (v.tag()) {
         case Tag::None: out.push_back('N'); out.push_back('o'); out.push_back('n'); out.push_back('e'); return;
         case Tag::Bool:
-            push_cstr(out, v.as.i ? "True" : "False");
+            push_cstr(out, v.as_i() ? "True" : "False");
             return;
         case Tag::Int:
-            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v.as.i));
+            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v.as_i()));
             for (char* p = buf; *p; ++p) out.push_back(*p);
             return;
         case Tag::Float:
-            format_double(v.as.f, out);
+            format_double(v.as_f(), out);
             return;
         case Tag::Obj: break;
     }
-    PyObj* o = v.as.obj;
+    PyObj* o = v.as_obj();
     if (!o) {
         push_cstr(out, "<null>");
         return;
@@ -1141,9 +1141,9 @@ void Runtime::repr_into(const Value& v, stdx::small_vector<char, 128>& out) noex
                 if (shape_find(inst->shape, global_symbols().intern("args"), slot) &&
                     slot < inst->slot_capacity) {
                     Value& argsv = inst->slots[slot];
-                    if (argsv.tag == Tag::Obj &&
-                        argsv.as.obj->tag == ObjTag::Tuple) {
-                        auto* args = static_cast<PyTupleObj*>(argsv.as.obj);
+                    if (argsv.tag() == Tag::Obj &&
+                        argsv.as_obj()->tag == ObjTag::Tuple) {
+                        auto* args = static_cast<PyTupleObj*>(argsv.as_obj());
                         for (std::uint32_t i = 0; i < args->length; ++i) {
                             if (i) out.push_back(' ');
                             str_into(args->items[i], out);
@@ -1180,8 +1180,8 @@ void Runtime::repr_into(const Value& v, stdx::small_vector<char, 128>& out) noex
 }
 
 void Runtime::str_into(const Value& v, stdx::small_vector<char, 128>& out) noexcept {
-    if (v.tag == Tag::Obj && v.as.obj && v.as.obj->tag == ObjTag::Str) {
-        auto* s = static_cast<PyStrObj*>(v.as.obj);
+    if (v.tag() == Tag::Obj && v.as_obj() && v.as_obj()->tag == ObjTag::Str) {
+        auto* s = static_cast<PyStrObj*>(v.as_obj());
         for (std::uint32_t i = 0; i < s->length; ++i) out.push_back(s->data()[i]);
         return;
     }
@@ -1203,7 +1203,7 @@ bool list_push(PyListObj* l, Value v) noexcept {
     // registers keep independent claims (released on reuse/teardown) — the
     // old adopt-the-caller's-ref contract stole claims when scratch regs
     // were reused (the nested-list over-decref).
-    if (v.tag == Tag::Obj && v.as.obj) Runtime::instance().incref(v.as.obj);
+    if (v.tag() == Tag::Obj && v.as_obj()) Runtime::instance().incref(v.as_obj());
     l->items[l->length++] = v;
     return true;
 }
@@ -1216,8 +1216,8 @@ bool list_set(PyListObj* l, std::uint32_t i, Value v) noexcept {
     // reference dangle when the caller's slot was overwritten or freed.
     // Now both list ops follow the same adopt contract.
     Runtime& rt = Runtime::instance();
-    if (l->items[i].tag == Tag::Obj) rt.decref(l->items[i].as.obj);
-    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    if (l->items[i].tag() == Tag::Obj) rt.decref(l->items[i].as_obj());
+    if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
     l->items[i] = v;
     return true;
 }
@@ -1227,7 +1227,7 @@ Value list_get(PyListObj* l, std::uint32_t i) noexcept {
 }
 
 static bool dict_grow(PyDictObj* d) noexcept {
-    // DICT-TOMBSTONE fix: skip tombstones (used=true, key.tag=None) when
+    // DICT-TOMBSTONE fix: skip tombstones (used=true, key.tag()=None) when
     // rehashing. The previous code copied tombstones to the new table,
     // where they accumulated across grows and could eventually fill the
     // table — at which point dict_set's probe loop had no `!e.used`
@@ -1242,11 +1242,11 @@ static bool dict_grow(PyDictObj* d) noexcept {
     if (!fresh) return false;
     for (std::uint32_t i = 0; i < d->capacity; ++i) {
         if (!d->entries[i].used) continue;
-        // Skip tombstones: used=true with key.tag=None means the entry
+        // Skip tombstones: used=true with key.tag()=None means the entry
         // was deleted (dict_del now uses backward-shift deletion, but
         // pre-existing tombstones from older deletes may still be present
         // in the live table when grow is triggered).
-        if (d->entries[i].key.tag == Tag::None) continue;
+        if (d->entries[i].key.tag() == Tag::None) continue;
         std::uint32_t h = d->entries[i].hash;
         std::uint32_t idx = h & (new_cap - 1);
         while (fresh[idx].used) idx = (idx + 1) & (new_cap - 1);
@@ -1272,16 +1272,16 @@ bool dict_set(PyDictObj* d, Value key, Value value) noexcept {
             e.hash = h;
             e.seq = d->insert_seq++;   // insertion order (CPython 3.7+)
             e.used = true;
-            if (key.tag == Tag::Obj) rt.incref(key.as.obj);
-            if (value.tag == Tag::Obj) rt.incref(value.as.obj);
+            if (key.tag() == Tag::Obj) rt.incref(key.as_obj());
+            if (value.tag() == Tag::Obj) rt.incref(value.as_obj());
             ++d->count;
             return true;
         }
         if (e.hash == h && rt.eq(e.key, key)) {
             // overwrite: free old value, take new
-            if (e.value.tag == Tag::Obj) rt.decref(e.value.as.obj);
+            if (e.value.tag() == Tag::Obj) rt.decref(e.value.as_obj());
             e.value = value;
-            if (value.tag == Tag::Obj) rt.incref(value.as.obj);
+            if (value.tag() == Tag::Obj) rt.incref(value.as_obj());
             // (dict keeps its original key; incoming key stays the caller's)
             return true;
         }
@@ -1302,7 +1302,7 @@ bool dict_get(PyDictObj* d, const Value& key, Value& out) noexcept {
         if (!e.used) return false;
         if (e.hash == h && rt.eq(e.key, key)) {
             out = e.value;
-            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            if (out.tag() == Tag::Obj && out.as_obj()) rt.incref(out.as_obj());
             return true;
         }
         idx = (idx + 1) & (d->capacity - 1);
@@ -1325,8 +1325,8 @@ bool dict_del(PyDictObj* d, const Value& key) noexcept {
         if (!e.used) return false;   // key not present
         if (e.hash == h && rt.eq(e.key, key)) {
             // found victim at slot i — release its refs.
-            if (e.key.tag == Tag::Obj) rt.decref(e.key.as.obj);
-            if (e.value.tag == Tag::Obj) rt.decref(e.value.as.obj);
+            if (e.key.tag() == Tag::Obj) rt.decref(e.key.as_obj());
+            if (e.value.tag() == Tag::Obj) rt.decref(e.value.as_obj());
             e.key = Value::none();
             e.value = Value::none();
             e.used = false;
@@ -1381,31 +1381,31 @@ bool dict_del(PyDictObj* d, const Value& key) noexcept {
 // =============================================================================
 Value box(const Value& v) noexcept {
     Runtime& rt = Runtime::instance();
-    switch (v.tag) {
+    switch (v.tag()) {
         case Tag::Obj: return v;
         case Tag::None: return Value::object(reinterpret_cast<PyObj*>(rt.none));
         case Tag::Bool:
-            return Value::object(reinterpret_cast<PyObj*>(v.as.i ? rt.true_obj : rt.false_obj));
-        case Tag::Int: return Value::object(reinterpret_cast<PyObj*>(rt.new_long_i64(v.as.i)));
-        case Tag::Float: return Value::object(reinterpret_cast<PyObj*>(rt.new_float(v.as.f)));
+            return Value::object(reinterpret_cast<PyObj*>(v.as_i() ? rt.true_obj : rt.false_obj));
+        case Tag::Int: return Value::object(reinterpret_cast<PyObj*>(rt.new_long_i64(v.as_i())));
+        case Tag::Float: return Value::object(reinterpret_cast<PyObj*>(rt.new_float(v.as_f())));
     }
     return v;
 }
 Value box_owned(const Value& v) noexcept {
     Value b = box(v);
-    if (b.tag == Tag::Obj && b.as.obj) Runtime::instance().incref(b.as.obj);
+    if (b.tag() == Tag::Obj && b.as_obj()) Runtime::instance().incref(b.as_obj());
     return b;
 }
 bool as_f64(const Value& v, double& out) noexcept {
-    switch (v.tag) {
-        case Tag::Int: out = static_cast<double>(v.as.i); return true;
-        case Tag::Float: out = v.as.f; return true;
-        // OBJ-14 fix: Tag::Bool is an unboxed 0/1 value in v.as.i. Python
+    switch (v.tag()) {
+        case Tag::Int: out = static_cast<double>(v.as_i()); return true;
+        case Tag::Float: out = v.as_f(); return true;
+        // OBJ-14 fix: Tag::Bool is an unboxed 0/1 value in v.as_i(). Python
         // treats True/False as the integers 1/0 in every numeric context
         // (True + 1 == 2, float(True) == 1.0, hash(True) == hash(1)).
-        case Tag::Bool: out = v.as.i ? 1.0 : 0.0; return true;
+        case Tag::Bool: out = v.as_i() ? 1.0 : 0.0; return true;
         case Tag::Obj: {
-            PyObj* o = v.as.obj;
+            PyObj* o = v.as_obj();
             if (!o) return false;
             if (o->tag == ObjTag::Long) {
                 auto* l = static_cast<PyLongObj*>(o);
@@ -1434,13 +1434,13 @@ bool as_f64(const Value& v, double& out) noexcept {
     }
 }
 bool as_i64(const Value& v, std::int64_t& out) noexcept {
-    switch (v.tag) {
-        case Tag::Int: out = v.as.i; return true;
-        // OBJ-14 fix: Tag::Bool is an unboxed 0/1 in v.as.i. int(True)
+    switch (v.tag()) {
+        case Tag::Int: out = v.as_i(); return true;
+        // OBJ-14 fix: Tag::Bool is an unboxed 0/1 in v.as_i(). int(True)
         // should yield 1, not a TypeError.
-        case Tag::Bool: out = v.as.i ? 1 : 0; return true;
+        case Tag::Bool: out = v.as_i() ? 1 : 0; return true;
         case Tag::Obj: {
-            PyObj* o = v.as.obj;
+            PyObj* o = v.as_obj();
             if (o && o->tag == ObjTag::Long) {
                 auto* l = static_cast<PyLongObj*>(o);
                 if (l->flags & PyLongObj::kBigFlag) return false;
@@ -1460,9 +1460,9 @@ namespace {
 /// Materialize a numeric Value as BigNum (integers only).
 [[nodiscard]] BigNum to_big(const Value& v, bool& ok) noexcept {
     ok = true;
-    if (v.tag == Tag::Int) return BigNum::from_i64(v.as.i);
-    if (v.tag == Tag::Obj && v.as.obj && v.as.obj->tag == ObjTag::Long) {
-        auto* l = static_cast<PyLongObj*>(v.as.obj);
+    if (v.tag() == Tag::Int) return BigNum::from_i64(v.as_i());
+    if (v.tag() == Tag::Obj && v.as_obj() && v.as_obj()->tag == ObjTag::Long) {
+        auto* l = static_cast<PyLongObj*>(v.as_obj());
         if (l->flags & PyLongObj::kBigFlag) return l->big;
         return BigNum::from_i64(l->value);
     }
@@ -1477,16 +1477,16 @@ namespace {
 }
 enum class NumKind { IntI64, IntBig, FloatD, Other };
 [[nodiscard]] NumKind classify(const Value& v) noexcept {
-    if (v.tag == Tag::Int) return NumKind::IntI64;
-    if (v.tag == Tag::Float) return NumKind::FloatD;
-    if (v.tag == Tag::Obj && v.as.obj) {
-        if (v.as.obj->tag == ObjTag::Long) {
-            return (static_cast<PyLongObj*>(v.as.obj)->flags & PyLongObj::kBigFlag)
+    if (v.tag() == Tag::Int) return NumKind::IntI64;
+    if (v.tag() == Tag::Float) return NumKind::FloatD;
+    if (v.tag() == Tag::Obj && v.as_obj()) {
+        if (v.as_obj()->tag == ObjTag::Long) {
+            return (static_cast<PyLongObj*>(v.as_obj())->flags & PyLongObj::kBigFlag)
                        ? NumKind::IntBig
                        : NumKind::IntI64;
         }
-        if (v.as.obj->tag == ObjTag::Float) return NumKind::FloatD;
-        if (v.as.obj->tag == ObjTag::Bool) return NumKind::IntI64;
+        if (v.as_obj()->tag == ObjTag::Float) return NumKind::FloatD;
+        if (v.as_obj()->tag == ObjTag::Bool) return NumKind::IntI64;
     }
     return NumKind::Other;
 }
@@ -1700,13 +1700,13 @@ bool values_bitop(const Value& a, const Value& b, std::uint16_t op, Value& out) 
     std::int64_t x = 0, y = 0;
     if (!as_i64(a, x) || !as_i64(b, y)) {
         // bool operands participate as 0/1
-        if (a.tag == Tag::Obj && a.as.obj && a.as.obj->tag == ObjTag::Bool) {
-            x = static_cast<PyBoolObj*>(a.as.obj)->value ? 1 : 0;
+        if (a.tag() == Tag::Obj && a.as_obj() && a.as_obj()->tag == ObjTag::Bool) {
+            x = static_cast<PyBoolObj*>(a.as_obj())->value ? 1 : 0;
         } else {
             return false;
         }
-        if (b.tag == Tag::Obj && b.as.obj && b.as.obj->tag == ObjTag::Bool) {
-            y = static_cast<PyBoolObj*>(b.as.obj)->value ? 1 : 0;
+        if (b.tag() == Tag::Obj && b.as_obj() && b.as_obj()->tag == ObjTag::Bool) {
+            y = static_cast<PyBoolObj*>(b.as_obj())->value ? 1 : 0;
         } else if (!as_i64(b, y)) {
             return false;
         }
@@ -1739,16 +1739,16 @@ bool values_shift(const Value& a, const Value& b, bool left, Value& out) noexcep
     return true;
 }
 bool values_neg(const Value& a, Value& out) noexcept {
-    if (a.tag == Tag::Int) {
-        if (a.as.i != INT64_MIN) {
-            out = Value::integer(-a.as.i);
+    if (a.tag() == Tag::Int) {
+        if (a.as_i() != INT64_MIN) {
+            out = Value::integer(-a.as_i());
             return true;
         }
-        out = big_value(BigNum::sub(BigNum{}, BigNum::from_i64(a.as.i)));
+        out = big_value(BigNum::sub(BigNum{}, BigNum::from_i64(a.as_i())));
         return true;
     }
-    if (a.tag == Tag::Float) {
-        out = Value::real(-a.as.f);
+    if (a.tag() == Tag::Float) {
+        out = Value::real(-a.as_f());
         return true;
     }
     NumKind k = classify(a);
@@ -1808,13 +1808,13 @@ bool values_compare(const Value& a, const Value& b, std::uint16_t op, bool& out)
     switch (static_cast<CmpOpKind>(op)) {
         case CmpOpKind::EQ: out = rt.eq(a, b); return true;
         case CmpOpKind::NE: out = !rt.eq(a, b); return true;
-        case CmpOpKind::Is: out = (a.tag == b.tag && a.as.i == b.as.i); return true;
-        case CmpOpKind::IsNot: out = !(a.tag == b.tag && a.as.i == b.as.i); return true;
+        case CmpOpKind::Is: out = (a.tag() == b.tag() && a.as_i() == b.as_i()); return true;
+        case CmpOpKind::IsNot: out = !(a.tag() == b.tag() && a.as_i() == b.as_i()); return true;
         case CmpOpKind::In:
         case CmpOpKind::NotIn: {
             // container membership
-            if (b.tag != Tag::Obj || !b.as.obj) return false;
-            PyObj* container = b.as.obj;
+            if (b.tag() != Tag::Obj || !b.as_obj()) return false;
+            PyObj* container = b.as_obj();
             bool found = false;
             if (container->tag == ObjTag::List) {
                 auto* l = static_cast<PyListObj*>(container);
@@ -1827,9 +1827,9 @@ bool values_compare(const Value& a, const Value& b, std::uint16_t op, bool& out)
                     if (rt.eq(t->items[i], a)) { found = true; break; }
                 }
             } else if (container->tag == ObjTag::Str &&
-                       a.tag == Tag::Obj && a.as.obj && a.as.obj->tag == ObjTag::Str) {
+                       a.tag() == Tag::Obj && a.as_obj() && a.as_obj()->tag == ObjTag::Str) {
                 auto* hay = static_cast<PyStrObj*>(container);
-                auto* needle = static_cast<PyStrObj*>(a.as.obj);
+                auto* needle = static_cast<PyStrObj*>(a.as_obj());
                 found = hay->length >= needle->length &&
                         (needle->length == 0 ||
                          std::strstr(hay->data(), needle->data()) != nullptr);
@@ -1845,10 +1845,10 @@ bool values_compare(const Value& a, const Value& b, std::uint16_t op, bool& out)
         default: break;
     }
     // string ordering
-    if (a.tag == Tag::Obj && b.tag == Tag::Obj && a.as.obj && b.as.obj &&
-        a.as.obj->tag == ObjTag::Str && b.as.obj->tag == ObjTag::Str) {
-        auto* sa = static_cast<PyStrObj*>(a.as.obj);
-        auto* sb = static_cast<PyStrObj*>(b.as.obj);
+    if (a.tag() == Tag::Obj && b.tag() == Tag::Obj && a.as_obj() && b.as_obj() &&
+        a.as_obj()->tag == ObjTag::Str && b.as_obj()->tag == ObjTag::Str) {
+        auto* sa = static_cast<PyStrObj*>(a.as_obj());
+        auto* sb = static_cast<PyStrObj*>(b.as_obj());
         std::size_t n = sa->length < sb->length ? sa->length : sb->length;
         int c = std::memcmp(sa->data(), sb->data(), n);
         if (c == 0) c = sa->length < sb->length ? -1 : (sa->length > sb->length ? 1 : 0);
@@ -1877,12 +1877,12 @@ bool values_compare(const Value& a, const Value& b, std::uint16_t op, bool& out)
         }
         return xn < yn ? -1 : (xn > yn ? 1 : 0);
     };
-    if (a.tag == Tag::Obj && b.tag == Tag::Obj && a.as.obj && b.as.obj) {
+    if (a.tag() == Tag::Obj && b.tag() == Tag::Obj && a.as_obj() && b.as_obj()) {
         auto is_seq = [](PyObj* o) {
             return o->tag == ObjTag::List || o->tag == ObjTag::Tuple;
         };
-        if (is_seq(a.as.obj) && is_seq(b.as.obj)) {
-            int c = seq_compare(a.as.obj, b.as.obj);
+        if (is_seq(a.as_obj()) && is_seq(b.as_obj())) {
+            int c = seq_compare(a.as_obj(), b.as_obj());
             if (c == 2) return false;
             return cmp_result(c);
         }

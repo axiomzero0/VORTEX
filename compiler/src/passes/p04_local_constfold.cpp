@@ -27,7 +27,7 @@ bool try_fold(Graph& g, NodeId id) noexcept {
             const Node& a = g.node(n.ins[2]);
             const Node& b = g.node(n.ins[3]);
             if (a.kind != NodeKind::ConstInt || b.kind != NodeKind::ConstInt) return false;
-            std::int64_t x = a.const_value.as.i, y = b.const_value.as.i;
+            std::int64_t x = a.const_value.as_i(), y = b.const_value.as_i();
             std::int64_t out = 0;
             switch (static_cast<BinOpKind>(n.subop)) {
                 case BinOpKind::Add:
@@ -53,7 +53,7 @@ bool try_fold(Graph& g, NodeId id) noexcept {
             const Node& a = g.node(n.ins[2]);
             const Node& b = g.node(n.ins[3]);
             if (a.kind != NodeKind::ConstInt || b.kind != NodeKind::ConstInt) return false;
-            std::int64_t x = a.const_value.as.i, y = b.const_value.as.i;
+            std::int64_t x = a.const_value.as_i(), y = b.const_value.as_i();
             bool out = false;
             switch (static_cast<CmpOpKind>(n.subop)) {
                 case CmpOpKind::LT: out = x < y; break;

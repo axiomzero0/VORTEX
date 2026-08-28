@@ -38,8 +38,8 @@ Program::~Program() {
 // =============================================================================
 void Vm::set_pending(Value exc_owned) noexcept {
     Runtime& rt = Runtime::instance();
-    if (pending_exception_.tag == Tag::Obj && pending_exception_.as.obj) {
-        rt.decref(pending_exception_.as.obj);
+    if (pending_exception_.tag() == Tag::Obj && pending_exception_.as_obj()) {
+        rt.decref(pending_exception_.as_obj());
     }
     pending_exception_ = exc_owned;
 }
@@ -103,11 +103,11 @@ bool Vm::get_global(std::uint32_t symbol, Value& out) noexcept {
 
 bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
     Runtime& rt = Runtime::instance();
-    if (obj.tag != Tag::Obj || !obj.as.obj) {
+    if (obj.tag() != Tag::Obj || !obj.as_obj()) {
         raise_builtin(rt.type_attribute_error, "attribute lookup on non-object");
         return false;
     }
-    PyObj* o = obj.as.obj;
+    PyObj* o = obj.as_obj();
     switch (o->tag) {
         case ObjTag::Module: {
             auto* m = static_cast<PyModuleObj*>(o);
@@ -137,8 +137,8 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                 Value key = Value::integer(symbol);
                 if (dict_get(t->dict, key, out)) {
                     // bind method
-                    if (out.tag == Tag::Obj && out.as.obj &&
-                        out.as.obj->tag == ObjTag::Function) {
+                    if (out.tag() == Tag::Obj && out.as_obj() &&
+                        out.as_obj()->tag == ObjTag::Function) {
                         auto* bm = static_cast<PyBoundMethodObj*>(
                             std::malloc(sizeof(PyBoundMethodObj)));
                         bm->tag = ObjTag::BoundMethod;
@@ -146,8 +146,8 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                         bm->refcount = 1;
                         bm->func = out;
                         bm->recv = obj;
-                        rt.incref(out.as.obj);
-                        rt.incref(obj.as.obj);
+                        rt.incref(out.as_obj());
+                        rt.incref(obj.as_obj());
                         out = Value::object(reinterpret_cast<PyObj*>(bm));
                     }
                     return true;
@@ -178,7 +178,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                 bm->refcount = 1;
                 bm->func = Value::integer(0x100 + (sym == "append" ? 0 : 1));  // marker
                 bm->recv = obj;
-                rt.incref(obj.as.obj);
+                rt.incref(obj.as_obj());
                 out = Value::object(reinterpret_cast<PyObj*>(bm));
                 return true;
             }
@@ -195,7 +195,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                 bm->func = Value::integer(0x200 + (sym == "get" ? 0 : sym == "keys" ? 1
                                                   : sym == "values" ? 2 : 3));
                 bm->recv = obj;
-                rt.incref(obj.as.obj);
+                rt.incref(obj.as_obj());
                 out = Value::object(reinterpret_cast<PyObj*>(bm));
                 return true;
             }
@@ -218,7 +218,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                     bm->refcount = 1;
                     bm->func = Value::integer(static_cast<std::int64_t>(m.kind));
                     bm->recv = obj;
-                    rt.incref(obj.as.obj);
+                    rt.incref(obj.as_obj());
                     out = Value::object(reinterpret_cast<PyObj*>(bm));
                     return true;
                 }
@@ -234,11 +234,11 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
 
 bool Vm::set_attr(const Value& obj, std::uint32_t symbol, Value value) noexcept {
     Runtime& rt = Runtime::instance();
-    if (obj.tag != Tag::Obj || !obj.as.obj) {
+    if (obj.tag() != Tag::Obj || !obj.as_obj()) {
         raise_builtin(rt.type_attribute_error, "attribute store on non-object");
         return false;
     }
-    PyObj* o = obj.as.obj;
+    PyObj* o = obj.as_obj();
     if (o->tag == ObjTag::Instance) {
         auto* inst = static_cast<PyInstanceObj*>(o);
         std::uint32_t slot = 0;
@@ -259,9 +259,9 @@ bool Vm::set_attr(const Value& obj, std::uint32_t symbol, Value value) noexcept 
             inst->slot_capacity = new_cap;
         }
         // store: incref new, decref old
-        if (value.tag == Tag::Obj && value.as.obj) rt.incref(value.as.obj);
+        if (value.tag() == Tag::Obj && value.as_obj()) rt.incref(value.as_obj());
         Value& slot_ref = inst->slots[slot];
-        if (slot_ref.tag == Tag::Obj && slot_ref.as.obj) rt.decref(slot_ref.as.obj);
+        if (slot_ref.tag() == Tag::Obj && slot_ref.as_obj()) rt.decref(slot_ref.as_obj());
         slot_ref = value;
         return true;
     }
@@ -279,8 +279,8 @@ bool Vm::set_attr(const Value& obj, std::uint32_t symbol, Value value) noexcept 
 
 bool Vm::get_iter(const Value& obj, Value& out) noexcept {
     Runtime& rt = Runtime::instance();
-    if (obj.tag == Tag::Obj && obj.as.obj) {
-        switch (obj.as.obj->tag) {
+    if (obj.tag() == Tag::Obj && obj.as_obj()) {
+        switch (obj.as_obj()->tag) {
             case ObjTag::RangeIter:
             case ObjTag::ListIter:
             case ObjTag::StrIter:
@@ -288,7 +288,7 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
             case ObjTag::Generator:
                 // Identity: return an OWNED reference (the register slot will
                 // take ownership; the source register keeps its own).
-                if (obj.tag == Tag::Obj && obj.as.obj) rt.incref(obj.as.obj);
+                if (obj.tag() == Tag::Obj && obj.as_obj()) rt.incref(obj.as_obj());
                 out = obj;
                 return true;
             case ObjTag::List: {
@@ -296,7 +296,7 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
                 li->tag = ObjTag::ListIter;
                 li->flags = 0;
                 li->refcount = 1;
-                li->list = static_cast<PyListObj*>(obj.as.obj);
+                li->list = static_cast<PyListObj*>(obj.as_obj());
                 li->index = 0;
                 out = Value::object(reinterpret_cast<PyObj*>(li));
                 return true;
@@ -306,7 +306,7 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
                 si->tag = ObjTag::StrIter;
                 si->flags = 0;
                 si->refcount = 1;
-                si->str = static_cast<PyStrObj*>(obj.as.obj);
+                si->str = static_cast<PyStrObj*>(obj.as_obj());
                 si->index = 0;
                 out = Value::object(reinterpret_cast<PyObj*>(si));
                 return true;
@@ -316,9 +316,9 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
                 di->tag = ObjTag::DictIter;
                 di->flags = 0;
                 di->refcount = 1;
-                di->dict = static_cast<PyDictObj*>(obj.as.obj);
+                di->dict = static_cast<PyDictObj*>(obj.as_obj());
                 di->slot = 0;   // seq cursor (insertion order)
-                di->remaining = static_cast<PyDictObj*>(obj.as.obj)->count;
+                di->remaining = static_cast<PyDictObj*>(obj.as_obj())->count;
                 out = Value::object(reinterpret_cast<PyObj*>(di));
                 return true;
             }
@@ -332,11 +332,11 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
 
 bool Vm::iter_check(Value& it, bool& more) noexcept {
     Runtime& rt = Runtime::instance();
-    if (it.tag != Tag::Obj || !it.as.obj) {
+    if (it.tag() != Tag::Obj || !it.as_obj()) {
         raise_builtin(rt.type_type_error, "iterator protocol on non-object");
         return false;
     }
-    PyObj* o = it.as.obj;
+    PyObj* o = it.as_obj();
     switch (o->tag) {
         case ObjTag::RangeIter: {
             auto* r = static_cast<PyRangeIterObj*>(o);
@@ -377,7 +377,7 @@ bool Vm::iter_check(Value& it, bool& more) noexcept {
                 // ref -> refcount underflow -> premature free -> UAF.
                 Value& slot =
                     g->frame->regs[g->frame->n_regs > 0 ? g->frame->n_regs - 1 : 0];
-                if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+                if (slot.tag() == Tag::Obj && slot.as_obj()) rt.decref(slot.as_obj());
                 slot = out;   // `out` is an owned ref (L_YIELD incref); transfer
                 more = true;
             } else {
@@ -393,11 +393,11 @@ bool Vm::iter_check(Value& it, bool& more) noexcept {
 
 bool Vm::iter_next(const Value& it, Value& out) noexcept {
     Runtime& rt = Runtime::instance();
-    if (it.tag != Tag::Obj || !it.as.obj) {
+    if (it.tag() != Tag::Obj || !it.as_obj()) {
         raise_builtin(rt.type_type_error, "iterator protocol on non-object");
         return false;
     }
-    PyObj* o = it.as.obj;
+    PyObj* o = it.as_obj();
     switch (o->tag) {
         case ObjTag::RangeIter: {
             auto* r = static_cast<PyRangeIterObj*>(o);
@@ -413,7 +413,7 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
             // list's reference and freeing the value while the list still
             // references it (over-decref / UAF).
             out = l->list->items[l->index++];
-            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            if (out.tag() == Tag::Obj && out.as_obj()) rt.incref(out.as_obj());
             return true;
         }
         case ObjTag::StrIter: {
@@ -427,7 +427,7 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
         case ObjTag::DictIter: {
             // Insertion-order iteration (CPython 3.7+ guarantee): repeatedly
             // select the live entry with the smallest seq >= cursor.
-            // OBJ-16 fix: skip tombstones (used=true, key.tag=None). With
+            // OBJ-16 fix: skip tombstones (used=true, key.tag()=None). With
             // backward-shift deletion in dict_del, tombstones shouldn't be
             // present in the live table, but a table may have been built
             // before this fix shipped — defensive guard prevents the iter
@@ -443,7 +443,7 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
             for (std::uint32_t i = 0; i < dict->capacity; ++i) {
                 const DictEntry& e = dict->entries[i];
                 if (!e.used || e.seq < di->slot) continue;   // already emitted
-                if (e.key.tag == Tag::None) continue;        // tombstone
+                if (e.key.tag() == Tag::None) continue;        // tombstone
                 if (e.seq < best) {
                     best = e.seq;
                     best_slot = i;
@@ -459,7 +459,7 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
             // teardown would drop the dict's only reference, freeing the
             // value while the dict still referenced it.
             out = dict->entries[best_slot].key;
-            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            if (out.tag() == Tag::Obj && out.as_obj()) rt.incref(out.as_obj());
             di->slot = best + 1;   // next scan starts after this seq
             --di->remaining;
             return true;
@@ -473,7 +473,7 @@ bool Vm::iter_next(const Value& it, Value& out) noexcept {
             // generator's reference and freeing the value while the
             // generator's frame still references it (over-decref / UAF).
             out = g->frame->regs[g->frame->n_regs > 0 ? g->frame->n_regs - 1 : 0];
-            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            if (out.tag() == Tag::Obj && out.as_obj()) rt.incref(out.as_obj());
             return true;
         }
         default:
@@ -536,7 +536,7 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
     std::uint32_t i = 0;
     for (; i < argc && i < plain; ++i) {
         Value v = args[i];
-        if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+        if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
         f.regs[unit->param_regs[i]] = v;
     }
     // defaults for missing positionals
@@ -548,7 +548,7 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
             std::uint32_t di = ndefaults - (plain - i);
             if (di < ndefaults) {
                 Value dv = fn->defaults->items[di];
-                if (dv.tag == Tag::Obj && dv.as.obj) rt.incref(dv.as.obj);
+                if (dv.tag() == Tag::Obj && dv.as_obj()) rt.incref(dv.as_obj());
                 f.regs[unit->param_regs[i]] = dv;
                 used_default = true;
             }
@@ -564,7 +564,7 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
         PyTupleObj* tup = rt.new_tuple(argc > plain ? argc - plain : 0);
         for (std::uint32_t k = plain; k < argc; ++k) {
             tup->items[k - plain] = args[k];
-            if (args[k].tag == Tag::Obj && args[k].as.obj) rt.incref(args[k].as.obj);
+            if (args[k].tag() == Tag::Obj && args[k].as_obj()) rt.incref(args[k].as_obj());
         }
         f.regs[var_reg] = Value::object(reinterpret_cast<PyObj*>(tup));
     }
@@ -585,18 +585,18 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
         stdx::small_vector<bool, 8> consumed_kw(nkw, false);
         for (std::uint32_t k = 0; k < nkw && kw_names; ++k) {
             Value key = kw_names->items[k];
-            if (key.tag != Tag::Int) continue;
+            if (key.tag() != Tag::Int) continue;
             for (std::uint32_t p = 0; p < plain; ++p) {
                 if (unit->param_names.size() > p &&
-                    unit->param_names[p] == static_cast<std::uint32_t>(key.as.i)) {
+                    unit->param_names[p] == static_cast<std::uint32_t>(key.as_i())) {
                     // Bind this kwarg to positional param p (overrides any
                     // positional binding — Python: kwarg wins).
                     Value val = args[argc + k];
-                    if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                    if (val.tag() == Tag::Obj && val.as_obj()) rt.incref(val.as_obj());
                     // Decref the old positional binding if it was set.
-                    if (f.regs[unit->param_regs[p]].tag == Tag::Obj &&
-                        f.regs[unit->param_regs[p]].as.obj) {
-                        rt.decref(f.regs[unit->param_regs[p]].as.obj);
+                    if (f.regs[unit->param_regs[p]].tag() == Tag::Obj &&
+                        f.regs[unit->param_regs[p]].as_obj()) {
+                        rt.decref(f.regs[unit->param_regs[p]].as_obj());
                     }
                     f.regs[unit->param_regs[p]] = val;
                     consumed_kw[k] = true;
@@ -619,17 +619,17 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
         // No **kwargs declared: every kwarg must match a positional param.
         for (std::uint32_t k = 0; k < nkw; ++k) {
             Value key = kw_names->items[k];
-            if (key.tag != Tag::Int) continue;
+            if (key.tag() != Tag::Int) continue;
             bool matched = false;
             for (std::uint32_t p = 0; p < plain; ++p) {
                 if (unit->param_names.size() > p &&
-                    unit->param_names[p] == static_cast<std::uint32_t>(key.as.i)) {
+                    unit->param_names[p] == static_cast<std::uint32_t>(key.as_i())) {
                     Value val = args[argc + k];
-                    if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                    if (val.tag() == Tag::Obj && val.as_obj()) rt.incref(val.as_obj());
                     // Decref the old positional binding if it was set.
-                    if (f.regs[unit->param_regs[p]].tag == Tag::Obj &&
-                        f.regs[unit->param_regs[p]].as.obj) {
-                        rt.decref(f.regs[unit->param_regs[p]].as.obj);
+                    if (f.regs[unit->param_regs[p]].tag() == Tag::Obj &&
+                        f.regs[unit->param_regs[p]].as_obj()) {
+                        rt.decref(f.regs[unit->param_regs[p]].as_obj());
                     }
                     f.regs[unit->param_regs[p]] = val;
                     matched = true;
@@ -655,7 +655,7 @@ bool Vm::bind_parameters(Frame& f, PyFuncObj* fn, Value* args, std::uint32_t arg
 
 bool Vm::builtin_call(PyNativeFnObj* fn, Value* args, std::uint32_t argc, Value& out) noexcept {
     out = fn->fn(fn->user, args, argc);
-    if (out.tag == Tag::Obj && out.as.obj == nullptr) {
+    if (out.tag() == Tag::Obj && out.as_obj() == nullptr) {
         out = Value::none();
         return false;   // null signals error (pending set by helper)
     }
@@ -670,11 +670,11 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                        PyTupleObj* kw_names, std::uint32_t nkw, Value& out) noexcept {
     Runtime& rt = Runtime::instance();
 
-    if (callee.tag != Tag::Obj || !callee.as.obj) {
+    if (callee.tag() != Tag::Obj || !callee.as_obj()) {
         raise_builtin(rt.type_type_error, "call of non-callable value");
         return false;
     }
-    PyObj* target = callee.as.obj;
+    PyObj* target = callee.as_obj();
 
     if (call_depth >= cfg::max_call_depth) {
         raise_builtin(rt.type_runtime_error, "maximum recursion depth exceeded");
@@ -689,8 +689,8 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
         case ObjTag::BoundMethod: {
             auto* bm = static_cast<PyBoundMethodObj*>(target);
             // builtin bound methods on list/dict/str
-            if (bm->func.tag == Tag::Int) {
-                std::uint64_t kind = static_cast<std::uint64_t>(bm->func.as.i);
+            if (bm->func.tag() == Tag::Int) {
+                std::uint64_t kind = static_cast<std::uint64_t>(bm->func.as_i());
                 return builtin_bound_method(kind, bm->recv, args, argc, out);
             }
             // general: call func with recv prepended
@@ -793,7 +793,7 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 // failure. There is NO silent failure: if rv is none(),
                 // either the function returned None, or the bridge handled
                 // the exception (pending is set).
-                if (rv.tag == Tag::None && has_pending()) {
+                if (rv.tag() == Tag::None && has_pending()) {
                     return false;   // propagate exception to caller
                 }
                 out = rv;
@@ -824,7 +824,7 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 }
                 init = Value::none();
             }
-            if (init.tag == Tag::Obj && init.as.obj) {
+            if (init.tag() == Tag::Obj && init.as_obj()) {
                 stdx::small_vector<Value, 8> full;
                 full.push_back(out);   // self
                 for (std::uint32_t i = 0; i < argc; ++i) full.push_back(args[i]);
@@ -847,14 +847,14 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
     Runtime& rt = Runtime::instance();
     if (kind >= 0x100 && kind < 0x200) {
         // list methods
-        auto* l = static_cast<PyListObj*>(recv.as.obj);
+        auto* l = static_cast<PyListObj*>(recv.as_obj());
         if (kind == 0x100) {   // append
             if (argc != 1) {
                 raise_builtin(rt.type_type_error, "append takes exactly one argument");
                 return false;
             }
             Value v = args[0];
-            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+            if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
             if (!list_push(l, v)) {
                 raise_builtin(rt.type_memory_error, "list allocation failed");
                 return false;
@@ -887,7 +887,7 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
             std::uint32_t u_idx = static_cast<std::uint32_t>(idx);
             out = l->items[u_idx];
             // incref out since the caller treats it as owned (was borrowed).
-            if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+            if (out.tag() == Tag::Obj && out.as_obj()) rt.incref(out.as_obj());
             // shift remaining elements left
             std::memmove(l->items + u_idx, l->items + u_idx + 1,
                          sizeof(Value) * (l->length - u_idx - 1));
@@ -897,7 +897,7 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
     }
     if (kind >= 0x200 && kind < 0x300) {
         // dict methods: get/keys/values/items
-        auto* d = static_cast<PyDictObj*>(recv.as.obj);
+        auto* d = static_cast<PyDictObj*>(recv.as_obj());
         if (kind == 0x200) {   // get(key[, default])
             if (argc == 0) {
                 raise_builtin(rt.type_type_error, "get needs a key");
@@ -911,12 +911,12 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
         // keys/values/items -> list
         auto* result = rt.new_list();
         for (std::uint32_t i = 0; i < d->capacity; ++i) {
-            // OBJ-7 fix: skip tombstones. used=true with key.tag=None is a
+            // OBJ-7 fix: skip tombstones. used=true with key.tag()=None is a
             // tombstone from the old deletion scheme (current dict_del
             // uses backward-shift, so this is defensive — but the table
             // may have been built by external code with tombstones).
             if (!d->entries[i].used) continue;
-            if (d->entries[i].key.tag == Tag::None) continue;
+            if (d->entries[i].key.tag() == Tag::None) continue;
             Value v;
                 if (kind == 0x201) v = d->entries[i].key;
             else if (kind == 0x202) v = d->entries[i].value;
@@ -924,8 +924,8 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                 auto* pair = rt.new_tuple(2);
                 pair->items[0] = d->entries[i].key;
                 pair->items[1] = d->entries[i].value;
-                if (pair->items[0].tag == Tag::Obj) rt.incref(pair->items[0].as.obj);
-                if (pair->items[1].tag == Tag::Obj) rt.incref(pair->items[1].as.obj);
+                if (pair->items[0].tag() == Tag::Obj) rt.incref(pair->items[0].as_obj());
+                if (pair->items[1].tag() == Tag::Obj) rt.incref(pair->items[1].as_obj());
                 v = Value::object(reinterpret_cast<PyObj*>(pair));
                 // For pair: list_push adopts (incref's), but we own a
                 // separate ref from new_tuple. Drop ours.
@@ -945,7 +945,7 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
         // Str bound methods. Kinds assigned at LOAD_ATTR:
         //   0x300 upper, 0x301 lower, 0x302 split, 0x303 startswith,
         //   0x304 endswith, 0x305 strip, 0x306 replace, 0x307 join.
-        auto* str = static_cast<PyStrObj*>(recv.as.obj);
+        auto* str = static_cast<PyStrObj*>(recv.as_obj());
         std::string_view sv(str->data(), str->length);
         switch (kind) {
             case 0x300: {   // upper
@@ -963,12 +963,12 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                 return true;
             }
             case 0x302: {   // split(sep)
-                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
-                    args[0].as.obj->tag != ObjTag::Str) {
+                if (argc < 1 || args[0].tag() != Tag::Obj || !args[0].as_obj() ||
+                    args[0].as_obj()->tag != ObjTag::Str) {
                     raise_builtin(rt.type_type_error, "split expects a string separator");
                     return false;
                 }
-                auto* sep = static_cast<PyStrObj*>(args[0].as.obj);
+                auto* sep = static_cast<PyStrObj*>(args[0].as_obj());
                 auto* result = rt.new_list();
                 std::string_view sepv(sep->data(), sep->length);
                 if (sepv.empty()) {
@@ -993,23 +993,23 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                 return true;
             }
             case 0x303: {   // startswith
-                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
-                    args[0].as.obj->tag != ObjTag::Str) {
+                if (argc < 1 || args[0].tag() != Tag::Obj || !args[0].as_obj() ||
+                    args[0].as_obj()->tag != ObjTag::Str) {
                     raise_builtin(rt.type_type_error, "startswith expects a string");
                     return false;
                 }
-                auto* pre = static_cast<PyStrObj*>(args[0].as.obj);
+                auto* pre = static_cast<PyStrObj*>(args[0].as_obj());
                 std::string_view pv(pre->data(), pre->length);
                 out = Value::boolean(sv.size() >= pv.size() && sv.substr(0, pv.size()) == pv);
                 return true;
             }
             case 0x304: {   // endswith
-                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
-                    args[0].as.obj->tag != ObjTag::Str) {
+                if (argc < 1 || args[0].tag() != Tag::Obj || !args[0].as_obj() ||
+                    args[0].as_obj()->tag != ObjTag::Str) {
                     raise_builtin(rt.type_type_error, "endswith expects a string");
                     return false;
                 }
-                auto* suf = static_cast<PyStrObj*>(args[0].as.obj);
+                auto* suf = static_cast<PyStrObj*>(args[0].as_obj());
                 std::string_view pv(suf->data(), suf->length);
                 out = Value::boolean(sv.size() >= pv.size() && sv.substr(sv.size() - pv.size()) == pv);
                 return true;
@@ -1023,14 +1023,14 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                 return true;
             }
             case 0x306: {   // replace(old, new)
-                if (argc < 2 || args[0].tag != Tag::Obj || !args[0].as.obj ||
-                    args[0].as.obj->tag != ObjTag::Str || args[1].tag != Tag::Obj ||
-                    !args[1].as.obj || args[1].as.obj->tag != ObjTag::Str) {
+                if (argc < 2 || args[0].tag() != Tag::Obj || !args[0].as_obj() ||
+                    args[0].as_obj()->tag != ObjTag::Str || args[1].tag() != Tag::Obj ||
+                    !args[1].as_obj() || args[1].as_obj()->tag != ObjTag::Str) {
                     raise_builtin(rt.type_type_error, "replace expects two strings");
                     return false;
                 }
-                auto* old_s = static_cast<PyStrObj*>(args[0].as.obj);
-                auto* new_s = static_cast<PyStrObj*>(args[1].as.obj);
+                auto* old_s = static_cast<PyStrObj*>(args[0].as_obj());
+                auto* new_s = static_cast<PyStrObj*>(args[1].as_obj());
                 std::string_view ov(old_s->data(), old_s->length);
                 std::string_view nv(new_s->data(), new_s->length);
                 stdx::small_vector<char, 128> buf;
@@ -1054,18 +1054,18 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                 return true;
             }
             case 0x307: {   // join(iterable of str)
-                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
-                    args[0].as.obj->tag != ObjTag::List) {
+                if (argc < 1 || args[0].tag() != Tag::Obj || !args[0].as_obj() ||
+                    args[0].as_obj()->tag != ObjTag::List) {
                     raise_builtin(rt.type_type_error, "join expects a list");
                     return false;
                 }
-                auto* parts = static_cast<PyListObj*>(args[0].as.obj);
+                auto* parts = static_cast<PyListObj*>(args[0].as_obj());
                 stdx::small_vector<char, 128> buf;
                 for (std::uint32_t i = 0; i < parts->length; ++i) {
                     if (i) for (char c : sv) buf.push_back(c);
                     Value& p = parts->items[i];
-                    if (p.tag == Tag::Obj && p.as.obj && p.as.obj->tag == ObjTag::Str) {
-                        auto* ps = static_cast<PyStrObj*>(p.as.obj);
+                    if (p.tag() == Tag::Obj && p.as_obj() && p.as_obj()->tag == ObjTag::Str) {
+                        auto* ps = static_cast<PyStrObj*>(p.as_obj());
                         for (std::uint32_t k = 0; k < ps->length; ++k) buf.push_back(ps->data()[k]);
                     }
                 }
@@ -1095,8 +1095,8 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
                 raise_builtin(rt.type_runtime_error, "MakeFunction arity");
                 return false;
             }
-            std::uint32_t unit_id = static_cast<std::uint32_t>(args[0].as.i);
-            std::uint32_t ndefaults = static_cast<std::uint32_t>(args[1].as.i);
+            std::uint32_t unit_id = static_cast<std::uint32_t>(args[0].as_i());
+            std::uint32_t ndefaults = static_cast<std::uint32_t>(args[1].as_i());
             // INT-11 fix: bound-check the defaults copy against argc.
             // The previous code read args[2 + i] unconditionally for
             // i in [0, ndefaults); if ndefaults > argc - 2 (caller passed
@@ -1112,16 +1112,16 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
                 defaults = rt.new_tuple(ndefaults);
                 for (std::uint32_t i = 0; i < ndefaults; ++i) {
                     defaults->items[i] = args[2 + i];
-                    if (args[2 + i].tag == Tag::Obj && args[2 + i].as.obj) {
-                        rt.incref(args[2 + i].as.obj);
+                    if (args[2 + i].tag() == Tag::Obj && args[2 + i].as_obj()) {
+                        rt.incref(args[2 + i].as_obj());
                     }
                 }
             }
             Value cells_v = args[2 + ndefaults];
             PyTupleObj* cells = nullptr;
-            if (cells_v.tag == Tag::Obj && cells_v.as.obj &&
-                cells_v.as.obj->tag == ObjTag::Tuple) {
-                cells = static_cast<PyTupleObj*>(cells_v.as.obj);
+            if (cells_v.tag() == Tag::Obj && cells_v.as_obj() &&
+                cells_v.as_obj()->tag == ObjTag::Tuple) {
+                cells = static_cast<PyTupleObj*>(cells_v.as_obj());
             }
             CodeUnit* unit = unit_id < program.units.size() ? program.units[unit_id] : nullptr;
             if (!unit) {
@@ -1141,7 +1141,7 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
             return true;
         }
         case NativeHelper::CellGet: {
-            auto* cell = static_cast<PyCellObj*>(args[0].as.obj);
+            auto* cell = static_cast<PyCellObj*>(args[0].as_obj());
             if (cell->flags & PyCellObj::kUnbound) {
                 raise_builtin(rt.type_runtime_error,
                               "cannot read unbound closure variable (UnboundLocalError)");
@@ -1151,11 +1151,11 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
             return true;
         }
         case NativeHelper::CellSet: {
-            auto* cell = static_cast<PyCellObj*>(args[0].as.obj);
+            auto* cell = static_cast<PyCellObj*>(args[0].as_obj());
             Value v = args[1];
-            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
-            if (cell->value.tag == Tag::Obj && cell->value.as.obj) {
-                rt.decref(cell->value.as.obj);
+            if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
+            if (cell->value.tag() == Tag::Obj && cell->value.as_obj()) {
+                rt.decref(cell->value.as_obj());
             }
             cell->value = v;
             cell->flags &= ~PyCellObj::kUnbound;
@@ -1165,12 +1165,12 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
         case NativeHelper::ImportModule: {
             std::uint32_t sym = 0;
             // arg is a symbol-string const: Value integer symbol or str object
-            if (args[0].tag == Tag::Int) {
-                sym = static_cast<std::uint32_t>(args[0].as.i);
-            } else if (args[0].tag == Tag::Obj && args[0].as.obj &&
-                       args[0].as.obj->tag == ObjTag::Str) {
+            if (args[0].tag() == Tag::Int) {
+                sym = static_cast<std::uint32_t>(args[0].as_i());
+            } else if (args[0].tag() == Tag::Obj && args[0].as_obj() &&
+                       args[0].as_obj()->tag == ObjTag::Str) {
                 sym = global_symbols().intern(
-                    static_cast<PyStrObj*>(args[0].as.obj)->view());
+                    static_cast<PyStrObj*>(args[0].as_obj())->view());
             }
             PyModuleObj* mod = load_native_module(sym);
             if (!mod) {
@@ -1188,21 +1188,21 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
         case NativeHelper::MakeClass: {
             // args: [name_str, namespace_dict, base_or_none]
             std::string_view name;
-            if (args[0].tag == Tag::Int) {
-                name = global_symbols().text(static_cast<std::uint32_t>(args[0].as.i));
-            } else if (args[0].tag == Tag::Obj && args[0].as.obj &&
-                       args[0].as.obj->tag == ObjTag::Str) {
-                name = static_cast<PyStrObj*>(args[0].as.obj)->view();
+            if (args[0].tag() == Tag::Int) {
+                name = global_symbols().text(static_cast<std::uint32_t>(args[0].as_i()));
+            } else if (args[0].tag() == Tag::Obj && args[0].as_obj() &&
+                       args[0].as_obj()->tag == ObjTag::Str) {
+                name = static_cast<PyStrObj*>(args[0].as_obj())->view();
             }
             PyDictObj* ns = nullptr;
-            if (args[1].tag == Tag::Obj && args[1].as.obj &&
-                args[1].as.obj->tag == ObjTag::Dict) {
-                ns = static_cast<PyDictObj*>(args[1].as.obj);
+            if (args[1].tag() == Tag::Obj && args[1].as_obj() &&
+                args[1].as_obj()->tag == ObjTag::Dict) {
+                ns = static_cast<PyDictObj*>(args[1].as_obj());
             }
             PyTypeObj* base = nullptr;
-            if (args[2].tag == Tag::Obj && args[2].as.obj &&
-                args[2].as.obj->tag == ObjTag::Type) {
-                base = static_cast<PyTypeObj*>(args[2].as.obj);
+            if (args[2].tag() == Tag::Obj && args[2].as_obj() &&
+                args[2].as_obj()->tag == ObjTag::Type) {
+                base = static_cast<PyTypeObj*>(args[2].as_obj());
             }
             PyTypeObj* cls = rt.new_type(global_symbols().intern(name), base, ns);
             // Inherit base attributes: own (ns) entries WIN — copy base
@@ -1226,17 +1226,17 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
         }
         case NativeHelper::UnpackSequence: {
             // args: [value, n]
-            std::uint32_t n = static_cast<std::uint32_t>(args[1].as.i);
+            std::uint32_t n = static_cast<std::uint32_t>(args[1].as_i());
             PyTupleObj* tup = rt.new_tuple(n);
             bool ok = false;
-            if (args[0].tag == Tag::Obj && args[0].as.obj) {
-                PyObj* src = args[0].as.obj;
+            if (args[0].tag() == Tag::Obj && args[0].as_obj()) {
+                PyObj* src = args[0].as_obj();
                 if (src->tag == ObjTag::List) {
                     auto* l = static_cast<PyListObj*>(src);
                     if (l->length == n) {
                         for (std::uint32_t i = 0; i < n; ++i) {
                             tup->items[i] = l->items[i];
-                            if (l->items[i].tag == Tag::Obj) rt.incref(l->items[i].as.obj);
+                            if (l->items[i].tag() == Tag::Obj) rt.incref(l->items[i].as_obj());
                         }
                         ok = true;
                     }
@@ -1245,7 +1245,7 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
                     if (t->length == n) {
                         for (std::uint32_t i = 0; i < n; ++i) {
                             tup->items[i] = t->items[i];
-                            if (t->items[i].tag == Tag::Obj) rt.incref(t->items[i].as.obj);
+                            if (t->items[i].tag() == Tag::Obj) rt.incref(t->items[i].as_obj());
                         }
                         ok = true;
                     }
@@ -1274,18 +1274,18 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
             return false;
         }
         case NativeHelper::DelSubscript: {
-            if (args[0].tag == Tag::Obj && args[0].as.obj &&
-                args[0].as.obj->tag == ObjTag::Dict) {
-                if (!dict_del(static_cast<PyDictObj*>(args[0].as.obj), args[1])) {
+            if (args[0].tag() == Tag::Obj && args[0].as_obj() &&
+                args[0].as_obj()->tag == ObjTag::Dict) {
+                if (!dict_del(static_cast<PyDictObj*>(args[0].as_obj()), args[1])) {
                     raise_builtin(rt.type_key_error, "del: key not found");
                     return false;
                 }
                 out = Value::none();
                 return true;
             }
-            if (args[0].tag == Tag::Obj && args[0].as.obj &&
-                args[0].as.obj->tag == ObjTag::List) {
-                auto* l = static_cast<PyListObj*>(args[0].as.obj);
+            if (args[0].tag() == Tag::Obj && args[0].as_obj() &&
+                args[0].as_obj()->tag == ObjTag::List) {
+                auto* l = static_cast<PyListObj*>(args[0].as_obj());
                 std::int64_t idx = 0;
                 // OBJ-21 fix: accept negative index (Python: del l[-1]
                 // deletes the last element). The previous code required
@@ -1299,7 +1299,7 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
                     raise_builtin(rt.type_index_error, "del index out of range");
                     return false;
                 }
-                if (l->items[idx].tag == Tag::Obj) rt.decref(l->items[idx].as.obj);
+                if (l->items[idx].tag() == Tag::Obj) rt.decref(l->items[idx].as_obj());
                 std::memmove(l->items + idx, l->items + idx + 1,
                              sizeof(Value) * (l->length - idx - 1));
                 l->length--;
@@ -1316,16 +1316,16 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
         }
         case NativeHelper::IsInstance: {
             // args: [exc_value, type_name_str]
-            if (args[0].tag == Tag::Obj && args[0].as.obj &&
-                args[0].as.obj->tag == ObjTag::Instance) {
-                auto* inst = static_cast<PyInstanceObj*>(args[0].as.obj);
+            if (args[0].tag() == Tag::Obj && args[0].as_obj() &&
+                args[0].as_obj()->tag == ObjTag::Instance) {
+                auto* inst = static_cast<PyInstanceObj*>(args[0].as_obj());
                 std::uint32_t sym = 0;
-                if (args[1].tag == Tag::Int) {
-                    sym = static_cast<std::uint32_t>(args[1].as.i);
-                } else if (args[1].tag == Tag::Obj && args[1].as.obj &&
-                           args[1].as.obj->tag == ObjTag::Str) {
+                if (args[1].tag() == Tag::Int) {
+                    sym = static_cast<std::uint32_t>(args[1].as_i());
+                } else if (args[1].tag() == Tag::Obj && args[1].as_obj() &&
+                           args[1].as_obj()->tag == ObjTag::Str) {
                     sym = global_symbols().intern(
-                        static_cast<PyStrObj*>(args[1].as.obj)->view());
+                        static_cast<PyStrObj*>(args[1].as_obj())->view());
                 }
                 out = Value::boolean(rt.exception_matches(inst, sym));
                 return true;
@@ -1436,21 +1436,21 @@ ExecStatus Vm::exec_frame(Frame& f) noexcept {
     // The bounds check was ~15% of Tier-0 overhead per instruction.
     auto write_reg = [&](std::uint32_t r, Value v) noexcept {
         Value& slot = regs[r];
-        if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+        if (slot.tag() == Tag::Obj && slot.as_obj()) rt.decref(slot.as_obj());
         slot = v;
     };
     auto write_reg_owned = [&](std::uint32_t r, Value v) noexcept {
         Value& slot = regs[r];
-        if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+        if (slot.tag() == Tag::Obj && slot.as_obj()) rt.decref(slot.as_obj());
         slot = v;
-        if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+        if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
     };
     // Move semantics: transfer ownership from source register.
     auto move_reg = [&](std::uint32_t dst, std::uint32_t src) noexcept {
         Value& dslot = regs[dst];
         Value v = regs[src];
-        if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);   // src keeps its ref
-        if (dslot.tag == Tag::Obj && dslot.as.obj) rt.decref(dslot.as.obj);
+        if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());   // src keeps its ref
+        if (dslot.tag() == Tag::Obj && dslot.as_obj()) rt.decref(dslot.as_obj());
         dslot = v;
     };
 #define RAISE_CHECK(expr)                       \
@@ -1493,8 +1493,8 @@ L_PY_BINOP: {
     // The fast path checks tag equality (one branch), then does the op
     // inline with __builtin_*_overflow. Only on overflow / div-by-zero
     // / mixed types does it fall through to the generic path.
-    if (a.tag == Tag::Int && b.tag == Tag::Int) {
-        const std::int64_t x = a.as.i, y = b.as.i;
+    if (a.tag() == Tag::Int && b.tag() == Tag::Int) {
+        const std::int64_t x = a.as_i(), y = b.as_i();
         std::int64_t r = 0;
         switch (op) {
             case BinOpKind::Add:
@@ -1547,8 +1547,8 @@ L_PY_BINOP: {
             write_reg(cur->dst, out);
             ++f.pc; VM_LOAD(); VM_DISPATCH();
         }
-    } else if (a.tag == Tag::Float && b.tag == Tag::Float) {
-        const double x = a.as.f, y = b.as.f;
+    } else if (a.tag() == Tag::Float && b.tag() == Tag::Float) {
+        const double x = a.as_f(), y = b.as_f();
         switch (op) {
             case BinOpKind::Add:      out = Value::real(x + y); ok = true; break;
             case BinOpKind::Sub:      out = Value::real(x - y); ok = true; break;
@@ -1577,10 +1577,10 @@ L_PY_BINOP: {
     switch (op) {
         case BinOpKind::Add: {
             // str + str, list + list fast paths
-            if (a.tag == Tag::Obj && b.tag == Tag::Obj && a.as.obj && b.as.obj &&
-                a.as.obj->tag == ObjTag::Str && b.as.obj->tag == ObjTag::Str) {
-                auto* sa = static_cast<PyStrObj*>(a.as.obj);
-                auto* sb = static_cast<PyStrObj*>(b.as.obj);
+            if (a.tag() == Tag::Obj && b.tag() == Tag::Obj && a.as_obj() && b.as_obj() &&
+                a.as_obj()->tag == ObjTag::Str && b.as_obj()->tag == ObjTag::Str) {
+                auto* sa = static_cast<PyStrObj*>(a.as_obj());
+                auto* sb = static_cast<PyStrObj*>(b.as_obj());
                 stdx::small_vector<char, 128> buf;
                 buf.reserve(sa->length + sb->length);
                 for (std::uint32_t i = 0; i < sa->length; ++i) buf.push_back(sa->data()[i]);
@@ -1590,10 +1590,10 @@ L_PY_BINOP: {
                 ok = true;
                 break;
             }
-            if (a.tag == Tag::Obj && b.tag == Tag::Obj && a.as.obj && b.as.obj &&
-                a.as.obj->tag == ObjTag::List && b.as.obj->tag == ObjTag::List) {
-                auto* la = static_cast<PyListObj*>(a.as.obj);
-                auto* lb = static_cast<PyListObj*>(b.as.obj);
+            if (a.tag() == Tag::Obj && b.tag() == Tag::Obj && a.as_obj() && b.as_obj() &&
+                a.as_obj()->tag == ObjTag::List && b.as_obj()->tag == ObjTag::List) {
+                auto* la = static_cast<PyListObj*>(a.as_obj());
+                auto* lb = static_cast<PyListObj*>(b.as_obj());
                 auto* merged = rt.new_list(la->length + lb->length);
                 for (std::uint32_t i = 0; i < la->length; ++i) list_push(merged, la->items[i]);
                 for (std::uint32_t i = 0; i < lb->length; ++i) list_push(merged, lb->items[i]);
@@ -1608,9 +1608,9 @@ L_PY_BINOP: {
         case BinOpKind::Mul: {
             // str * int, list * int replication
             std::int64_t n = 0;
-            if (a.tag == Tag::Obj && a.as.obj && a.as.obj->tag == ObjTag::Str &&
+            if (a.tag() == Tag::Obj && a.as_obj() && a.as_obj()->tag == ObjTag::Str &&
                 as_i64(b, n) && n >= 0) {
-                auto* s = static_cast<PyStrObj*>(a.as.obj);
+                auto* s = static_cast<PyStrObj*>(a.as_obj());
                 stdx::small_vector<char, 256> buf;
                 for (std::int64_t k = 0; k < n; ++k) {
                     for (std::uint32_t i = 0; i < s->length; ++i) buf.push_back(s->data()[i]);
@@ -1620,9 +1620,9 @@ L_PY_BINOP: {
                 ok = true;
                 break;
             }
-            if (a.tag == Tag::Obj && a.as.obj && a.as.obj->tag == ObjTag::List &&
+            if (a.tag() == Tag::Obj && a.as_obj() && a.as_obj()->tag == ObjTag::List &&
                 as_i64(b, n) && n >= 0) {
-                auto* l = static_cast<PyListObj*>(a.as.obj);
+                auto* l = static_cast<PyListObj*>(a.as_obj());
                 auto* merged = rt.new_list();
                 for (std::int64_t k = 0; k < n; ++k) {
                     for (std::uint32_t i = 0; i < l->length; ++i) list_push(merged, l->items[i]);
@@ -1637,8 +1637,8 @@ L_PY_BINOP: {
         case BinOpKind::TrueDiv: {
             std::int64_t yi = 0;
             double yf = 0;
-            if ((b.tag == Tag::Int && b.as.i == 0) ||
-                (b.tag == Tag::Float && b.as.f == 0.0) ||
+            if ((b.tag() == Tag::Int && b.as_i() == 0) ||
+                (b.tag() == Tag::Float && b.as_f() == 0.0) ||
                 (as_i64(b, yi) && yi == 0) || (as_f64(b, yf) && yf == 0.0)) {
                 raise_builtin(rt.type_zero_div, "division by zero");
                 ok = false;
@@ -1736,8 +1736,8 @@ L_PY_CMP: {
 
     // Inline int+int fast path — eliminates the values_compare function
     // call for the dominant case (loop conditions, equality checks).
-    if (a.tag == Tag::Int && b.tag == Tag::Int) {
-        const std::int64_t x = a.as.i, y = b.as.i;
+    if (a.tag() == Tag::Int && b.tag() == Tag::Int) {
+        const std::int64_t x = a.as_i(), y = b.as_i();
         switch (static_cast<CmpOpKind>(cur->imm)) {
             case CmpOpKind::LT: result = x <  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
             case CmpOpKind::LE: result = x <= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
@@ -1749,8 +1749,8 @@ L_PY_CMP: {
         }
     }
     // Float+float fast path
-    if (a.tag == Tag::Float && b.tag == Tag::Float) {
-        const double x = a.as.f, y = b.as.f;
+    if (a.tag() == Tag::Float && b.tag() == Tag::Float) {
+        const double x = a.as_f(), y = b.as_f();
         switch (static_cast<CmpOpKind>(cur->imm)) {
             case CmpOpKind::LT: result = x <  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
             case CmpOpKind::LE: result = x <= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
@@ -1808,10 +1808,10 @@ L_LOAD_INDEX: {
     Value idx = regs[cur->b];
     Value out;
     bool ok = false;
-    if (obj.tag == Tag::Obj && obj.as.obj) {
+    if (obj.tag() == Tag::Obj && obj.as_obj()) {
         std::int64_t i = 0;
-        if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
-            auto* l = static_cast<PyListObj*>(obj.as.obj);
+        if (obj.as_obj()->tag == ObjTag::List && as_i64(idx, i)) {
+            auto* l = static_cast<PyListObj*>(obj.as_obj());
             std::int64_t len = static_cast<std::int64_t>(l->length);
             std::int64_t eff = i < 0 ? i + len : i;
             if (eff >= 0 && eff < len) {
@@ -1820,8 +1820,8 @@ L_LOAD_INDEX: {
             } else {
                 raise_builtin(rt.type_index_error, "list index out of range");
             }
-        } else if (obj.as.obj->tag == ObjTag::Tuple && as_i64(idx, i)) {
-            auto* t = static_cast<PyTupleObj*>(obj.as.obj);
+        } else if (obj.as_obj()->tag == ObjTag::Tuple && as_i64(idx, i)) {
+            auto* t = static_cast<PyTupleObj*>(obj.as_obj());
             std::int64_t len = static_cast<std::int64_t>(t->length);
             std::int64_t eff = i < 0 ? i + len : i;
             if (eff >= 0 && eff < len) {
@@ -1830,8 +1830,8 @@ L_LOAD_INDEX: {
             } else {
                 raise_builtin(rt.type_index_error, "tuple index out of range");
             }
-        } else if (obj.as.obj->tag == ObjTag::Str && as_i64(idx, i)) {
-            auto* s = static_cast<PyStrObj*>(obj.as.obj);
+        } else if (obj.as_obj()->tag == ObjTag::Str && as_i64(idx, i)) {
+            auto* s = static_cast<PyStrObj*>(obj.as_obj());
             std::int64_t len = static_cast<std::int64_t>(s->length);
             std::int64_t eff = i < 0 ? i + len : i;
             if (eff >= 0 && eff < len) {
@@ -1841,28 +1841,28 @@ L_LOAD_INDEX: {
             } else {
                 raise_builtin(rt.type_index_error, "string index out of range");
             }
-        } else if (obj.as.obj->tag == ObjTag::Dict) {
-            if (dict_get(static_cast<PyDictObj*>(obj.as.obj), idx, out)) {
+        } else if (obj.as_obj()->tag == ObjTag::Dict) {
+            if (dict_get(static_cast<PyDictObj*>(obj.as_obj()), idx, out)) {
                 ok = true;
             } else {
                 // str keys via symbol-int normalization
                 raise_builtin(rt.type_key_error, "key not found");
             }
-        } else if (obj.as.obj->tag == ObjTag::List && idx.tag == Tag::Obj &&
-                   idx.as.obj && idx.as.obj->tag == ObjTag::Tuple &&
-                   static_cast<PyTupleObj*>(idx.as.obj)->length == 3) {
+        } else if (obj.as_obj()->tag == ObjTag::List && idx.tag() == Tag::Obj &&
+                   idx.as_obj() && idx.as_obj()->tag == ObjTag::Tuple &&
+                   static_cast<PyTupleObj*>(idx.as_obj())->length == 3) {
             // slice: (lower, upper, step) with None for omitted
-            auto* tup = static_cast<PyTupleObj*>(idx.as.obj);
+            auto* tup = static_cast<PyTupleObj*>(idx.as_obj());
             std::int64_t len = static_cast<std::int64_t>(
-                static_cast<PyListObj*>(obj.as.obj)->length);
+                static_cast<PyListObj*>(obj.as_obj())->length);
             std::int64_t lo = 0, hi = len, step = 1;
-            if (tup->items[0].tag == Tag::Int) lo = tup->items[0].as.i;
-            if (tup->items[1].tag == Tag::Int) hi = tup->items[1].as.i;
-            if (tup->items[2].tag == Tag::Int) step = tup->items[2].as.i;
+            if (tup->items[0].tag() == Tag::Int) lo = tup->items[0].as_i();
+            if (tup->items[1].tag() == Tag::Int) hi = tup->items[1].as_i();
+            if (tup->items[2].tag() == Tag::Int) step = tup->items[2].as_i();
             if (step == 0) {
                 raise_builtin(rt.type_value_error, "slice step cannot be zero");
             } else {
-                auto* src = static_cast<PyListObj*>(obj.as.obj);
+                auto* src = static_cast<PyListObj*>(obj.as_obj());
                 auto* result = rt.new_list();
                 if (step > 0) {
                     if (lo < 0) lo += len;
@@ -1877,7 +1877,7 @@ L_LOAD_INDEX: {
                     }
                 } else {
                     // negative step: defaults are lo=len-1, hi=-1
-                    if (tup->items[0].tag != Tag::Int) {
+                    if (tup->items[0].tag() != Tag::Int) {
                         lo = len - 1;
                     } else if (lo < 0) {
                         lo += len;
@@ -1889,7 +1889,7 @@ L_LOAD_INDEX: {
                         // to never execute (k > hi was always false).
                         if (lo < 0) lo = len - 1;
                     }
-                    if (tup->items[1].tag != Tag::Int) {
+                    if (tup->items[1].tag() != Tag::Int) {
                         hi = -1;
                     } else if (hi < 0) {
                         hi += len;
@@ -1913,16 +1913,16 @@ L_LOAD_INDEX: {
                 out = Value::object(reinterpret_cast<PyObj*>(result));
                 ok = true;
             }
-        } else if (obj.as.obj->tag == ObjTag::Str && idx.tag == Tag::Obj &&
-                   idx.as.obj && idx.as.obj->tag == ObjTag::Tuple &&
-                   static_cast<PyTupleObj*>(idx.as.obj)->length == 3) {
-            auto* tup = static_cast<PyTupleObj*>(idx.as.obj);
-            auto* src = static_cast<PyStrObj*>(obj.as.obj);
+        } else if (obj.as_obj()->tag == ObjTag::Str && idx.tag() == Tag::Obj &&
+                   idx.as_obj() && idx.as_obj()->tag == ObjTag::Tuple &&
+                   static_cast<PyTupleObj*>(idx.as_obj())->length == 3) {
+            auto* tup = static_cast<PyTupleObj*>(idx.as_obj());
+            auto* src = static_cast<PyStrObj*>(obj.as_obj());
             std::int64_t len = static_cast<std::int64_t>(src->length);
             std::int64_t lo = 0, hi = len, step = 1;
-            if (tup->items[0].tag == Tag::Int) lo = tup->items[0].as.i;
-            if (tup->items[1].tag == Tag::Int) hi = tup->items[1].as.i;
-            if (tup->items[2].tag == Tag::Int) step = tup->items[2].as.i;
+            if (tup->items[0].tag() == Tag::Int) lo = tup->items[0].as_i();
+            if (tup->items[1].tag() == Tag::Int) hi = tup->items[1].as_i();
+            if (tup->items[2].tag() == Tag::Int) step = tup->items[2].as_i();
             if (step == 0) {
                 raise_builtin(rt.type_value_error, "slice step cannot be zero");
             } else {
@@ -1936,14 +1936,14 @@ L_LOAD_INDEX: {
                         if (k >= 0 && k < len) buf.push_back(src->data()[k]);
                     }
                 } else {
-                    if (tup->items[0].tag != Tag::Int) {
+                    if (tup->items[0].tag() != Tag::Int) {
                         lo = len - 1;
                     } else if (lo < 0) {
                         lo += len;
                         // INT-9 fix: clamp very-negative lo to len-1.
                         if (lo < 0) lo = len - 1;
                     }
-                    if (tup->items[1].tag != Tag::Int) {
+                    if (tup->items[1].tag() != Tag::Int) {
                         hi = -1;
                     } else if (hi < 0) {
                         hi += len;
@@ -1974,10 +1974,10 @@ L_STORE_INDEX: {
     Value idx = regs[cur->b];
     Value val = regs[cur->c];
     bool ok = false;
-    if (obj.tag == Tag::Obj && obj.as.obj) {
+    if (obj.tag() == Tag::Obj && obj.as_obj()) {
         std::int64_t i = 0;
-        if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
-            auto* l = static_cast<PyListObj*>(obj.as.obj);
+        if (obj.as_obj()->tag == ObjTag::List && as_i64(idx, i)) {
+            auto* l = static_cast<PyListObj*>(obj.as_obj());
             std::int64_t len = static_cast<std::int64_t>(l->length);
             std::int64_t eff = i < 0 ? i + len : i;
             if (eff >= 0 && eff < len) {
@@ -1985,9 +1985,9 @@ L_STORE_INDEX: {
             } else {
                 raise_builtin(rt.type_index_error, "list assignment index out of range");
             }
-        } else if (obj.as.obj->tag == ObjTag::Dict) {
+        } else if (obj.as_obj()->tag == ObjTag::Dict) {
             Value key = idx;
-            ok = dict_set(static_cast<PyDictObj*>(obj.as.obj), key, val);
+            ok = dict_set(static_cast<PyDictObj*>(obj.as_obj()), key, val);
         }
     }
     if (!ok) {
@@ -2015,7 +2015,7 @@ L_NEW_TUPLE: {
     auto* t = rt.new_tuple(cur->b);
     for (std::uint32_t i = 0; i < cur->b; ++i) {
         t->items[i] = regs[cur->a + i];
-        if (regs[cur->a + i].tag == Tag::Obj) rt.incref(regs[cur->a + i].as.obj);
+        if (regs[cur->a + i].tag() == Tag::Obj) rt.incref(regs[cur->a + i].as_obj());
     }
     write_reg(cur->dst, Value::object(reinterpret_cast<PyObj*>(t)));
     ++f.pc;
@@ -2030,7 +2030,7 @@ L_NEW_DICT: {
     VM_DISPATCH();
 }
 L_LIST_APPEND: {
-    auto* l = static_cast<PyListObj*>(regs[cur->a].as.obj);
+    auto* l = static_cast<PyListObj*>(regs[cur->a].as_obj());
     Value v = regs[cur->b];
     RAISE_CHECK(l != nullptr);
     // OBJ-5 fix: list_push adopts (it incref's v internally). The previous
@@ -2057,10 +2057,10 @@ L_CALL_KW: {
     Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
     std::uint32_t kwnode = cur->imm >> 16;
     PyTupleObj* kw_names = kwnode < f.unit->n_registers &&
-                                   regs[kwnode].tag == Tag::Obj &&
-                                   regs[kwnode].as.obj &&
-                                   regs[kwnode].as.obj->tag == ObjTag::Tuple
-                               ? static_cast<PyTupleObj*>(regs[kwnode].as.obj)
+                                   regs[kwnode].tag() == Tag::Obj &&
+                                   regs[kwnode].as_obj() &&
+                                   regs[kwnode].as_obj()->tag == ObjTag::Tuple
+                               ? static_cast<PyTupleObj*>(regs[kwnode].as_obj())
                                : nullptr;
     std::uint32_t nkw = kw_names ? kw_names->length : 0;
     Value out;
@@ -2106,7 +2106,7 @@ L_ITER_NEXT: {
 }
 L_YIELD: {
     Value v = regs[cur->a];
-    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
     frame_return_ = v;
     ++f.pc;
     f.suspended = true;
@@ -2148,13 +2148,13 @@ L_JUMP_IF_TRUE: {
 }
 L_RETURN: {
     Value v = regs[cur->a];
-    if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+    if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
     frame_return_ = v;
     return ExecStatus::Returned;
 }
 L_RAISE: {
     Value exc = regs[cur->a];
-    if (exc.tag == Tag::Obj && exc.as.obj && exc.as.obj->tag == ObjTag::Type) {
+    if (exc.tag() == Tag::Obj && exc.as_obj() && exc.as_obj()->tag == ObjTag::Type) {
         // raise Class -> instantiate
         Value inst;
         if (!call_value(exc, nullptr, 0, inst)) {
@@ -2162,7 +2162,7 @@ L_RAISE: {
         }
         set_pending(inst);   // call_value returned an owned ref
     } else {
-        if (exc.tag == Tag::Obj && exc.as.obj) rt.incref(exc.as.obj);
+        if (exc.tag() == Tag::Obj && exc.as_obj()) rt.incref(exc.as_obj());
         set_pending(exc);
     }
     if (unwind_to_handler(f)) {
@@ -2193,7 +2193,7 @@ L_TRY_END: {
 }
 L_GET_EXC: {
     Value e = pending_exception_;
-    if (e.tag == Tag::Obj && e.as.obj) rt.incref(e.as.obj);
+    if (e.tag() == Tag::Obj && e.as_obj()) rt.incref(e.as_obj());
     write_reg(cur->dst, e);
     ++f.pc;
     VM_LOAD();
@@ -2205,8 +2205,8 @@ L_LOAD_FIELD: {
     Value base = regs[cur->a];
     Value out;
     bool ok = false;
-    if (base.tag == Tag::Obj && base.as.obj) {
-        PyObj* o = base.as.obj;
+    if (base.tag() == Tag::Obj && base.as_obj()) {
+        PyObj* o = base.as_obj();
         if (o->tag == ObjTag::Instance) {
             auto* inst = static_cast<PyInstanceObj*>(o);
             std::uint32_t slot = cur->imm;
@@ -2243,8 +2243,8 @@ L_STORE_FIELD: {
     Value base = regs[cur->a];
     Value val = regs[cur->b];
     bool ok = false;
-    if (base.tag == Tag::Obj && base.as.obj) {
-        PyObj* o = base.as.obj;
+    if (base.tag() == Tag::Obj && base.as_obj()) {
+        PyObj* o = base.as_obj();
         if (o->tag == ObjTag::Instance) {
             auto* inst = static_cast<PyInstanceObj*>(o);
             std::uint32_t slot = cur->imm;
@@ -2260,9 +2260,9 @@ L_STORE_FIELD: {
                 inst->slot_capacity = new_cap;
             }
             if (slot < inst->slot_capacity) {
-                if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                if (val.tag() == Tag::Obj && val.as_obj()) rt.incref(val.as_obj());
                 Value& slot_ref = inst->slots[slot];
-                if (slot_ref.tag == Tag::Obj && slot_ref.as.obj) rt.decref(slot_ref.as.obj);
+                if (slot_ref.tag() == Tag::Obj && slot_ref.as_obj()) rt.decref(slot_ref.as_obj());
                 slot_ref = val;
                 ok = true;
             }
@@ -2274,9 +2274,9 @@ L_STORE_FIELD: {
                 DictEntry& e = d->entries[si];
                 if (!e.used) continue;
                 if (seen == want) {
-                    if (e.value.tag == Tag::Obj) rt.decref(e.value.as.obj);
+                    if (e.value.tag() == Tag::Obj) rt.decref(e.value.as_obj());
                     e.value = val;
-                    if (val.tag == Tag::Obj) rt.incref(val.as.obj);
+                    if (val.tag() == Tag::Obj) rt.incref(val.as_obj());
                     ok = true;
                     break;
                 }
@@ -2315,8 +2315,8 @@ Result<Value> Vm::run_module(CodeUnit* unit) noexcept {
     Value exc = take_pending();
     stdx::small_vector<char, 128> msg;
     Runtime& rti = Runtime::instance();
-    if (exc.tag == Tag::Obj && exc.as.obj && exc.as.obj->tag == ObjTag::Instance) {
-        auto* inst = static_cast<PyInstanceObj*>(exc.as.obj);
+    if (exc.tag() == Tag::Obj && exc.as_obj() && exc.as_obj()->tag == ObjTag::Instance) {
+        auto* inst = static_cast<PyInstanceObj*>(exc.as_obj());
         if (inst->type) {
             std::string_view tname = global_symbols().text(inst->type->name_symbol);
             for (char c : tname) msg.push_back(c);
@@ -2348,14 +2348,14 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
     // No bounds check: the scheduler guarantees valid regs.
     auto write_reg = [&](std::uint32_t r, Value v) noexcept {
         Value& slot = regs[r];
-        if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+        if (slot.tag() == Tag::Obj && slot.as_obj()) rt.decref(slot.as_obj());
         slot = v;
     };
     auto write_reg_owned = [&](std::uint32_t r, Value v) noexcept {
         Value& slot = regs[r];
-        if (slot.tag == Tag::Obj && slot.as.obj) rt.decref(slot.as.obj);
+        if (slot.tag() == Tag::Obj && slot.as_obj()) rt.decref(slot.as_obj());
         slot = v;
-        if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+        if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
     };
 
     switch (static_cast<Op>(cur->op)) {
@@ -2366,7 +2366,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
         }
         case Op::MOVE: {
             Value v = regs[cur->a];
-            if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+            if (v.tag() == Tag::Obj && v.as_obj()) rt.incref(v.as_obj());
             write_reg(cur->dst, v);
             out = v;
             return true;
@@ -2377,8 +2377,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             Value result;
             const auto op = static_cast<BinOpKind>(cur->imm);
             // Inline int+int fast path
-            if (a.tag == Tag::Int && b.tag == Tag::Int) {
-                const std::int64_t x = a.as.i, y = b.as.i;
+            if (a.tag() == Tag::Int && b.tag() == Tag::Int) {
+                const std::int64_t x = a.as_i(), y = b.as_i();
                 std::int64_t r = 0;
                 switch (op) {
                     case BinOpKind::Add:
@@ -2425,8 +2425,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                 }
             }
             // Float+float fast path
-            if (a.tag == Tag::Float && b.tag == Tag::Float) {
-                const double x = a.as.f, y = b.as.f;
+            if (a.tag() == Tag::Float && b.tag() == Tag::Float) {
+                const double x = a.as_f(), y = b.as_f();
                 switch (op) {
                     case BinOpKind::Add: result = Value::real(x + y); break;
                     case BinOpKind::Sub: result = Value::real(x - y); break;
@@ -2436,7 +2436,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                         raise_builtin(rt.type_value_error, "float division by zero"); return false;
                     default: result = Value::none(); break;
                 }
-                if (result.tag != Tag::None) {
+                if (result.tag() != Tag::None) {
                     write_reg_owned(cur->dst, result);
                     out = result; return true;
                 }
@@ -2505,8 +2505,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
         case Op::PY_CMP: {
             Value a = regs[cur->a];
             Value b = regs[cur->b];
-            if (a.tag == Tag::Int && b.tag == Tag::Int) {
-                const std::int64_t x = a.as.i, y = b.as.i;
+            if (a.tag() == Tag::Int && b.tag() == Tag::Int) {
+                const std::int64_t x = a.as_i(), y = b.as_i();
                 bool result = false;
                 switch (static_cast<CmpOpKind>(cur->imm)) {
                     case CmpOpKind::LT: result = x <  y; break;
@@ -2520,8 +2520,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                 write_reg_owned(cur->dst, Value::boolean(result));
                 out = Value::boolean(result); return true;
             }
-            if (a.tag == Tag::Float && b.tag == Tag::Float) {
-                const double x = a.as.f, y = b.as.f;
+            if (a.tag() == Tag::Float && b.tag() == Tag::Float) {
+                const double x = a.as_f(), y = b.as_f();
                 bool result = false;
                 switch (static_cast<CmpOpKind>(cur->imm)) {
                     case CmpOpKind::LT: result = x <  y; break;
@@ -2577,10 +2577,10 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             Value idx = regs[cur->b];
             Value result;
             bool ok = false;
-            if (obj.tag == Tag::Obj && obj.as.obj) {
+            if (obj.tag() == Tag::Obj && obj.as_obj()) {
                 std::int64_t i = 0;
-                if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
-                    auto* l = static_cast<PyListObj*>(obj.as.obj);
+                if (obj.as_obj()->tag == ObjTag::List && as_i64(idx, i)) {
+                    auto* l = static_cast<PyListObj*>(obj.as_obj());
                     std::int64_t len = static_cast<std::int64_t>(l->length);
                     std::int64_t eff = i < 0 ? i + len : i;
                     if (eff >= 0 && eff < len) {
@@ -2590,8 +2590,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                         raise_builtin(rt.type_index_error, "list index out of range");
                         return false;
                     }
-                } else if (obj.as.obj->tag == ObjTag::Tuple && as_i64(idx, i)) {
-                    auto* t = static_cast<PyTupleObj*>(obj.as.obj);
+                } else if (obj.as_obj()->tag == ObjTag::Tuple && as_i64(idx, i)) {
+                    auto* t = static_cast<PyTupleObj*>(obj.as_obj());
                     std::int64_t len = static_cast<std::int64_t>(t->length);
                     std::int64_t eff = i < 0 ? i + len : i;
                     if (eff >= 0 && eff < len) {
@@ -2601,8 +2601,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                         raise_builtin(rt.type_index_error, "tuple index out of range");
                         return false;
                     }
-                } else if (obj.as.obj->tag == ObjTag::Str && as_i64(idx, i)) {
-                    auto* s = static_cast<PyStrObj*>(obj.as.obj);
+                } else if (obj.as_obj()->tag == ObjTag::Str && as_i64(idx, i)) {
+                    auto* s = static_cast<PyStrObj*>(obj.as_obj());
                     std::int64_t len = static_cast<std::int64_t>(s->length);
                     std::int64_t eff = i < 0 ? i + len : i;
                     if (eff >= 0 && eff < len) {
@@ -2613,8 +2613,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                         raise_builtin(rt.type_index_error, "string index out of range");
                         return false;
                     }
-                } else if (obj.as.obj->tag == ObjTag::Dict) {
-                    if (dict_get(static_cast<PyDictObj*>(obj.as.obj), idx, result)) {
+                } else if (obj.as_obj()->tag == ObjTag::Dict) {
+                    if (dict_get(static_cast<PyDictObj*>(obj.as_obj()), idx, result)) {
                         ok = true;
                     } else {
                         raise_builtin(rt.type_key_error, "key not found");
@@ -2634,10 +2634,10 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             Value idx = regs[cur->b];
             Value val = regs[cur->c];
             bool ok = false;
-            if (obj.tag == Tag::Obj && obj.as.obj) {
+            if (obj.tag() == Tag::Obj && obj.as_obj()) {
                 std::int64_t i = 0;
-                if (obj.as.obj->tag == ObjTag::List && as_i64(idx, i)) {
-                    auto* l = static_cast<PyListObj*>(obj.as.obj);
+                if (obj.as_obj()->tag == ObjTag::List && as_i64(idx, i)) {
+                    auto* l = static_cast<PyListObj*>(obj.as_obj());
                     std::int64_t len = static_cast<std::int64_t>(l->length);
                     std::int64_t eff = i < 0 ? i + len : i;
                     if (eff >= 0 && eff < len) {
@@ -2646,8 +2646,8 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
                         raise_builtin(rt.type_index_error, "list assignment index out of range");
                         return false;
                     }
-                } else if (obj.as.obj->tag == ObjTag::Dict) {
-                    ok = dict_set(static_cast<PyDictObj*>(obj.as.obj), idx, val);
+                } else if (obj.as_obj()->tag == ObjTag::Dict) {
+                    ok = dict_set(static_cast<PyDictObj*>(obj.as_obj()), idx, val);
                 }
             }
             if (!ok) {
@@ -2669,7 +2669,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             auto* t = rt.new_tuple(cur->b);
             for (std::uint32_t i = 0; i < cur->b; ++i) {
                 t->items[i] = regs[cur->a + i];
-                if (regs[cur->a + i].tag == Tag::Obj) rt.incref(regs[cur->a + i].as.obj);
+                if (regs[cur->a + i].tag() == Tag::Obj) rt.incref(regs[cur->a + i].as_obj());
             }
             Value v = Value::object(reinterpret_cast<PyObj*>(t));
             write_reg_owned(cur->dst, v);
@@ -2682,7 +2682,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             out = v; return true;
         }
         case Op::LIST_APPEND: {
-            auto* l = static_cast<PyListObj*>(regs[cur->a].as.obj);
+            auto* l = static_cast<PyListObj*>(regs[cur->a].as_obj());
             if (!l) { raise_builtin(rt.type_type_error, "append on non-list"); return false; }
             if (!list_push(l, regs[cur->b])) {
                 raise_builtin(rt.type_memory_error, "list allocation failed");
@@ -2708,10 +2708,10 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             Value callee = regs[cur->a];
             Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
             std::uint32_t kwnode = cur->imm >> 16;
-            PyTupleObj* kw_names = kwnode < n_regs && regs[kwnode].tag == Tag::Obj &&
-                                   regs[kwnode].as.obj &&
-                                   regs[kwnode].as.obj->tag == ObjTag::Tuple
-                               ? static_cast<PyTupleObj*>(regs[kwnode].as.obj)
+            PyTupleObj* kw_names = kwnode < n_regs && regs[kwnode].tag() == Tag::Obj &&
+                                   regs[kwnode].as_obj() &&
+                                   regs[kwnode].as_obj()->tag == ObjTag::Tuple
+                               ? static_cast<PyTupleObj*>(regs[kwnode].as_obj())
                                : nullptr;
             std::uint32_t nkw = kw_names ? kw_names->length : 0;
             bool prev = jit_disabled_in_bridge;
@@ -2754,7 +2754,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             Frame f(unit);
             for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
                 f.regs[i] = regs[i];
-                if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
+                if (regs[i].tag() == Tag::Obj && regs[i].as_obj()) rt.incref(regs[i].as_obj());
             }
             f.pc = pc;
             bool prev = jit_disabled_in_bridge;
@@ -2763,7 +2763,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             jit_disabled_in_bridge = prev;
             for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
                 regs[i] = f.regs[i];
-                if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
+                if (f.regs[i].tag() == Tag::Obj && f.regs[i].as_obj()) rt.incref(f.regs[i].as_obj());
             }
             if (st == ExecStatus::Returned) {
                 out = frame_return_;
@@ -2777,7 +2777,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             Frame f(unit);
             for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
                 f.regs[i] = regs[i];
-                if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
+                if (regs[i].tag() == Tag::Obj && regs[i].as_obj()) rt.incref(regs[i].as_obj());
             }
             f.pc = pc;
             bool prev = jit_disabled_in_bridge;
@@ -2786,7 +2786,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             jit_disabled_in_bridge = prev;
             for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
                 regs[i] = f.regs[i];
-                if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
+                if (f.regs[i].tag() == Tag::Obj && f.regs[i].as_obj()) rt.incref(f.regs[i].as_obj());
             }
             if (st == ExecStatus::Returned) {
                 out = frame_return_;
@@ -2824,7 +2824,7 @@ bool Vm::enter_at(CodeUnit* unit, Value* regs, std::uint32_t n_regs, std::uint32
     Runtime& rt = Runtime::instance();
     for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
         f.regs[i] = regs[i];
-        if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
+        if (regs[i].tag() == Tag::Obj && regs[i].as_obj()) rt.incref(regs[i].as_obj());
     }
     
     ExecStatus st = exec_frame(f);

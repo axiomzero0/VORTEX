@@ -83,9 +83,9 @@ private:
     [[nodiscard]] std::uint32_t add_constant(Value v) noexcept {
         for (std::uint32_t i = 0; i < unit_.constants.size(); ++i) {
             const Value& c = unit_.constants[i];
-            if (c.tag == v.tag && c.as.i == v.as.i) return i;
+            if (c.tag() == v.tag() && c.as_i() == v.as_i()) return i;
         }
-        if (v.tag == Tag::Obj && v.as.obj) Runtime::instance().incref(v.as.obj);
+        if (v.tag() == Tag::Obj && v.as_obj()) Runtime::instance().incref(v.as_obj());
         unit_.constants.push_back(v);
         return static_cast<std::uint32_t>(unit_.constants.size() - 1);
     }
@@ -242,14 +242,14 @@ void Scheduler::emit_value(NodeId id) noexcept {
             // module pool; Bool/None literals carry tag-only payloads.
             bool is_pool_string = n.aux0 != 0xFFFF'FFFF && n.aux1 != 0xFFFF'FFFF &&
                                   n.symbol == 0xFFFF'FFFF &&
-                                  n.const_value.tag == Tag::None;
+                                  n.const_value.tag() == Tag::None;
             if (n.symbol != 0xFFFF'FFFF && n.symbol != 0) {
                 i.imm = symbol_const(n.symbol);
-            } else if (n.const_value.tag == Tag::Obj) {
+            } else if (n.const_value.tag() == Tag::Obj) {
                 i.imm = add_constant(n.const_value);
-            } else if (n.const_value.tag == Tag::Bool) {
+            } else if (n.const_value.tag() == Tag::Bool) {
                 i.imm = add_constant(n.const_value);
-            } else if (n.const_value.tag == Tag::None && !is_pool_string) {
+            } else if (n.const_value.tag() == Tag::None && !is_pool_string) {
                 i.imm = add_constant(n.const_value);
             } else {
                 std::string_view text(pool_.data() + n.aux0, n.aux1);

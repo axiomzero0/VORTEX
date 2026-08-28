@@ -403,6 +403,18 @@ public:
     // --- NOP (90) — safepoint placeholder ------------------------------------------------------
     [[nodiscard]] bool nop() noexcept { return emit8(0x90); }
 
+    // --- SHR r64, imm8 (48 C1 E8 ib) — logical shift right by immediate -----------------
+    // Used by NaN-boxed tag extraction: shr rax, 48 isolates the top 16 bits.
+    [[nodiscard]] bool shr_r64_imm8(std::uint8_t reg, std::uint8_t count) noexcept {
+        if (reg >= 8) { if (!emit8(0x49)) return false; }
+        else { if (!emit8(0x48)) return false; }
+        if (!emit8(0xC1)) return false;
+        if (!emit8(0xE8 | (reg & 7))) return false;   // /5 = SHR
+        return emit8(count);
+    }
+
+    // --- MOV r64, r64 (48 89 /r) — already exists as mov_r64_r64 --------------------
+
     // --- JMP rax (FF E0) — indirect tail-call through a register -----------------------------
     [[nodiscard]] bool jmp_rax_placeholder() noexcept {
         if (!emit8(0xFF)) return false;

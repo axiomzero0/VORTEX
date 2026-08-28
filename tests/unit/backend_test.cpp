@@ -646,8 +646,8 @@ TEST(jit_executes_int_arithmetic_correctly) {
 
     // Result must be Value::integer(42): the JIT added 1 to 41 via the
     // native ADDrr path and returned via RET.
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 42);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 42);
 
     // Cleanup. The regs array's param 0 still owns the integer (Tag::Int
     // is unboxed — no refcount); the result Value is also unboxed. No
@@ -688,8 +688,8 @@ TEST(jit_matches_tier0_for_int_arithmetic) {
     vm.exec_frame(f);
     Value tier0_result = vm.frame_return_;
     vm.frame_return_ = Value::none();
-    CHECK(tier0_result.tag == Tag::Int);
-    CHECK_EQ(tier0_result.as.i, 42);
+    CHECK(tier0_result.tag() == Tag::Int);
+    CHECK_EQ(tier0_result.as_i(), 42);
 
     // Reset VM state before running the JIT — the bridge/deopt path uses
     // active_vm() and the program.units array. The JIT test below uses
@@ -726,8 +726,8 @@ TEST(jit_matches_tier0_for_int_arithmetic) {
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value jit_result = entry(regs);
 
-    CHECK(jit_result.tag == Tag::Int);
-    CHECK_EQ(jit_result.as.i, tier0_result.as.i);
+    CHECK(jit_result.tag() == Tag::Int);
+    CHECK_EQ(jit_result.as_i(), tier0_result.as_i());
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -753,7 +753,7 @@ TEST(p45_folds_const_str_concat_into_one_constpy) {
 
     NodeId a = g.create(NodeKind::ConstPy);
     Node& an = g.node(a);
-    an.const_value.tag = Tag::None;
+    an.const_value = Value::none();
     an.aux0 = 0;            // offset
     an.aux1 = 3;            // length
     an.symbol = 0xFFFF'FFFF;
@@ -761,7 +761,7 @@ TEST(p45_folds_const_str_concat_into_one_constpy) {
 
     NodeId b = g.create(NodeKind::ConstPy);
     Node& bn = g.node(b);
-    bn.const_value.tag = Tag::None;
+    bn.const_value = Value::none();
     bn.aux0 = 3;
     bn.aux1 = 3;
     bn.symbol = 0xFFFF'FFFF;
@@ -797,11 +797,11 @@ TEST(p45_folds_const_str_concat_into_one_constpy) {
     g.for_each_live([&](NodeId id) {
         const Node& n = g.node(id);
         if (n.kind != NodeKind::ConstPy) return;
-        if (n.const_value.tag != Tag::Obj) return;
+        if (n.const_value.tag() != Tag::Obj) return;
         // The folded value must be a PyStrObj with view == "abcdef".
-        if (n.const_value.as.obj == nullptr) return;
-        if (n.const_value.as.obj->tag != vortex::rt::ObjTag::Str) return;
-        auto* s = static_cast<vortex::rt::PyStrObj*>(n.const_value.as.obj);
+        if (n.const_value.as_obj() == nullptr) return;
+        if (n.const_value.as_obj()->tag != vortex::rt::ObjTag::Str) return;
+        auto* s = static_cast<vortex::rt::PyStrObj*>(n.const_value.as_obj());
         std::string_view sv(s->data(), s->length);
         if (sv == std::string_view("abcdef")) found_folded = true;
     });
@@ -865,8 +865,8 @@ TEST(p54_peephole_fires_on_int_plus_const) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 42);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 42);
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -928,8 +928,8 @@ TEST(p54_peephole_skips_imm_outside_int32_range) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 1 + kBigConst);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 1 + kBigConst);
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -981,8 +981,8 @@ TEST(p54_peephole_sub_const_pattern) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 95);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 95);
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1068,8 +1068,8 @@ TEST(p54_gpr_cache_fires_on_chained_add) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 13);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 13);
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1128,8 +1128,8 @@ TEST(p54_gpr_cache_preserves_correctness_single_block) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 42);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 42);
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1233,8 +1233,8 @@ TEST(p54_v2_self_mov_elimination_counter_wired_and_correctness) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 13);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 13);
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1327,8 +1327,8 @@ TEST(p54_v2_self_mov_elimination_preserves_sibling_cache_entries) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 23);
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 23);
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1421,8 +1421,8 @@ TEST(p52_lowering_if_both_arms_return_truthy_path) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 6);   // 5 + 1 = 6 (true arm)
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 6);   // 5 + 1 = 6 (true arm)
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1485,8 +1485,8 @@ TEST(p52_lowering_if_both_arms_return_falsy_path) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 0);   // false arm returns 0
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 0);   // false arm returns 0
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1543,8 +1543,8 @@ TEST(p52_lowering_single_block_graph_unchanged_by_postorder_fix) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 42);   // 41 + 1 = 42
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 42);   // 41 + 1 = 42
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1623,14 +1623,14 @@ TEST(p52_lowering_parser_produced_if_both_arms_return) {
 
     auto entry = reinterpret_cast<JitEntryFn>(code_buf);
     Value result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 5);   // true arm returns the constant 5
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 5);   // true arm returns the constant 5
 
     // Falsy input: p=0 → false arm → return 0.
     for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::integer(0);
     result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 0);   // false arm returns 0
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 0);   // false arm returns 0
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1729,14 +1729,14 @@ TEST(p52_lowering_guard_int_lives_in_correct_arm_for_if) {
     // Under the buggy lowering, execution fell into the true arm,
     // the GUARD_INT fired (and passed, since p is int), and the result
     // was 0+1=1.
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 0);   // false arm; guard never fires
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 0);   // false arm; guard never fires
 
     // Truthy input: p=5 → true arm → guard passes → 5+1=6.
     regs[2] = Value::integer(5);
     result = entry(regs);
-    CHECK(result.tag == Tag::Int);
-    CHECK_EQ(result.as.i, 6);   // true arm; guard passes; returns p+1
+    CHECK(result.tag() == Tag::Int);
+    CHECK_EQ(result.as_i(), 6);   // true arm; guard passes; returns p+1
 
     std::free(regs);
     free_exec_buffer(code_buf, kCodeCap);
@@ -1831,11 +1831,11 @@ TEST(p54_v3_xmm_cache_fires_on_chained_float_add) {
     // Result must be 1.5 + 2.5 + 3.0 = 7.0. A wrong cache would
     // diverge here. Tag::Float pins that the FP fast path produced
     // the result (not the interpreter bridge).
-    CHECK(result.tag == Tag::Float);
-    if (result.tag == Tag::Float) {
+    CHECK(result.tag() == Tag::Float);
+    if (result.tag() == Tag::Float) {
         // 1.5, 2.5, 3.0, 7.0 are all exactly representable in IEEE 754
         // binary64 (no rounding). So the result should be bit-exact 7.0.
-        CHECK_EQ(result.as.f, 7.0);
+        CHECK_EQ(result.as_f(), 7.0);
     }
 
     std::free(regs);
@@ -1928,9 +1928,9 @@ TEST(p54_v3_xmm_cache_preserves_sibling_entries_across_self_mov_elim) {
     Value result = entry(regs);
 
     // 1.0+2.0=3.0, +3.0=6.0, +4.0=10.0. All exactly representable.
-    CHECK(result.tag == Tag::Float);
-    if (result.tag == Tag::Float) {
-        CHECK_EQ(result.as.f, 10.0);
+    CHECK(result.tag() == Tag::Float);
+    if (result.tag() == Tag::Float) {
+        CHECK_EQ(result.as_f(), 10.0);
     }
 
     std::free(regs);

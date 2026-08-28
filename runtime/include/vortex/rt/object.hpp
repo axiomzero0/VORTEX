@@ -360,7 +360,7 @@ private:
 };
 
 // --- free helpers (hot path, inline) ---------------------------------------------
-[[nodiscard]] inline PyObj* as_obj(const Value& v) noexcept { return v.tag == Tag::Obj ? v.as.obj : nullptr; }
+[[nodiscard]] inline PyObj* as_obj(const Value& v) noexcept { return v.tag() == Tag::Obj ? v.as_obj() : nullptr; }
 
 template <typename T>
 [[nodiscard]] inline T* obj_cast(PyObj* o) noexcept {

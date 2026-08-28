@@ -44,7 +44,7 @@ struct IV {
             if (step.ins[2] != id) return;   // x = phi + k form
             const Node& k = g.node(step.ins[3]);
             if (k.kind != NodeKind::ConstInt) return;
-            out.push_back(IV{id, base.const_value.as.i, k.const_value.as.i});
+            out.push_back(IV{id, base.const_value.as_i(), k.const_value.as_i()});
         });
     }
     return !out.empty();

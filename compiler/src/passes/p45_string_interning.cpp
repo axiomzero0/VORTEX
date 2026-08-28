@@ -31,7 +31,7 @@ using namespace vortex::ir;
 namespace {
 
 [[nodiscard]] bool is_const_str(const Node& n) noexcept {
-    return n.kind == NodeKind::ConstPy && n.const_value.tag == Tag::None &&
+    return n.kind == NodeKind::ConstPy && n.const_value.tag() == Tag::None &&
            n.aux0 != 0xFFFF'FFFF && n.aux1 != 0xFFFF'FFFF &&
            n.symbol == 0xFFFF'FFFF;
 }
@@ -91,7 +91,7 @@ Result<PassResult> P45_StringInterning::run(Graph& g, const PassContext& c) noex
         for (char ch : sb) joined.push_back(ch);
 
         // Allocate the interned PyStrObj via the runtime. The runtime
-        // owns the allocation; the const_value.as.obj pointer holds a
+        // owns the allocation; the const_value.as_obj() pointer holds a
         // borrowed ref. The scheduler's add_constant increfs on insert,
         // so the obj's lifetime extends to the CodeUnit's constants
         // table.

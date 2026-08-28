@@ -89,7 +89,7 @@ public:
 
     [[nodiscard]] Value pending_exception() const noexcept { return pending_exception_; }
     [[nodiscard]] bool has_pending() const noexcept {
-        return pending_exception_.tag == Tag::Obj && pending_exception_.as.obj != nullptr;
+        return pending_exception_.tag() == Tag::Obj && pending_exception_.as_obj() != nullptr;
     }
 
     /// Raise a builtin exception by type (sets pending).

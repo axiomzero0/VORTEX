@@ -58,7 +58,7 @@ passes::PassContext make_tier2_ctx() {
 
     auto mk_const_str = [&](std::uint32_t sym) {
         NodeId c = g.create(NodeKind::ConstPy);
-        g.node(c).const_value.tag = Tag::None;
+        g.node(c).const_value = Value::none();
         g.node(c).symbol = sym;
         g.node(c).set_flag(NodeFlag::Pure);
         return c;
@@ -120,7 +120,7 @@ passes::PassContext make_tier2_ctx() {
 
     auto mk_const_str = [&](std::uint32_t sym) {
         NodeId c = g.create(NodeKind::ConstPy);
-        g.node(c).const_value.tag = Tag::None;
+        g.node(c).const_value = Value::none();
         g.node(c).symbol = sym;
         g.node(c).set_flag(NodeFlag::Pure);
         return c;
@@ -260,7 +260,7 @@ TEST(p46_d2s_declines_on_single_key_dict) {
     g.node(d).set_flag(NodeFlag::OnEffectChain);
 
     NodeId key = g.create(NodeKind::ConstPy);
-    g.node(key).const_value.tag = Tag::None;
+    g.node(key).const_value = Value::none();
     g.node(key).symbol = 100;
     g.node(key).set_flag(NodeFlag::Pure);
     NodeId val = g.create(NodeKind::ConstInt);

@@ -56,7 +56,7 @@ Result<PassResult> P41_ObjectInlining::run(Graph& g, const PassContext& c) noexc
         const Node& idx = g.node(n.ins[3]);
         if (idx.kind != NodeKind::ConstInt) return;
         std::uint64_t key = (std::uint64_t(base) << 32) |
-                            static_cast<std::uint32_t>(idx.const_value.as.i);
+                            static_cast<std::uint32_t>(idx.const_value.as_i());
         if (const NodeId* val = elem.get(key)) {
             g.replace_all_uses(id, *val);
             g.kill(id);

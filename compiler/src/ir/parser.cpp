@@ -303,13 +303,14 @@ Result<void> parse_graph(std::string_view text, Graph& g) noexcept {
                         if (!parse_uint_tok(p.substr(4), t)) {
                             return fail(syntax_error(line_no + 1, p, "tag int"));
                         }
-                        pn.const_value.tag = static_cast<Tag>(t);
+                        // NaN-boxed Value: set tag + zero payload
+                        pn.const_value = Value::from_raw(static_cast<std::uint64_t>(t) << 48);
                     } else if (p.starts_with("i=")) {
                         std::int64_t v = 0;
                         if (!parse_int_tok(p.substr(2), v)) {
                             return fail(syntax_error(line_no + 1, p, "int64"));
                         }
-                        pn.const_value.as.i = v;
+                        pn.const_value = Value::integer(v);
                     }
                     break;
                 }
