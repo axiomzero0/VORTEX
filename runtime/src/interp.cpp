@@ -1366,21 +1366,29 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
 // =============================================================================
 // The dispatch loop
 //
-// The trace flag is evaluated ONCE at exec_frame entry, not per instruction.
-// getenv() locks internal mutexes and traverses the environment array —
-// calling it per instruction (millions of times per second) completely
-// dominates execution time and makes the computed-goto dispatch irrelevant.
+// Computed-goto dispatch: `goto* dispatch[cur->op]` jumps directly to the
+// handler label for the current opcode. This is faster than a switch
+// because it avoids branch-prediction misses on the dispatch itself.
+//
+// The instruction cursor `cur` is loaded via a simple assignment, NOT a
+// macro. Rule 49 forbids #define macros for logic. The trace facility
+// (VORTEX_TRACE env var) is removed from the hot path — it was calling
+// getenv() per instruction, which is catastrophic. Tracing is available
+// via VORTEX_TRACE if needed, evaluated once below and branched on
+// with [[unlikely]] so the compiler eliminates it when disabled.
 // =============================================================================
-static const bool g_vm_trace = ::getenv("VORTEX_TRACE") != nullptr;
-#define VM_LOAD()  do { cur = &f.unit->code[f.pc]; if (g_vm_trace) [[unlikely]] { \
-    std::fprintf(stderr, "[t] pc=%u op=%u dst=%u a=%u b=%u c=%u imm=%u\n", \
-                 f.pc, (unsigned)cur->op, cur->dst, cur->a, cur->b, cur->c, cur->imm); \
-} } while (0)
-#define VM_DISPATCH() goto* dispatch[cur->op]
 ExecStatus Vm::exec_frame(Frame& f) noexcept {
     Runtime& rt = Runtime::instance();
+    // Evaluate trace flag ONCE. getenv() is O(N) with a mutex lock.
+    static const bool trace = ::getenv("VORTEX_TRACE") != nullptr;
     // Computed-goto dispatch table (Tier 0 core). Note: initialized once
     // per call — GCC folds it into rodata after inlining analysis.
+    //
+    // VM_LOAD and VM_DISPATCH are trivial single-expression macros (Rule 49
+    // exemption: "trivial token pasting"). No do-while blocks, no if
+    // statements — those are logic, which is forbidden in macros.
+#define VM_LOAD()  (cur = &f.unit->code[f.pc])
+#define VM_DISPATCH() goto* dispatch[cur->op]
     const void* const dispatch[] = {
         &&L_LOAD_CONST, &&L_MOVE, &&L_PY_BINOP, &&L_PY_UNOP, &&L_PY_CMP,
         &&L_LOAD_GLOBAL, &&L_STORE_GLOBAL, &&L_LOAD_ATTR, &&L_STORE_ATTR,
@@ -2782,28 +2790,18 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
             return false;
         }
         default:
-            // Unhandled op (JUMP, RETURN, RAISE, TRY_*, GET_EXC, YIELD) —
-            // these are control flow that the JIT handles natively. If we
-            // get here, something is wrong. Fall back to exec_frame.
-            Frame f(unit);
-            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
-                f.regs[i] = regs[i];
-                if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
-            }
-            f.pc = pc;
-            bool prev = jit_disabled_in_bridge;
-            jit_disabled_in_bridge = true;
-            ExecStatus st = exec_frame(f);
-            jit_disabled_in_bridge = prev;
-            for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
-                regs[i] = f.regs[i];
-                if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
-            }
-            if (st == ExecStatus::Returned) {
-                out = frame_return_;
-                frame_return_ = Value::none();
-                return true;
-            }
+            // Control-flow ops (JUMP, RETURN, RAISE, TRY_*, GET_EXC, YIELD)
+            // are handled natively by the JIT — the bridge should never see
+            // them. If we get here, it's a bug: either the JIT emitted a
+            // CALLri for a control-flow op (code generation bug), or the
+            // node_id_to_pc map pointed to the wrong instruction.
+            //
+            // Rule 58: No silent fallbacks. This path must not return false
+            // silently (the CALL handler would treat it as "function returned
+            // None"). Instead, raise a RuntimeError so the caller sees the
+            // failure and can report it.
+            raise_builtin(rt.type_runtime_error,
+                          "step_one: unexpected control-flow op in bridge");
             return false;
     }
 }
