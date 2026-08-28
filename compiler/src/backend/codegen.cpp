@@ -835,19 +835,29 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     break;
                 }
                 case MOp::JMP: {
-                    // Task 24 (candidate j): unconditional JMP emitted by
-                    // the lowering at backedge sites (loop body → loop
-                    // header) and forward-jump sites (if-true arm → merge
-                    // over the if-false arm). The target is the SOLE
-                    // successor in the MIR block's succs vector.
-                    std::size_t site = a.jmp_rel32();
+                    // Rule 88: Safepoint poll at loop backedges.
+                    // A backedge is a JMP to a block with ID <= current
+                    // (i.e., jumping backward to a loop header). The
+                    // runtime's g_safepoint_requested flag is checked;
+                    // if set, vortex_safepoint_poll() is called.
+                    //
+                    // TODO: emit the actual poll instructions once the
+                    // assembler has the needed byte-emission helpers.
+                    // For now, the infrastructure (g_safepoint_requested +
+                    // vortex_safepoint_poll) is in place; the codegen
+                    // will emit: movzx eax, [g_safepoint_requested];
+                    // test eax, eax; jnz poll; ... poll: call poll_fn.
                     const auto& succs = lowered.mir.blocks[block_id].succs;
+                    bool is_backedge = !succs.empty() && succs[0] <= block_id;
+                    if (is_backedge) {
+                        // Emit a NOP as a placeholder for the safepoint poll.
+                        // The real poll will be ~6 bytes: movzx + test + jnz + call.
+                        a.nop();
+                    }
+                    std::size_t site = a.jmp_rel32();
                     if (!succs.empty()) {
                         patches.push_back(PatchSite{site, succs[0], /*is_jmp=*/true});
                     } else {
-                        // No successor recorded: patch to past_cold as a
-                        // safe fallback. Should not happen (a JMP without
-                        // a target is a malformed block), but defensive.
                         patches.push_back(PatchSite{site, 0xFFFFFFFFu, /*is_jmp=*/true});
                     }
                     break;

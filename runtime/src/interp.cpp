@@ -2835,5 +2835,29 @@ bool Vm::enter_at(CodeUnit* unit, Value* regs, std::uint32_t n_regs, std::uint32
     }
     return false;
 }
+
+// =============================================================================
+// Rule 88: Safepoint polling infrastructure.
+//
+// Currently single-threaded: g_safepoint_requested is a plain bool, and
+// request_safepoint() immediately calls vortex_safepoint_poll() which clears
+// it. When multi-threading is added, this becomes atomic with relaxed loads
+// in the JIT poll and a release store when requesting.
+// =============================================================================
+
+bool g_safepoint_requested{false};
+
+void request_safepoint() noexcept {
+    g_safepoint_requested = true;
+    // Single-threaded: immediately process the safepoint.
+    vortex_safepoint_poll();
+}
+
+void vortex_safepoint_poll() noexcept {
+    // Single-threaded: just clear the flag. When multi-threaded, this
+    // will block until the runtime releases the thread.
+    g_safepoint_requested = false;
+}
+
 }  // namespace abi_v1
 }  // namespace vortex::rt

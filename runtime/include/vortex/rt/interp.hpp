@@ -153,5 +153,34 @@ void set_vm_for_builtins(Vm* vm) noexcept;
 /// Load a native module by name (math / time / random); null if unknown.
 [[nodiscard]] PyModuleObj* load_native_module(std::uint32_t name_symbol) noexcept;
 
+// -----------------------------------------------------------------------------
+// Rule 88: Safepoint polling infrastructure.
+//
+// JIT code polls a global flag at every loop backedge. When the runtime needs
+// all threads to pause (for GC, deopt, or suspension), it sets the flag.
+// The JIT's poll reads the flag; if set, it calls vortex_safepoint_poll()
+// which blocks until the runtime clears the flag.
+//
+// The flag is a plain bool (not atomic) because VORTEX is currently
+// single-threaded. When multi-threading is added, this becomes
+// std::atomic<bool> with relaxed loads in the JIT and a release store
+// when requesting a safepoint.
+// -----------------------------------------------------------------------------
+
+/// The global safepoint flag. JIT code reads this at every loop backedge.
+/// When true, the JIT calls vortex_safepoint_poll() to pause.
+extern bool g_safepoint_requested;
+
+/// Request all JIT'd threads to pause at their next safepoint poll.
+/// Currently a no-op (single-threaded) — sets the flag, calls the poll
+/// immediately, then clears. When multi-threaded, this will signal
+/// other threads and wait for them to reach a safepoint.
+void request_safepoint() noexcept;
+
+/// Called by JIT code when g_safepoint_requested is true. Currently a
+/// no-op (single-threaded) — just clears the flag. When multi-threaded,
+/// this will block until the runtime releases the thread.
+void vortex_safepoint_poll() noexcept;
+
 }  // namespace abi_v1
 }  // namespace vortex::rt
