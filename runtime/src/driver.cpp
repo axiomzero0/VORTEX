@@ -189,7 +189,9 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
         // The IR graph (lowered.graph) is alive for the duration of
         // this loop iteration; compile_unit takes a const ref so it
         // can be safely borrowed here.
-        if (!lowered.is_generator) {
+        // Rule 132: Kill switch — disable_jit forces Tier-0 only.
+        // Useful for bisection when a JIT bug is suspected.
+        if (!lowered.is_generator && !options.disable_jit) {
             constexpr std::size_t kJitCodeCapacity = 64 * 1024;  // 64 KB per unit
             std::byte* jit_buf = make_jit_buffer(kJitCodeCapacity);
             if (jit_buf) {

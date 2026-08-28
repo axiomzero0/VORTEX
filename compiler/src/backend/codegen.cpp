@@ -26,6 +26,18 @@
 //            into interpreter resume)
 //   exit:    result Value in rax (tag word) + rdx (payload); restore pops.
 //
+// GC REFERENCE TRACKING (Rule 86):
+//   The backend does NOT emit GC reference maps for safepoints. This is
+//   safe ONLY because VORTEX uses reference counting (non-moving GC):
+//   all object pointers live in the Tier-0 home-slot register file,
+//   which is always visible to the runtime. The JIT caches GPR values
+//   in physical registers, but every value is also written back to its
+//   home slot before any safepoint (CALLri). If a moving GC is ever
+//   added, this MUST be fixed: add is_gc_ref to MachineNode, a reference
+//   bitset to SafepointRecord, and propagate is_pyobject from the
+//   register allocator into the codegen. The infrastructure exists
+//   (LiveInterval::is_pyobject) but is currently unused.
+//
 // HOT/COLD PARTITIONING (Pass 55 — REAL, not faked):
 //   1. Emit hot body: prologue + per-block hot ops + JMP past_cold at the
 //      last hot block.

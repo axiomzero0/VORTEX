@@ -22,10 +22,29 @@ inline namespace abi_v1 {
 /// (the polyhedral analysis is linear in N for bounded D, but non-
 /// trivial in absolute terms on hot-loop-heavy code).
 struct CompileOptions {
-    /// Pass 33 (polyhedral loop transforms). DEFAULT-ON. Maps to
-    /// OptOption::DisablePolyhedral when set. The only legitimate
+    /// Pass 33 (polyhedral loop transforms). DEFAULT-ON. The only legitimate
     /// reason to set this is compilation-time sensitivity.
     bool disable_polyhedral{false};
+
+    /// Rule 132: Every major optimization must have a kill switch.
+    /// These flags enable bisection and emergency response (Rule 132).
+
+    /// Disable JIT compilation entirely — all functions run Tier-0 only.
+    /// Useful for bisection when a JIT bug is suspected.
+    bool disable_jit{false};
+
+    /// Disable inline cache (IC) devirtualization (Pass 16 + 16b).
+    /// Functions still JIT, but call sites use generic dispatch.
+    bool disable_ic_devirt{false};
+
+    /// Disable SLP vectorization (Pass 31).
+    bool disable_slp{false};
+
+    /// Disable dict-to-struct specialization (Pass 46).
+    bool disable_d2s{false};
+
+    /// Disable box/unbox elimination (Pass 47).
+    bool disable_unboxing{false};
 };
 
 struct CompileOutcome {
