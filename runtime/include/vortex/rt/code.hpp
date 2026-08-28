@@ -193,6 +193,14 @@ struct Frame {
     Value* regs{nullptr};             // owned refs, n_registers slots
     std::uint32_t n_regs{0};
 
+    // Inline register buffer for small functions (Rule 19: SBO). Most
+    // Python functions have ≤32 live registers — the inline buffer avoids
+    // a malloc/free pair per call. This is the single biggest Tier-0
+    // perf win for call-heavy code (fib_recursion was 44x slower than
+    // CPython; the malloc per Frame was the dominant cost).
+    static constexpr std::uint32_t kInlineRegs = 32;
+    Value inline_regs[kInlineRegs]{};
+
     // exception handler stack (sp + ranges)
     struct Handler {
         std::uint32_t try_pc_start{0};
@@ -207,19 +215,16 @@ struct Frame {
 
     explicit Frame(CodeUnit* u) noexcept : unit(u) {
         n_regs = u ? u->n_registers : 0;
-        // TTC-17 fix: malloc can return nullptr under memory pressure.
-        // We used to write `for (i=0; i<n_regs; ++i) regs[i] = ...` unconditionally —
-        // a null regs dereferences, segfaults the whole VM, and the failure
-        // mode is opaque. Mark the frame as "no regs" so the destructor skips
-        // the decref loop and future dispatch can either raise an OOM-style
-        // Python exception or, lacking one, raise a clean fatal diagnostic.
-        const std::size_t bytes = sizeof(Value) * (n_regs ? n_regs : 1);
+        // Fast path: small frames use the inline buffer (no malloc).
+        if (n_regs <= kInlineRegs) {
+            regs = inline_regs;
+            for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+            return;
+        }
+        // Slow path: large frames spill to heap.
+        const std::size_t bytes = sizeof(Value) * n_regs;
         regs = static_cast<Value*>(std::malloc(bytes));
         if (!regs) [[unlikely]] {
-            // OOM. The destructor checks regs before iterating; the
-            // interpreter checks `unit != nullptr && regs != nullptr`
-            // before running. Print a hard diagnostic (Rule 47) — we
-            // cannot raise a Python-level MemoryError without a frame.
             std::fprintf(stderr,
                          "VORTEX FATAL: Frame allocation of %zu bytes failed "
                          "(resource exhaustion — see docs/adr/0007-resource-policy.md)\n",
@@ -237,7 +242,8 @@ struct Frame {
         if (current_exception.tag == Tag::Obj && current_exception.as.obj) {
             rt.decref(current_exception.as.obj);
         }
-        std::free(regs);
+        // Only free if we spilled to heap (regs != inline_regs).
+        if (regs && regs != inline_regs) std::free(regs);
     }
     Frame(const Frame&) = delete;
     Frame& operator=(const Frame&) = delete;
