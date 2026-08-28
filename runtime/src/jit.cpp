@@ -37,19 +37,22 @@ inline namespace abi_v1 {
 extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id,
                                            std::uint64_t op_hint) noexcept {
     using namespace vortex::rt;
+    // Rule 120: Compiler bugs must not crash user programs. All error paths
+    // here return none() (triggering Tier-0 fallback) instead of aborting.
     CodeUnit* unit = find_unit(unit_id);
     if (!unit) {
-        std::fputs("VORTEX jit bridge: unknown unit id\n", stderr);
-        std::abort();
+        std::fprintf(stderr, "VORTEX jit bridge: unknown unit id %u — falling back to Tier-0\n",
+                     unit_id);
+        return vortex::Value::none();
     }
     Vm* vm = active_vm();
     if (!vm) {
-        std::fputs("VORTEX jit bridge: no active VM\n", stderr);
-        std::abort();
+        std::fputs("VORTEX jit bridge: no active VM — falling back\n", stderr);
+        return vortex::Value::none();
     }
     if (!regs_raw) {
-        std::fputs("VORTEX jit bridge: null regs\n", stderr);
-        std::abort();
+        std::fputs("VORTEX jit bridge: null regs — falling back\n", stderr);
+        return vortex::Value::none();
     }
 
     Value* regs = static_cast<Value*>(regs_raw);

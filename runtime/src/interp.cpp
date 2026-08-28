@@ -1401,14 +1401,20 @@ ExecStatus Vm::exec_frame(Frame& f) noexcept {
     Value* const regs = f.regs;
     auto chk_reg = [&](std::uint32_t r, const char* what) noexcept {
         if (r >= f.n_regs) [[unlikely]] {
-            std::fprintf(stderr, "VORTEX FATAL: %s reg %u >= %u (unit %s pc %u)\n", what, r,
-                         f.n_regs,
+            // Rule 120: Don't crash on register out-of-bounds — raise
+            // a Python RuntimeError instead. This is a compiler bug
+            // (the scheduler should guarantee valid regs), but the user
+            // program should not crash.
+            std::fprintf(stderr, "VORTEX: %s reg %u >= %u (unit %s pc %u) — raising RuntimeError\n",
+                         what, r, f.n_regs,
                          f.unit->name != 0xFFFFFFFFu
                              ? global_symbols().text(f.unit->name).data()
                              : "?",
                          f.pc);
-            std::abort();
+            raise_builtin(rt.type_runtime_error, "register out of bounds (compiler bug)");
+            return false;
         }
+        return true;
     };
     // [watchdog] detect the dict-count corruption at instruction granularity
     const Instr* cur = &f.unit->code[0];   // single rebinding instruction cursor

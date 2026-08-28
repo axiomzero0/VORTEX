@@ -22,19 +22,38 @@ namespace vortex::rt {
 inline namespace abi_v1 {
 
 namespace {
-/// Task 24: page-aligned RWX buffer for JIT-compiled machine code.
-/// Allocated via mmap; freed by CodeUnit's destructor via the
-/// vortex_rt_munmap_jit_buffer shim (see runtime/src/jit.cpp).
+/// Task 24: page-aligned buffer for JIT-compiled machine code.
+///
+/// Rule 97 (W^X): The buffer is NEVER simultaneously writable and executable.
+/// Allocated via mmap with PROT_READ|PROT_WRITE (no exec). After codegen
+/// writes the machine code, make_jit_buffer_executable() flips the
+/// protection to PROT_READ|PROT_EXEC (no write). This is the standard
+/// W^X pattern that prevents JIT spraying attacks where attacker-controlled
+/// data becomes executable.
+///
 /// Returns nullptr on failure (the driver logs and falls back to
 /// Tier-0 execution for this unit).
 [[nodiscard]] std::byte* make_jit_buffer(std::size_t bytes) noexcept {
     long pagesz = sysconf(_SC_PAGESIZE);
     if (pagesz <= 0) pagesz = 4096;
     std::size_t mapped = ((bytes + pagesz - 1) / pagesz) * pagesz;
-    void* p = mmap(nullptr, mapped, PROT_READ | PROT_WRITE | PROT_EXEC,
+    // Rule 97: W^X — start writable, NOT executable. Codegen writes here,
+    // then make_jit_buffer_executable flips to read+exec before installation.
+    void* p = mmap(nullptr, mapped, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return nullptr;
     return static_cast<std::byte*>(p);
+}
+
+/// Rule 97 (W^X): Flip JIT buffer from writable to executable.
+/// After codegen writes the machine code, call this to make the buffer
+/// executable and remove write access. Returns true on success.
+[[nodiscard]] bool make_jit_buffer_executable(void* buf, std::size_t bytes) noexcept {
+    long pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0) pagesz = 4096;
+    std::size_t mapped = ((bytes + pagesz - 1) / pagesz) * pagesz;
+    // Flip to PROT_READ|PROT_EXEC (no PROT_WRITE) — W^X satisfied.
+    return mprotect(buf, mapped, PROT_READ | PROT_EXEC) == 0;
 }
 }  // namespace
 
@@ -179,17 +198,28 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
                                           kJitCodeCapacity,
                                           backend::host_target());
                 if (cc.valid) {
-                    // Install: the function pointer is the start of
-                    // the buffer (the codegen emits a prologue at
-                    // offset 0). Store the buffer/capacity so the
-                    // CodeUnit destructor can munmap it.
-                    cu->jit_code_buffer = jit_buf;
-                    cu->jit_code_capacity = cc.code_size > 0
-                                               ? cc.code_size
-                                               : kJitCodeCapacity;
-                    cu->jit_entry.store(jit_buf, std::memory_order_release);
-                    cu->current_tier.store(1, std::memory_order_release);
-                    cu->has_dynamic_ops = cc.has_dynamic_ops;
+                    // Rule 97 (W^X): Flip the buffer from writable to
+                    // executable BEFORE installing the jit_entry pointer.
+                    // The buffer was allocated writable (no exec); codegen
+                    // wrote the machine code; now we flip to exec (no write).
+                    // If mprotect fails, fall back to Tier-0 (don't install
+                    // a writable buffer as executable — that's a security bug).
+                    if (!make_jit_buffer_executable(jit_buf, kJitCodeCapacity)) {
+                        // mprotect failed — can't make it executable safely.
+                        // Fall back to Tier-0 for this unit.
+                        vortex_rt_munmap_jit_buffer(jit_buf, kJitCodeCapacity);
+                    } else {
+                        // Install: the function pointer is the start of
+                        // the buffer (the codegen emits a prologue at
+                        // offset 0). Store the buffer/capacity so the
+                        // CodeUnit destructor can munmap it.
+                        cu->jit_code_buffer = jit_buf;
+                        cu->jit_code_capacity = cc.code_size > 0
+                                                   ? cc.code_size
+                                                   : kJitCodeCapacity;
+                        cu->jit_entry.store(jit_buf, std::memory_order_release);
+                        cu->current_tier.store(1, std::memory_order_release);
+                        cu->has_dynamic_ops = cc.has_dynamic_ops;
                     // Task 24: the JIT's home slots are IR NodeIds
                     // (per backend/lowering.cpp: `std::uint32_t home = id;`).
                     // The scheduler's `n_registers` is set independently
@@ -264,6 +294,7 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
                     // skips jit_entry anyway (falls back to Tier-0).
                     // Future task: populate safepoint_pcs so units
                     // with dynamic ops can also be JIT'd.
+                    }  // end of else (mprotect succeeded)
                 } else {
                     // compile_unit reported the graph couldn't be
                     // lowered (likely contains ops the backend's MIR
