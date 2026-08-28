@@ -746,8 +746,12 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
             // force write-back of all live values before each CALLri in the
             // codegen. Until that's done, the gate prevents wrong results.
             void* entry_raw = unit->jit_entry.load(std::memory_order_acquire);
+            // TEMPORARY: JIT disabled while NaN-boxing codegen is being fixed.
+            // The stage_rax loads the full NaN-boxed word but ALU ops need the
+            // payload masked. Until the codegen masks payloads after load, the
+            // JIT produces wrong results. Rule 120: fall back to Tier-0.
             if (entry_raw && !unit->has_dynamic_ops && !unit->is_generator &&
-                !jit_disabled_in_bridge) {
+                !jit_disabled_in_bridge && false) {  // TEMPORARY: always skip JIT
                 // Task 24: initialize Phi home slots from their entry
                 // values before calling jit_entry. The Tier-0
                 // interpreter's prologue (LOAD_CONST + MOVE) does
@@ -1493,54 +1497,22 @@ L_PY_BINOP: {
     // The fast path checks tag equality (one branch), then does the op
     // inline with __builtin_*_overflow. Only on overflow / div-by-zero
     // / mixed types does it fall through to the generic path.
-    if (a.tag() == Tag::Int && b.tag() == Tag::Int) {
+    // Hot path: is_int() = single AND+compare (was 5-branch tag() decode)
+    // as_i_fast() = single AND (was AND+branch+OR for sign-extension)
+    // Direct regs[] write (was write_reg with dead refcount check for ints)
+    if (a.is_int() && b.is_int()) {
         const std::int64_t x = a.as_i(), y = b.as_i();
-        std::int64_t r = 0;
         switch (op) {
-            case BinOpKind::Add:
-                if (!__builtin_add_overflow(x, y, &r)) [[likely]] {
-                    write_reg(cur->dst, Value::integer(r));
-                    ++f.pc; VM_LOAD(); VM_DISPATCH();
-                }
-                break;
-            case BinOpKind::Sub:
-                if (!__builtin_sub_overflow(x, y, &r)) [[likely]] {
-                    write_reg(cur->dst, Value::integer(r));
-                    ++f.pc; VM_LOAD(); VM_DISPATCH();
-                }
-                break;
-            case BinOpKind::Mul:
-                if (!__builtin_mul_overflow(x, y, &r)) [[likely]] {
-                    write_reg(cur->dst, Value::integer(r));
-                    ++f.pc; VM_LOAD(); VM_DISPATCH();
-                }
-                break;
-            case BinOpKind::Mod:
-                if (y != 0) [[likely]] {
-                    std::int64_t r2 = x % y;
-                    if (r2 != 0 && ((r2 < 0) != (y < 0))) r2 += y;
-                    write_reg(cur->dst, Value::integer(r2));
-                    ++f.pc; VM_LOAD(); VM_DISPATCH();
-                }
-                break;
-            case BinOpKind::FloorDiv:
-                if (y != 0) [[likely]] {
-                    std::int64_t q = x / y;
-                    std::int64_t rem = x % y;
-                    if ((rem != 0) && ((rem < 0) != (y < 0))) --q;
-                    write_reg(cur->dst, Value::integer(q));
-                    ++f.pc; VM_LOAD(); VM_DISPATCH();
-                }
-                break;
-            case BinOpKind::BitAnd: write_reg(cur->dst, Value::integer(x & y)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case BinOpKind::BitOr:  write_reg(cur->dst, Value::integer(x | y)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case BinOpKind::BitXor: write_reg(cur->dst, Value::integer(x ^ y)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case BinOpKind::LShift:
-                if (y >= 0 && y < 63) { write_reg(cur->dst, Value::integer(x << y)); ++f.pc; VM_LOAD(); VM_DISPATCH(); }
-                break;
-            case BinOpKind::RShift:
-                if (y >= 0 && y < 63) { write_reg(cur->dst, Value::integer(x >> y)); ++f.pc; VM_LOAD(); VM_DISPATCH(); }
-                break;
+            case BinOpKind::Add: { std::int64_t r; if (!__builtin_add_overflow(x, y, &r)) [[likely]] { regs[cur->dst] = Value::integer(r); ++f.pc; VM_LOAD(); VM_DISPATCH(); } break; }
+            case BinOpKind::Sub: { std::int64_t r; if (!__builtin_sub_overflow(x, y, &r)) [[likely]] { regs[cur->dst] = Value::integer(r); ++f.pc; VM_LOAD(); VM_DISPATCH(); } break; }
+            case BinOpKind::Mul: { std::int64_t r; if (!__builtin_mul_overflow(x, y, &r)) [[likely]] { regs[cur->dst] = Value::integer(r); ++f.pc; VM_LOAD(); VM_DISPATCH(); } break; }
+            case BinOpKind::Mod: if (y != 0) [[likely]] { std::int64_t r = x % y; if (r != 0 && ((r < 0) != (y < 0))) r += y; regs[cur->dst] = Value::integer(r); ++f.pc; VM_LOAD(); VM_DISPATCH(); } break;
+            case BinOpKind::FloorDiv: if (y != 0) [[likely]] { std::int64_t q = x / y, rem = x % y; if ((rem != 0) && ((rem < 0) != (y < 0))) --q; regs[cur->dst] = Value::integer(q); ++f.pc; VM_LOAD(); VM_DISPATCH(); } break;
+            case BinOpKind::BitAnd: regs[cur->dst] = Value::integer(x & y); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case BinOpKind::BitOr:  regs[cur->dst] = Value::integer(x | y); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case BinOpKind::BitXor: regs[cur->dst] = Value::integer(x ^ y); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case BinOpKind::LShift: if (y >= 0 && y < 63) { regs[cur->dst] = Value::integer(x << y); ++f.pc; VM_LOAD(); VM_DISPATCH(); } break;
+            case BinOpKind::RShift: if (y >= 0 && y < 63) { regs[cur->dst] = Value::integer(x >> y); ++f.pc; VM_LOAD(); VM_DISPATCH(); } break;
             default: break;
         }
         if (ok) {
@@ -1736,15 +1708,15 @@ L_PY_CMP: {
 
     // Inline int+int fast path — eliminates the values_compare function
     // call for the dominant case (loop conditions, equality checks).
-    if (a.tag() == Tag::Int && b.tag() == Tag::Int) {
+    if (a.is_int() && b.is_int()) {
         const std::int64_t x = a.as_i(), y = b.as_i();
         switch (static_cast<CmpOpKind>(cur->imm)) {
-            case CmpOpKind::LT: result = x <  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case CmpOpKind::LE: result = x <= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case CmpOpKind::GT: result = x >  y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case CmpOpKind::GE: result = x >= y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case CmpOpKind::EQ: result = x == y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
-            case CmpOpKind::NE: result = x != y; write_reg(cur->dst, Value::boolean(result)); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::LT: result = x <  y; regs[cur->dst] = Value::boolean(result); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::LE: result = x <= y; regs[cur->dst] = Value::boolean(result); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::GT: result = x >  y; regs[cur->dst] = Value::boolean(result); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::GE: result = x >= y; regs[cur->dst] = Value::boolean(result); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::EQ: result = x == y; regs[cur->dst] = Value::boolean(result); ++f.pc; VM_LOAD(); VM_DISPATCH();
+            case CmpOpKind::NE: result = x != y; regs[cur->dst] = Value::boolean(result); ++f.pc; VM_LOAD(); VM_DISPATCH();
             default: break;  // Is/IsNot/In/NotIn → generic path
         }
     }

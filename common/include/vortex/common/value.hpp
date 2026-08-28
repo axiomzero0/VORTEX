@@ -127,8 +127,26 @@ public:
         return Tag::None;  // shouldn't happen
     }
 
+    // --- Fast tag predicates (single AND + compare, no branch chain) ---
+    // These are the hot-path checks: `a.is_int()` replaces `a.tag() == Tag::Int`
+    // with a single mask+compare instead of the 5-branch tag() decode.
+    [[nodiscard]] constexpr bool is_int() const noexcept {
+        return (raw_ & kTagMask) == kTagInt;
+    }
+    [[nodiscard]] constexpr bool is_float() const noexcept {
+        return is_double_raw(raw_);
+    }
+    [[nodiscard]] constexpr bool is_obj() const noexcept {
+        return (raw_ & kTagMask) == kTagObj;
+    }
+    [[nodiscard]] constexpr bool is_none() const noexcept {
+        return raw_ == kTagNone;
+    }
+
     // --- Payload accessors ---
     /// Get int64 payload. Sign-extends from 48 bits.
+    /// For values known to be int (checked via is_int()), the sign-extension
+    /// is needed because Value::integer() only keeps the low 48 bits.
     [[nodiscard]] std::int64_t as_i() const noexcept {
         // Sign-extend from 48 bits: if bit 47 is set, fill bits 63-48 with 1s.
         std::uint64_t payload = raw_ & kPayloadMask;
@@ -136,6 +154,13 @@ public:
             payload |= kTagMask;  // set high bits
         }
         return static_cast<std::int64_t>(payload);
+    }
+
+    /// Fast int payload: no sign-extension (for values that fit in 47 bits,
+    /// which covers all loop counters and most arithmetic). Use this in hot
+    /// paths where the caller knows the value is a small int.
+    [[nodiscard]] constexpr std::int64_t as_i_fast() const noexcept {
+        return static_cast<std::int64_t>(raw_ & kPayloadMask);
     }
 
     /// Get double payload.
