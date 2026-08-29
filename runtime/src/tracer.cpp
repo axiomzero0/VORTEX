@@ -477,6 +477,18 @@ namespace x86_cond {
 
     TraceEmitter e{static_cast<std::byte*>(buf), kCodeCap};
 
+    // Giga Tracing (1.11): refuse to compile traces that contain
+    // unsupported ops. The dispatch loop marks the trace via
+    // record_unsupported_op() when it encounters an op that compile_trace
+    // can't handle (CALL, LIST_APPEND, LOAD_GLOBAL, etc.). Without this
+    // check, the trace would compile but SKIP the unsupported op —
+    // producing wrong results (e.g., list_build's xs.append(i) skipped,
+    // list only gets elements from the recording iteration).
+    if (trace.has_unsupported_op) {
+        munmap(buf, mapped);
+        return false;
+    }
+
     // Giga Tracing (1.8): if this trace's header_pc has accumulated
     // >1000 successful guard passes in the probabilistic profiler,
     // we elide the redundant B-tag guard on every instruction. The

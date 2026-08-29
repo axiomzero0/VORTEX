@@ -1704,6 +1704,7 @@ L_PY_BINOP: {
     VM_DISPATCH();
 }
 L_PY_UNOP: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value a = regs[cur->a];
     Value out;
     bool ok = false;
@@ -1792,6 +1793,7 @@ L_PY_CMP: {
     VM_DISPATCH();
 }
 L_LOAD_GLOBAL: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value v;
     RAISE_CHECK(get_global(cur->imm, v));
     write_reg_owned(cur->dst, v);
@@ -1800,6 +1802,7 @@ L_LOAD_GLOBAL: {
     VM_DISPATCH();
 }
 L_STORE_GLOBAL: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value v = regs[cur->a];
     PyStrObj* key = rt.new_str(global_symbols().text(cur->imm));
     RAISE_CHECK(dict_set(program.globals, Value::object(reinterpret_cast<PyObj*>(key)), v));
@@ -1809,6 +1812,7 @@ L_STORE_GLOBAL: {
     VM_DISPATCH();
 }
 L_LOAD_ATTR: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value out;
     RAISE_CHECK(get_attr(regs[cur->a], cur->imm, out));
     write_reg_owned(cur->dst, out);
@@ -1817,6 +1821,7 @@ L_LOAD_ATTR: {
     VM_DISPATCH();
 }
 L_STORE_ATTR: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value v = regs[cur->b];
     RAISE_CHECK(set_attr(regs[cur->a], cur->imm, v));
     ++f.pc;
@@ -1824,6 +1829,7 @@ L_STORE_ATTR: {
     VM_DISPATCH();
 }
 L_LOAD_INDEX: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value obj = regs[cur->a];
     Value idx = regs[cur->b];
     Value out;
@@ -1990,6 +1996,7 @@ L_LOAD_INDEX: {
     VM_DISPATCH();
 }
 L_STORE_INDEX: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value obj = regs[cur->a];
     Value idx = regs[cur->b];
     Value val = regs[cur->c];
@@ -2019,6 +2026,7 @@ L_STORE_INDEX: {
     VM_DISPATCH();
 }
 L_NEW_LIST: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     auto* l = rt.new_list(cur->b > 0 ? cur->b : 4);
     for (std::uint32_t i = 0; i < cur->b; ++i) {
         if (!list_push(l, regs[cur->a + i])) {
@@ -2032,6 +2040,7 @@ L_NEW_LIST: {
     VM_DISPATCH();
 }
 L_NEW_TUPLE: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     auto* t = rt.new_tuple(cur->b);
     for (std::uint32_t i = 0; i < cur->b; ++i) {
         t->items[i] = regs[cur->a + i];
@@ -2043,6 +2052,7 @@ L_NEW_TUPLE: {
     VM_DISPATCH();
 }
 L_NEW_DICT: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     auto* d = rt.new_dict();
     write_reg(cur->dst, Value::object(reinterpret_cast<PyObj*>(d)));
     ++f.pc;
@@ -2050,6 +2060,7 @@ L_NEW_DICT: {
     VM_DISPATCH();
 }
 L_LIST_APPEND: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     auto* l = static_cast<PyListObj*>(regs[cur->a].as.obj);
     Value v = regs[cur->b];
     RAISE_CHECK(l != nullptr);
@@ -2063,6 +2074,7 @@ L_LIST_APPEND: {
     VM_DISPATCH();
 }
 L_CALL: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value callee = regs[cur->a];
     Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
     Value out;
@@ -2073,6 +2085,7 @@ L_CALL: {
     VM_DISPATCH();
 }
 L_CALL_KW: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value callee = regs[cur->a];
     Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
     std::uint32_t kwnode = cur->imm >> 16;
@@ -2091,6 +2104,7 @@ L_CALL_KW: {
     VM_DISPATCH();
 }
 L_NATIVE: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value* args = cur->b > 0 ? &regs[cur->a] : nullptr;
     Value out;
     RAISE_CHECK(native_helper(cur->imm, args, cur->b, out));
@@ -2100,6 +2114,7 @@ L_NATIVE: {
     VM_DISPATCH();
 }
 L_ITER: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value out;
     RAISE_CHECK(get_iter(regs[cur->a], out));
     write_reg(cur->dst, out);
@@ -2108,6 +2123,7 @@ L_ITER: {
     VM_DISPATCH();
 }
 L_ITER_CHECK: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value it = regs[cur->a];
     bool more = false;
     RAISE_CHECK(iter_check(it, more));
@@ -2117,6 +2133,7 @@ L_ITER_CHECK: {
     VM_DISPATCH();
 }
 L_ITER_NEXT: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value out;
     RAISE_CHECK(iter_next(regs[cur->a], out));
     write_reg_owned(cur->dst, out);
@@ -2125,6 +2142,7 @@ L_ITER_NEXT: {
     VM_DISPATCH();
 }
 L_YIELD: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value v = regs[cur->a];
     if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
     frame_return_ = v;
@@ -2209,6 +2227,7 @@ L_JUMP_IF_FALSE: {
     VM_DISPATCH();
 }
 L_JUMP_IF_TRUE: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     if (cur->imm <= f.pc) {
         f.unit->bump_backedge(cur->imm);
     }
@@ -2222,12 +2241,14 @@ L_JUMP_IF_TRUE: {
     VM_DISPATCH();
 }
 L_RETURN: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value v = regs[cur->a];
     if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
     frame_return_ = v;
     return ExecStatus::Returned;
 }
 L_RAISE: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value exc = regs[cur->a];
     if (exc.tag == Tag::Obj && exc.as.obj && exc.as.obj->tag == ObjTag::Type) {
         // raise Class -> instantiate
@@ -2247,6 +2268,7 @@ L_RAISE: {
     return ExecStatus::Raised;
 }
 L_TRY_BEGIN: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Frame::Handler h;
     h.handler_pc = cur->imm;
     // Range filled by TRY_END pairs.
@@ -2259,6 +2281,7 @@ L_TRY_BEGIN: {
     VM_DISPATCH();
 }
 L_TRY_END: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     if (!f.handlers.empty()) {
         f.handlers.back().try_pc_end = f.pc + 1;
     }
@@ -2267,6 +2290,7 @@ L_TRY_END: {
     VM_DISPATCH();
 }
 L_GET_EXC: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     Value e = pending_exception_;
     if (e.tag == Tag::Obj && e.as.obj) rt.incref(e.as.obj);
     write_reg(cur->dst, e);
@@ -2275,6 +2299,7 @@ L_GET_EXC: {
     VM_DISPATCH();
 }
 L_LOAD_FIELD: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     // Pass-46 fast path: fixed-slot read. Instances read through their
     // shape slot; dict bases read the ordinal-th live entry.
     Value base = regs[cur->a];
@@ -2311,6 +2336,7 @@ L_LOAD_FIELD: {
     VM_DISPATCH();
 }
 L_STORE_FIELD: {
+    if (tracer.is_recording()) tracer.record_unsupported_op();
     // Pass-46 fast path: fixed-slot write. Instances write their shape
     // slot (growing on demand); dicts overwrite the ordinal-th live
     // entry. New-key appends stay StoreIndex (pass 46 only rewrites

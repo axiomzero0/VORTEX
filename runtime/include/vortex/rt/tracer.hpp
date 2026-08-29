@@ -66,6 +66,10 @@ struct Trace {
     std::size_t native_code_size{0};
     bool is_compiled{false};        // Has the trace been compiled to native code?
     bool is_recording{false};       // Are we currently recording this trace?
+    /// Giga Tracing (1.11): set when an unsupported op was recorded.
+    /// compile_trace checks this flag and refuses to compile if set.
+    /// This prevents incorrect traces that skip unsupported ops.
+    bool has_unsupported_op{false};
 
     // Layer 2: CorrelationId — causally links this trace to its Tier-0
     // execution context. Used by the Introspector (Rule 119) to answer:
@@ -136,6 +140,15 @@ struct MetaTracer {
     /// (otherwise nested-loop backedges patch to the wrong header).
     void record_instr(const Instr& instr, std::uint32_t pc, std::uint8_t tag_a,
                       std::uint8_t tag_b, std::uint8_t tag_dst) noexcept;
+
+    /// Giga Tracing (1.11): mark the current trace as containing an
+    /// unsupported op. Called from op handlers that compile_trace can't
+    /// compile (CALL, LIST_APPEND, LOAD_GLOBAL, etc.). The trace will
+    /// be recorded completely (no gaps) but compile_trace will refuse
+    /// to compile it, preventing incorrect traces that skip ops.
+    void record_unsupported_op() noexcept {
+        if (recording) recording->has_unsupported_op = true;
+    }
 
     /// Finish recording and compile the trace.
     /// Called when the backedge fires again during recording.
