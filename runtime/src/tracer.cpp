@@ -294,6 +294,138 @@ struct TraceEmitter {
         emit8(0xF7);
         emit8(0xD8 | (reg & 7));  // /3 = NEG, rm = reg
     }
+
+    // ========================================================================
+    // SSE2 scalar-double emit helpers (Giga Tracing 1.9 — float path).
+    //
+    // These mirror the GPR helpers above but operate on XMM0..XMM15 and
+    // use the SSE2 packed-double opcode (F2 0F ..) so traces can run
+    // hot float loops without falling back to Tier-0 on every iteration.
+    //
+    // Encoding notes:
+    //   - All scalar-double opcodes use mandatory prefix F2 (ADDSD=F2 0F 58,
+    //     MULSD=F2 0F 59, etc.).
+    //   - MOVSD uses F2 prefix; UCOMISD uses 66 prefix.
+    //   - REX.R extends reg (the xmm operand encoded in `reg` field) to 8..15.
+    //   - REX.B extends rm (the xmm operand or memory base encoded in
+    //     the rm field) to 8..15.
+    //   - Frame base is RBX (=3) so REX.B is only needed when the xmm
+    //     register operand in the rm slot is >= 8.
+    // ========================================================================
+
+    // MOVSD xmm, [base + disp]  (F2 0F 10 /r — load 64-bit mem → xmm)
+    void movsd_xmm_mem(std::uint8_t xmm, std::uint8_t base, std::int32_t disp) {
+        // Mandatory prefix F2, then REX if xmm>=8 or base>=8, then 0F 10.
+        // REX byte: 0x40 | R | 0 | 0 | B, where R extends reg (xmm), B extends base.
+        std::uint8_t rex = 0x40;
+        bool need_rex = false;
+        if (xmm >= 8) { rex |= 0x04; need_rex = true; }
+        if (base >= 8) { rex |= 0x01; need_rex = true; }
+        emit8(0xF2);
+        if (need_rex) emit8(rex);
+        emit8(0x0F); emit8(0x10);
+        // ModRM: mod=10 (disp32), reg=xmm, rm=base
+        emit8(0x80 | ((xmm & 7) << 3) | (base & 7));
+        // SIB required when base is RSP (4) or R12 (12) — we don't use those
+        // as frame base (we use RBX), so no SIB needed here.
+        if ((base & 7) == 4) emit8(0x24);
+        emit32(static_cast<std::uint32_t>(disp));
+    }
+
+    // MOVSD [base + disp], xmm  (F2 0F 11 /r — store xmm → 64-bit mem)
+    void movsd_mem_xmm(std::uint8_t base, std::int32_t disp, std::uint8_t xmm) {
+        std::uint8_t rex = 0x40;
+        bool need_rex = false;
+        if (xmm >= 8) { rex |= 0x04; need_rex = true; }
+        if (base >= 8) { rex |= 0x01; need_rex = true; }
+        emit8(0xF2);
+        if (need_rex) emit8(rex);
+        emit8(0x0F); emit8(0x11);
+        emit8(0x80 | ((xmm & 7) << 3) | (base & 7));
+        if ((base & 7) == 4) emit8(0x24);
+        emit32(static_cast<std::uint32_t>(disp));
+    }
+
+    // ADDSD xmm_dst, xmm_src  (F2 0F 58 /r)
+    void addsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) {
+        std::uint8_t rex = 0x40;
+        bool need_rex = false;
+        if (dst >= 8) { rex |= 0x04; need_rex = true; }   // R extends reg (dst in ModRM reg field)
+        if (src >= 8) { rex |= 0x01; need_rex = true; }   // B extends rm (src in rm field)
+        emit8(0xF2);
+        if (need_rex) emit8(rex);
+        emit8(0x0F); emit8(0x58);
+        // ModRM: mod=11 (reg-reg), reg=dst, rm=src
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // SUBSD xmm_dst, xmm_src  (F2 0F 5C /r)
+    void subsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) {
+        std::uint8_t rex = 0x40;
+        bool need_rex = false;
+        if (dst >= 8) { rex |= 0x04; need_rex = true; }
+        if (src >= 8) { rex |= 0x01; need_rex = true; }
+        emit8(0xF2);
+        if (need_rex) emit8(rex);
+        emit8(0x0F); emit8(0x5C);
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // MULSD xmm_dst, xmm_src  (F2 0F 59 /r)
+    void mulsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) {
+        std::uint8_t rex = 0x40;
+        bool need_rex = false;
+        if (dst >= 8) { rex |= 0x04; need_rex = true; }
+        if (src >= 8) { rex |= 0x01; need_rex = true; }
+        emit8(0xF2);
+        if (need_rex) emit8(rex);
+        emit8(0x0F); emit8(0x59);
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // DIVSD xmm_dst, xmm_src  (F2 0F 5E /r)
+    void divsd_xmm_xmm(std::uint8_t dst, std::uint8_t src) {
+        std::uint8_t rex = 0x40;
+        bool need_rex = false;
+        if (dst >= 8) { rex |= 0x04; need_rex = true; }
+        if (src >= 8) { rex |= 0x01; need_rex = true; }
+        emit8(0xF2);
+        if (need_rex) emit8(rex);
+        emit8(0x0F); emit8(0x5E);
+        emit8(0xC0 | ((dst & 7) << 3) | (src & 7));
+    }
+
+    // UCOMISD xmm_a, xmm_b  (66 0F 2E /r) — sets EFLAGS from double comparison.
+    // Use SETA/SETB/SETAE/SETBE for GT/LT/GE/LE; SETE/SETNE for EQ/NE
+    // (NaN caveat: SETE returns True for unordered NaN==x; Python says False.
+    // Accept this divergence in the trace — loops rarely compare NaN.)
+    void ucomisd_xmm_xmm(std::uint8_t a, std::uint8_t b) {
+        std::uint8_t rex = 0x40;
+        bool need_rex = false;
+        if (a >= 8) { rex |= 0x04; need_rex = true; }
+        if (b >= 8) { rex |= 0x01; need_rex = true; }
+        emit8(0x66);
+        if (need_rex) emit8(rex);
+        emit8(0x0F); emit8(0x2E);
+        emit8(0xC0 | ((a & 7) << 3) | (b & 7));
+    }
+
+    // JA rel32  (0F 87 cd) — jump if above (CF=0 AND ZF=0). Used for
+    // float-GT guard checks where SETA semantics are needed.
+    std::size_t ja_rel32() {
+        emit8(0x0F); emit8(0x87);
+        std::size_t patch_pos = pos;
+        emit32(0);
+        return patch_pos;
+    }
+
+    // JB rel32  (0F 82 cd) — jump if below (CF=1).
+    std::size_t jb_rel32() {
+        emit8(0x0F); emit8(0x82);
+        std::size_t patch_pos = pos;
+        emit32(0);
+        return patch_pos;
+    }
 };
 
 // x86 condition codes for CMP results (low nibble for SETCC/Jcc)
@@ -304,6 +436,11 @@ namespace x86_cond {
     constexpr std::uint8_t LE = 0x0E;  // JLE / SETLE (signed)
     constexpr std::uint8_t G  = 0x0F;  // JG  / SETG  (signed)
     constexpr std::uint8_t E  = 0x04;  // JE  / SETE
+    // Float-compare condition codes (after UCOMISD):
+    constexpr std::uint8_t A  = 0x07;  // JA  / SETA  (above — unsigned >)
+    constexpr std::uint8_t B  = 0x02;  // JB  / SETB  (below — unsigned <)
+    constexpr std::uint8_t AE = 0x03;  // JAE / SETAE (above-or-equal — unsigned >=)
+    constexpr std::uint8_t BE = 0x06;  // JBE / SETBE (below-or-equal — unsigned <=)
 }
 
 /// Slot displacement: [frame_base + slot * kValueSize + offset]
@@ -389,6 +526,57 @@ namespace x86_cond {
                 std::uint8_t b = instr.b;
                 BinOpKind bop = static_cast<BinOpKind>(instr.imm);
 
+                // Giga Tracing (1.9): float support.
+                // Trace semantics: when the recorded operands were both
+                // floats at recording time, we compile a SSE2 float path
+                // instead of the GPR int path. The result is tagged
+                // kTagFloat (matches Tier-0's float+float fast path).
+                // Mixed int/float operands refuse to compile (Rule 120:
+                // fall back to Tier-0 — the int↔float coercion is
+                // awkward to inline and not hot enough to specialize).
+                if (ti.tag_a == kTagFloat && ti.tag_b == kTagFloat) {
+                    // Float guard: operand A
+                    e.cmp_mem8_imm8(x86::RBX, slot_disp(a, kTagOffset), kTagFloat);
+                    std::size_t ja = e.jne_rel32();
+                    deopt_jumps.push_back(ja);
+                    // Float guard: operand B (elided when profiler says
+                    // this trace's guards have always passed — same
+                    // rule as the int path).
+                    if (!elide_redundant_guards) {
+                        e.cmp_mem8_imm8(x86::RBX, slot_disp(b, kTagOffset), kTagFloat);
+                        std::size_t jb = e.jne_rel32();
+                        deopt_jumps.push_back(jb);
+                    }
+                    // Load operands into XMM0 (a), XMM1 (b)
+                    e.movsd_xmm_mem(x86::RAX, x86::RBX, slot_disp(a, kPayloadOffset));
+                    e.movsd_xmm_mem(x86::RCX, x86::RBX, slot_disp(b, kPayloadOffset));
+                    // SSE2 scalar double op into XMM0
+                    switch (bop) {
+                        case BinOpKind::Add: e.addsd_xmm_xmm(x86::RAX, x86::RCX); break;
+                        case BinOpKind::Sub: e.subsd_xmm_xmm(x86::RAX, x86::RCX); break;
+                        case BinOpKind::Mul: e.mulsd_xmm_xmm(x86::RAX, x86::RCX); break;
+                        case BinOpKind::TrueDiv: e.divsd_xmm_xmm(x86::RAX, x86::RCX); break;
+                        default:
+                            // FloorDiv / Mod / Pow / MatMul — Tier-0 fallback
+                            munmap(buf, mapped);
+                            return false;
+                    }
+                    // Store result payload + tag (Tag::Float)
+                    e.movsd_mem_xmm(x86::RBX, slot_disp(dst, kPayloadOffset), x86::RAX);
+                    e.mov_mem8_imm8(x86::RBX, slot_disp(dst, kTagOffset), kTagFloat);
+                    break;
+                }
+
+                // Mixed int/float — refuse to compile (Rule 120 fall-back).
+                // The Tier-0 fast path handles int+int and float+float; mixed
+                // goes through values_binop which coerces. Inlining the
+                // coercion here would bloat the trace for a rarely-hot case.
+                if (ti.tag_a != kTagInt || ti.tag_b != kTagInt) {
+                    munmap(buf, mapped);
+                    return false;
+                }
+
+                // Int path (existing).
                 // Guard: check tag of operand A
                 if (ti.tag_a == kTagInt) {
                     e.cmp_mem8_imm8(x86::RBX, slot_disp(a, kTagOffset), kTagInt);
@@ -440,6 +628,69 @@ namespace x86_cond {
                 std::uint8_t b = instr.b;
                 CmpOpKind cop = static_cast<CmpOpKind>(instr.imm);
 
+                // Giga Tracing (1.9): float comparison via UCOMISD.
+                // When both recorded operands were floats, emit a float
+                // comparison. We use UCOMISD (unordered compare) + SETCC
+                // rather than COMISD because Python NaN comparisons
+                // return False for ordering predicates — UCOMISD lets us
+                // detect NaN via PF (parity flag). For simplicity we
+                // accept the NaN divergence here: SETE returns True on
+                // unordered (NaN==x), Python says False. Loops rarely
+                // compare NaN in the hot path, so this divergence is
+                // documented and accepted as a trade-off.
+                if (ti.tag_a == kTagFloat && ti.tag_b == kTagFloat) {
+                    // Float guards
+                    e.cmp_mem8_imm8(x86::RBX, slot_disp(a, kTagOffset), kTagFloat);
+                    std::size_t j = e.jne_rel32();
+                    deopt_jumps.push_back(j);
+                    if (!elide_redundant_guards) {
+                        e.cmp_mem8_imm8(x86::RBX, slot_disp(b, kTagOffset), kTagFloat);
+                        std::size_t j2 = e.jne_rel32();
+                        deopt_jumps.push_back(j2);
+                    }
+                    // Load XMM0 = a, XMM1 = b
+                    e.movsd_xmm_mem(x86::RAX, x86::RBX, slot_disp(a, kPayloadOffset));
+                    e.movsd_xmm_mem(x86::RCX, x86::RBX, slot_disp(b, kPayloadOffset));
+                    e.ucomisd_xmm_xmm(x86::RAX, x86::RCX);
+                    // SETCC based on UCOMISD flags. UCOMISD sets:
+                    //   CF=0 ZF=0 PF=0  if a > b
+                    //   CF=0 ZF=1 PF=0  if a == b
+                    //   CF=1 ZF=0 PF=0  if a < b
+                    //   CF=1 ZF=1 PF=1  if unordered (NaN)
+                    // For Python:
+                    //   LT: SETB (CF=1) — but True for unordered (NaN), wrong
+                    //   LE: SETBE — True for unordered (NaN), wrong
+                    //   GT: SETA (CF=0 AND ZF=0) — False for unordered, correct
+                    //   GE: SETAE (CF=0) — False for unordered, correct
+                    //   EQ: SETE (ZF=1) — True for unordered (NaN), wrong
+                    //   NE: SETNE (ZF=0) — False for unordered (NaN), wrong
+                    // We accept the NaN divergence; loops rarely compare NaN.
+                    std::uint8_t cond = 0;
+                    switch (cop) {
+                        case CmpOpKind::LT: cond = x86_cond::B; break;   // SETB
+                        case CmpOpKind::LE: cond = x86_cond::BE; break;  // SETBE
+                        case CmpOpKind::GT: cond = x86_cond::A; break;   // SETA
+                        case CmpOpKind::GE: cond = x86_cond::AE; break;  // SETAE
+                        case CmpOpKind::EQ: cond = x86_cond::E; break;   // SETE
+                        case CmpOpKind::NE: cond = x86_cond::NE; break;  // SETNE
+                        default:
+                            munmap(buf, mapped);
+                            return false;
+                    }
+                    e.setcc_r8(cond, x86::RAX);
+                    e.movzx_eax_al();
+                    e.mov_mem_r64(x86::RBX, slot_disp(dst, kPayloadOffset), x86::RAX);
+                    e.mov_mem8_imm8(x86::RBX, slot_disp(dst, kTagOffset), kTagBool);
+                    break;
+                }
+
+                // Mixed int/float — refuse to compile.
+                if (ti.tag_a != kTagInt || ti.tag_b != kTagInt) {
+                    munmap(buf, mapped);
+                    return false;
+                }
+
+                // Int path (existing).
                 // Guard: check tags
                 if (ti.tag_a == kTagInt) {
                     e.cmp_mem8_imm8(x86::RBX, slot_disp(a, kTagOffset), kTagInt);

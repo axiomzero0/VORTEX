@@ -2154,7 +2154,18 @@ L_JUMP: {
                 // redundant-guard elimination on recompile).
                 profiler.record_guard((*pp)->header_pc, rv.tag != Tag::None);
                 if (rv.tag == Tag::None) {
-                    ++f.pc;
+                    // Giga Tracing (1.9): deopt resume fix. Previously
+                    // this did `++f.pc` which advanced PAST the JUMP —
+                    // exiting the loop. That's wrong when the deopt
+                    // was a mid-trace guard (e.g. an inner if-condition
+                    // that flipped): the loop should continue, not exit.
+                    // The correct resume point is the loop header
+                    // (cur->imm) — Tier-0 re-runs the body from the top,
+                    // correctly handling whatever condition caused the
+                    // deopt. The loop-exit guard (i < N) re-evaluates
+                    // and exits cleanly; mid-trace guards re-evaluate
+                    // and take the correct branch.
+                    f.pc = cur->imm;
                     VM_LOAD();
                     VM_DISPATCH();
                 }
