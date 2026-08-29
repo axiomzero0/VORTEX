@@ -433,20 +433,26 @@ namespace x86_cond {
                 break;
             }
             case Op::JUMP_IF_FALSE: {
-                // Conditional backedge — check condition, jump to header if true
-                // (continue loop), fall through to deopt if false (exit loop)
+                // Conditional backedge — check condition.
+                // If TRUE: fall through to the body (loop continues).
+                // If FALSE: jump to deopt (loop exits).
                 std::uint8_t cond_reg = instr.a;
                 // Load the bool payload
                 e.mov_r64_mem(x86::RAX, x86::RBX, slot_disp(cond_reg, kPayloadOffset));
                 // TEST RAX, RAX (check if truthy)
-                // 48 85 C0
                 e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);
-                // JNZ to header (loop continues)
-                std::size_t j = e.jne_rel32();  // reuse jne for jnz
-                e.patch_rel32(j, header_pos);
-                // Fall through: loop exit — jump to deopt
-                std::size_t deopt_j = e.jmp_rel32();
-                deopt_jumps.push_back(deopt_j);
+                // JZ to deopt (loop exit). Falls through to body if true.
+                std::size_t deopt_j = e.jmp_rel32();  // use JMP for now (JZ would be 0F 84)
+                // Actually: we need JZ (jump if zero = jump if false).
+                // But our emitter only has JNE/JGE/JL/JLE. Let me use JE instead.
+                // JE rel32 = 0F 84 cd
+                // Back up: we emitted JMP (E9) but need JE (0F 84).
+                // Remove the JMP bytes and emit JE instead.
+                e.pos -= 5;  // undo the JMP
+                e.emit8(0x0F); e.emit8(0x84);  // JE rel32
+                std::size_t patch_pos = e.pos;
+                e.emit32(0);
+                deopt_jumps.push_back(patch_pos);
                 break;
             }
             case Op::LOAD_CONST: {
@@ -571,18 +577,16 @@ void MetaTracer::finish_recording() noexcept {
     recording->is_recording = false;
 
     // Compile the trace to native code
-    // TODO: native trace execution has a bug (infinite loop for large N).
-    // The trace records correctly (verified: 9 instructions including
-    // LOAD_CONST, PY_CMP, JUMP_IF_FALSE, PY_BINOP, MOVE, JUMP backedge).
-    // The native code loops but doesn't exit — likely the SETCC/JNZ
-    // encoding or the JUMP backedge patch is wrong. Disabling native
-    // execution until the encoding is fixed. The trace data is available
-    // for debugging.
-    recording->is_compiled = false;  // Stay in Tier-0
-    recording->native_code = nullptr;
+    if (!compile_trace(*recording)) {
+        std::fprintf(stderr, "VORTEX tracer: trace compilation failed, staying Tier-0\n");
+        recording->~Trace();
+        std::free(recording);
+        recording = nullptr;
+        return;
+    }
 
-    std::fprintf(stderr, "VORTEX tracer: trace recorded (%zu instrs, native exec disabled)\n",
-                 recording->instrs.size());
+    std::fprintf(stderr, "VORTEX tracer: trace compiled (%zu instrs, %zu bytes native)\n",
+                 recording->instrs.size(), recording->native_code_size);
 
     active = recording;
     recording = nullptr;
