@@ -217,9 +217,13 @@ struct ProbabilisticProfiler {
     void record_guard(std::uint32_t site_id, bool passed) noexcept {
         if (passed) {
             guard_pass_count.increment(site_id);
-            guard_stream.record(true);
+            // The GuardBitStream packs 64 guard results into one word.
+            // When the word fills, the consumer (telemetry flush) reads
+            // it and clears. We don't need to act on the "word full"
+            // signal here — the bitstream is best-effort aggregation.
+            (void)guard_stream.record(true);
         } else {
-            guard_stream.record(false);
+            (void)guard_stream.record(false);
             // Check if this was unexpected (guard usually passes)
             std::uint32_t passes = guard_pass_count.estimate(site_id);
             if (passes > 100) {

@@ -2148,6 +2148,11 @@ L_JUMP: {
             if (pp && *pp && (*pp)->native_code) {
                 auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
                 Value rv = trace_fn(f.regs);
+                // Giga Tracing (1.8): record the guard outcome so the
+                // probabilistic profiler can decide whether this trace's
+                // guards always pass (>1000 successes → eligible for
+                // redundant-guard elimination on recompile).
+                profiler.record_guard((*pp)->header_pc, rv.tag != Tag::None);
                 if (rv.tag == Tag::None) {
                     ++f.pc;
                     VM_LOAD();
@@ -2169,6 +2174,8 @@ L_JUMP_IF_FALSE: {
             if (pp && *pp && (*pp)->native_code) {
                 auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
                 Value rv = trace_fn(f.regs);
+                // Giga Tracing (1.8): record the guard outcome.
+                profiler.record_guard((*pp)->header_pc, rv.tag != Tag::None);
                 if (rv.tag == Tag::None) {
                     f.pc = cur->imm;
                     VM_LOAD();

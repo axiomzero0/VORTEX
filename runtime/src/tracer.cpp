@@ -314,7 +314,21 @@ namespace x86_cond {
 /// Compile a recorded trace to native x86-64 machine code.
 /// Returns true on success (trace->native_code is set).
 /// Returns false on failure (Rule 120: fall back to Tier-0).
-[[nodiscard]] static bool compile_trace(Trace& trace) noexcept {
+///
+/// Giga Tracing (1.8): `profiler` is the probabilistic profiler (may be
+/// null in tests). When non-null and `guard_always_passes(header_pc)`
+/// returns true (trace has >1000 successful executions without a guard
+/// failure), the redundant B-tag guards are elided. The A-tag guard is
+/// always kept so any type change at operand A still triggers a deopt.
+/// This is a conservative guard-elimination: one CMP+JNE per
+/// instruction is saved, but the trace still deopts when the dominant
+/// operand type changes. Risk: if A's type stays stable but B's type
+/// changes, the trace would produce wrong results. The probabilistic
+/// model (B has been stable for >1000 iterations) makes this rare; the
+/// anomaly buffer captures subsequent deopt events for analysis.
+[[nodiscard]] static bool compile_trace(
+    Trace& trace,
+    const vortex::support::ProbabilisticProfiler* profiler) noexcept {
     // Rule 97 (W^X): allocate RW buffer, write code, then mprotect to RX.
     constexpr std::size_t kCodeCap = 4096;  // 4KB per trace (plenty for 256 instrs)
     long pagesz = sysconf(_SC_PAGESIZE);
@@ -325,6 +339,14 @@ namespace x86_cond {
     if (buf == MAP_FAILED) return false;
 
     TraceEmitter e{static_cast<std::byte*>(buf), kCodeCap};
+
+    // Giga Tracing (1.8): if this trace's header_pc has accumulated
+    // >1000 successful guard passes in the probabilistic profiler,
+    // we elide the redundant B-tag guard on every instruction. The
+    // A-tag guard is always emitted so type changes at operand A
+    // still trigger a deopt.
+    const bool elide_redundant_guards =
+        profiler != nullptr && profiler->guard_always_passes(trace.header_pc);
 
     // --- Prologue ---
     // SysV ABI: RDI = first arg = Value* regs (the frame's register file)
@@ -374,7 +396,13 @@ namespace x86_cond {
                     deopt_jumps.push_back(j);
                 }
                 // Guard: check tag of operand B
-                if (ti.tag_b == kTagInt) {
+                // Giga Tracing (1.8): elide the B-tag guard when the
+                // probabilistic profiler reports this trace's guards
+                // have always passed (>1000 successful executions).
+                // The A-tag guard above still catches type changes at
+                // operand A; if A is Int and B has been Int for >1000
+                // iterations, the bet is that B stays Int.
+                if (ti.tag_b == kTagInt && !elide_redundant_guards) {
                     e.cmp_mem8_imm8(x86::RBX, slot_disp(b, kTagOffset), kTagInt);
                     std::size_t j = e.jne_rel32();
                     deopt_jumps.push_back(j);
@@ -418,7 +446,9 @@ namespace x86_cond {
                     std::size_t j = e.jne_rel32();
                     deopt_jumps.push_back(j);
                 }
-                if (ti.tag_b == kTagInt) {
+                // Giga Tracing (1.8): elide redundant B-tag guard on
+                // hot traces (same rationale as PY_BINOP above).
+                if (ti.tag_b == kTagInt && !elide_redundant_guards) {
                     e.cmp_mem8_imm8(x86::RBX, slot_disp(b, kTagOffset), kTagInt);
                     std::size_t j = e.jne_rel32();
                     deopt_jumps.push_back(j);
@@ -564,8 +594,18 @@ bool MetaTracer::on_backedge(CodeUnit* unit, std::uint32_t pc,
     // Case 3: Loop is hot — start recording
     // Use per-header backedge count (not total backedge_count) so nested
     // loops don't interfere. Each loop header has its own counter.
+    //
+    // Giga Tracing (1.8): also consult the probabilistic profiler's
+    // Count-Min Sketch. The sketch is updated on every backedge via
+    // `profiler.record_branch(f.pc, true)` in the dispatch loop. If the
+    // sketch says this site is hot (>= kHotThreshold observations),
+    // promote even if the exact per-header counter hasn't reached the
+    // threshold yet — the sketch sees ALL backedges including those
+    // from before a recompile/telemetry-flush, so it's a strictly
+    // additive signal. OR semantics: either signal triggers promotion.
     std::uint64_t this_loop_backedges = unit->backedges_for(target_pc);
-    if (!recording && this_loop_backedges >= kHotThreshold) {
+    bool sketch_hot = profiler_ && profiler_->is_hot(pc, kHotThreshold);
+    if (!recording && (this_loop_backedges >= kHotThreshold || sketch_hot)) {
         // Check if we already have a (failed) trace for this key — don't re-record
         if (traces.get(key)) return false;  // Already tried, failed
         recording = static_cast<Trace*>(std::malloc(sizeof(Trace)));
@@ -629,8 +669,10 @@ void MetaTracer::finish_recording() noexcept {
 
     recording->is_recording = false;
 
-    // Compile the trace to native code
-    if (!compile_trace(*recording)) {
+    // Compile the trace to native code. Pass the probabilistic profiler
+    // so compile_trace can consult guard_always_passes() for redundant
+    // guard elimination on hot traces (Giga Tracing 1.8).
+    if (!compile_trace(*recording, profiler_)) {
         std::fprintf(stderr, "VORTEX tracer: trace compilation failed, staying Tier-0\n");
         recording->~Trace();
         std::free(recording);

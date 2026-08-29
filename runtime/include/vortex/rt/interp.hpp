@@ -51,7 +51,11 @@ enum class ExecStatus : std::uint8_t { Returned, Raised, Suspended };
 
 class Vm {
 public:
-    Vm() noexcept = default;
+    /// Constructor wires the probabilistic profiler into the meta-tracer
+    /// so on_backedge and compile_trace can consult is_hot() and
+    /// guard_always_passes(). Both members are declared below; by the
+    /// time the constructor body runs they are both fully constructed.
+    Vm() noexcept { tracer.set_profiler(&profiler); }
 
     Program program{};
 

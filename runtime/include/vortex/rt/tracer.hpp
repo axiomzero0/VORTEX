@@ -35,6 +35,7 @@
 
 #include "vortex/rt/code.hpp"
 #include "vortex/stdx/flat_map.hpp"
+#include "vortex/support/profiler.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -100,6 +101,22 @@ struct MetaTracer {
     /// Max trace length — prevents unbounded recording on pathological loops.
     /// Rule 10: bounded by budget.
     static constexpr std::uint32_t kMaxTraceLen = 256;
+
+    /// Giga Tracing: probabilistic profiler (Count-Min Sketch + EMA).
+    /// Non-owning, set by the Vm at construction. May be null in tests
+    /// that construct a MetaTracer without a Vm — every consult is
+    /// null-checked. When non-null, on_backedge uses is_hot() as an
+    /// alternative tier-promotion trigger, and compile_trace uses
+    /// guard_always_passes() to elide redundant B-tag guards on traces
+    /// that have >1000 successful executions.
+    /// Rule 118: single-writer (the mutator thread) — no synchronization.
+    support::ProbabilisticProfiler* profiler_{nullptr};
+
+    /// Wire the probabilistic profiler. Called once by the owning Vm
+    /// after both `tracer` and `profiler` members are constructed.
+    void set_profiler(support::ProbabilisticProfiler* p) noexcept {
+        profiler_ = p;
+    }
 
     /// Called at every backedge in the dispatch loop. Checks if the loop
     /// is hot enough to start recording, or if a compiled trace exists.
