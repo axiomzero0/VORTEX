@@ -60,6 +60,8 @@ extern "C" vortex::Value vortex_deopt_entry(std::uint32_t unit_id,
     // Rule 26: Record the guard failure in telemetry.
     vm->telemetry.record(vortex::TelemetryEventKind::GuardFailed, unit_id, safepoint_index, 0);
     vm->telemetry.bump(vortex::Telemetry::counter_guard_failures);
+    // Giga Tracing: record in probabilistic profiler
+    vm->profiler.record_deopt(unit_id);
 
     const std::uint32_t n_regs = unit->n_registers;
     Value* regs = static_cast<Value*>(regs_raw);

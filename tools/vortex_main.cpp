@@ -70,9 +70,9 @@ namespace {
         return 1;
     }
 
-    // Rule 26 / Rule 119: Dump telemetry on exit so every fallback, deopt,
-    // and tier transition is visible. No silent events.
+    // Rule 26 / Rule 119: Dump telemetry + profiler on exit.
     vm.telemetry.write_report(stderr);
+    vm.profiler.write_report(stderr);
 
     return 0;
 }

@@ -25,6 +25,7 @@
 #include "vortex/support/result.hpp"
 #include "vortex/stdx/small_vector.hpp"
 #include "vortex/support/telemetry.hpp"
+#include "vortex/support/profiler.hpp"
 
 namespace vortex::rt {
 
@@ -111,6 +112,13 @@ public:
     /// them to native code. The dispatch loop calls tracer.on_backedge()
     /// at every backedge and tracer.record_instr() during recording.
     MetaTracer tracer{};
+
+    /// Probabilistic profiler (Giga Tracing layer). Replaces exact tracing
+    /// with streaming sketches: Count-Min Sketch for branch frequency,
+    /// EMA for overflow/deopt probability, anomaly buffer for rare events.
+    /// Updated on every backedge, guard, and trace execution.
+    /// Rule 7: Fixed-size, no heap allocation. ~9KB total.
+    support::ProbabilisticProfiler profiler{};
 
 private:
     Value pending_exception_{};   // owned ref

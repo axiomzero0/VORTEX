@@ -1515,13 +1515,13 @@ L_PY_BINOP: {
                 if (!__builtin_add_overflow(x, y, &r)) [[likely]] {
                     write_reg(cur->dst, Value::integer(r));
                     ++f.pc; VM_LOAD(); VM_DISPATCH();
-                }
+                } else { profiler.record_overflow(f.pc); }  // Giga Tracing
                 break;
             case BinOpKind::Sub:
                 if (!__builtin_sub_overflow(x, y, &r)) [[likely]] {
                     write_reg(cur->dst, Value::integer(r));
                     ++f.pc; VM_LOAD(); VM_DISPATCH();
-                }
+                } else { profiler.record_overflow(f.pc); }
                 break;
             case BinOpKind::Mul:
                 if (!__builtin_mul_overflow(x, y, &r)) [[likely]] {
@@ -2135,9 +2135,9 @@ L_YIELD: {
 L_JUMP: {
     if (cur->imm <= f.pc) {
         ++f.unit->backedge_count;
-        // Record the backedge JUMP BEFORE calling on_backedge, so it's
-        // the last instruction in the trace. on_backedge calls
-        // finish_recording() which compiles the trace.
+        // Giga Tracing: probabilistic branch frequency (Count-Min Sketch)
+        profiler.record_branch(f.pc, true);
+        // Record the backedge JUMP BEFORE calling on_backedge
         if (tracer.is_recording()) {
             tracer.record_instr(*cur, 0, 0, 0);
         }
