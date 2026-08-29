@@ -982,9 +982,22 @@ void MetaTracer::finish_recording() noexcept {
     std::uint64_t key = (static_cast<std::uint64_t>(recording->unit->id) << 16) |
                         recording->header_pc;
 
-    // Store in the traces map (replaces old single `active` pointer).
-    // Bug fix 1.7.3: old active trace's native_code was leaked. Now the
-    // map holds all traces; eviction (future) munmaps the old code.
+    // Giga Tracing (1.12): Rule 106 — code cache eviction.
+    // If the traces map is full, evict the coldest trace before inserting.
+    // Also handle re-insertion: if a trace for this key already exists
+    // (e.g., re-recorded after a previous failure), free the old trace
+    // before replacing it — otherwise its native_code buffer is leaked.
+    if (Trace** existing = traces.get(key)) {
+        // Key already exists — free the old trace before replacing.
+        if (*existing) free_trace(*existing);
+        traces.erase(key);
+    }
+    if (traces.size() >= kMaxCompiledTraces) {
+        evict_coldest_trace();
+    }
+
+    // Store in the traces map. Now safe — either the key was empty or
+    // we freed the old entry above.
     traces.insert(key, recording);
 
     recording = nullptr;

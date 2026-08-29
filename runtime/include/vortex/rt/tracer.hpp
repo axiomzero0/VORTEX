@@ -39,6 +39,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>      // std::free, std::malloc
+#include <sys/mman.h>   // munmap (for free_trace)
 
 namespace vortex::rt {
 
@@ -121,6 +123,75 @@ struct MetaTracer {
     /// after both `tracer` and `profiler` members are constructed.
     void set_profiler(support::ProbabilisticProfiler* p) noexcept {
         profiler_ = p;
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 106: code cache lifecycle.
+    //
+    // The MetaTracer destructor frees every compiled trace and munmaps its
+    // native_code buffer. Without this, every Vm destruction leaks up to
+    // kMaxCompiledTraces × 4KB = 256KB of native code buffers.
+    //
+    // Eviction: when the traces map is full (size == kMaxCompiledTraces),
+    // the coldest trace (lowest hit_count) is evicted before inserting a
+    // new one. This is a simple LRU approximation — true LRU would track
+    // last-used timestamp, but hit_count is a good proxy (traces that
+    // are used more are hotter and should stay).
+    // -------------------------------------------------------------------------
+    ~MetaTracer() noexcept {
+        clear_all_traces();
+    }
+
+    MetaTracer() noexcept = default;
+    MetaTracer(const MetaTracer&) = delete;
+    MetaTracer& operator=(const MetaTracer&) = delete;
+
+    /// Free a single trace: munmap native_code, destroy Trace, free memory.
+    static void free_trace(Trace* t) noexcept {
+        if (!t) return;
+        // munmap the native code buffer (allocated via mmap in compile_trace).
+        if (t->native_code) {
+            long pagesz = sysconf(_SC_PAGESIZE);
+            if (pagesz <= 0) pagesz = 4096;
+            std::size_t cap = ((4096 + pagesz - 1) / pagesz) * pagesz;  // matches compile_trace's kCodeCap
+            munmap(t->native_code, cap);
+            t->native_code = nullptr;
+        }
+        t->~Trace();
+        std::free(t);
+    }
+
+    /// Evict the coldest trace (lowest hit_count) from the traces map.
+    /// Called by finish_recording when the map is full.
+    void evict_coldest_trace() noexcept {
+        if (traces.empty()) return;
+        // Find the entry with the lowest hit_count.
+        Trace** coldest = nullptr;
+        std::uint64_t coldest_key = 0;
+        for (auto& kv : traces) {
+            if (!coldest || (kv.second && kv.second->hit_count < (*coldest)->hit_count)) {
+                coldest = &kv.second;
+                coldest_key = kv.first;
+            }
+        }
+        if (coldest && *coldest) {
+            free_trace(*coldest);
+            traces.erase(coldest_key);
+        }
+    }
+
+    /// Free ALL traces (destructor + explicit reset). Used by ~MetaTracer
+    /// and could be called by the runtime on program reload.
+    void clear_all_traces() noexcept {
+        for (auto& kv : traces) {
+            free_trace(kv.second);
+        }
+        traces.clear();
+        // Also free any in-progress recording.
+        if (recording) {
+            free_trace(recording);
+            recording = nullptr;
+        }
     }
 
     /// Called at every backedge in the dispatch loop. Checks if the loop
