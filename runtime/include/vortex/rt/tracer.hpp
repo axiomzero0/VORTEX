@@ -63,6 +63,11 @@ struct Trace {
     std::size_t native_code_size{0};
     bool is_compiled{false};        // Has the trace been compiled to native code?
     bool is_recording{false};       // Are we currently recording this trace?
+
+    // Layer 2: CorrelationId — causally links this trace to its Tier-0
+    // execution context. Used by the Introspector (Rule 119) to answer:
+    // "this deopt came from trace X which was compiled from loop Y."
+    std::uint64_t program_hash{0};  // hash of source module (0 = unset)
 };
 
 /// The meta-tracer state. One per Vm (single-threaded for now).

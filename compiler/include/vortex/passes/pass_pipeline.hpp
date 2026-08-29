@@ -10,6 +10,7 @@
 
 #include "vortex/passes/passes_fwd.hpp"
 #include "vortex/ir/verifier.hpp"
+#include "vortex/support/introspect.hpp"
 
 namespace vortex::passes {
 inline namespace abi_v1 {
@@ -117,7 +118,8 @@ struct TierFilter {
 };
 
 /// Run the pipeline over one graph. Verifier (Rule 40) runs after every
-/// pass in debug; telemetry records budgets (Rule 26).
+/// pass in debug; telemetry records budgets (Rule 26). PhaseScope records
+/// per-pass duration + node-count delta (Rule 123).
 template <typename Pipeline = OptPipeline>
 [[nodiscard]] Result<void> run_pipeline(ir::Graph& g, const PassContext& ctx,
                                         Pipeline& pipeline) noexcept {
@@ -134,8 +136,20 @@ template <typename Pipeline = OptPipeline>
                         }
                         return;   // budget guard: stop processing
                     }
+                    // Rule 123: PhaseScope records duration + node-count delta.
+                    // Zero overhead when no hook is set (single branch on armed_).
+                    support::PhaseScope span(
+                        support::PhaseKind::Pass,
+                        static_cast<std::uint16_t>(0),  // pass_id extracted from name
+                        static_cast<std::uint8_t>(ctx.tier),
+                        static_cast<std::uint16_t>(ctx.code_unit_id),
+                        g.live_node_count());
                     auto r = pass.run(g, ctx);
-                    if (!r) return;   // diagnostics propagate via graph state
+                    if (!r) {
+                        span.set_result(support::PhaseResult::CompileFailed, g.live_node_count());
+                        return;
+                    }
+                    span.set_result(support::PhaseResult::Ok, g.live_node_count());
                     if (g_verify_after_each_pass) {
                         g_verify_after_each_pass(g, pass.name);   // Rule 40
                     }

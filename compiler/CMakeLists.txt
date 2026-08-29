@@ -10,6 +10,7 @@ add_library(vortex_compiler STATIC
     src/support/diagnostic.cpp
     src/support/symbol_table.cpp
     src/support/telemetry.cpp
+    src/support/introspect.cpp
     src/ir/graph.cpp
     src/ir/node_kind.cpp
     src/ir/printer.cpp
