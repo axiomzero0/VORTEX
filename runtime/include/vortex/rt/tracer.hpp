@@ -51,6 +51,7 @@ struct TraceInstr {
     std::uint8_t tag_a;    // Observed tag of operand A (Tag::Int, Tag::Float, etc.)
     std::uint8_t tag_b;    // Observed tag of operand B
     std::uint8_t tag_dst;  // Observed tag of the result
+    std::uint32_t pc;       // Tier-0 PC of this instruction (for JUMP target resolution)
 };
 
 /// A recorded trace — a linear sequence of bytecode instructions with
@@ -130,7 +131,10 @@ struct MetaTracer {
 
     /// Record a single instruction during trace recording.
     /// Called from the dispatch loop after each instruction executes.
-    void record_instr(const Instr& instr, std::uint8_t tag_a,
+    /// `pc` is the Tier-0 bytecode PC of the instruction — needed for
+    /// resolving JUMP targets to positions within the compiled trace
+    /// (otherwise nested-loop backedges patch to the wrong header).
+    void record_instr(const Instr& instr, std::uint32_t pc, std::uint8_t tag_a,
                       std::uint8_t tag_b, std::uint8_t tag_dst) noexcept;
 
     /// Finish recording and compile the trace.

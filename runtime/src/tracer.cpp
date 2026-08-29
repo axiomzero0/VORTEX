@@ -504,12 +504,27 @@ namespace x86_cond {
 
     std::size_t header_pos = e.pos;
 
+    // Giga Tracing (1.10): PC → emitter-position map for JUMP target resolution.
+    // Built incrementally as each instruction is emitted. When the JUMP case
+    // needs to patch a backedge, it looks up the target PC in this map to
+    // find the correct position within the trace (NOT always header_pos —
+    // nested-loop inner backedges patch to the inner header, not the outer).
+    // Without this, nested loops hang: the inner backedge JUMPs to the
+    // outer header, the inner loop runs once per outer iteration, and
+    // `i` never increments (infinite loop).
+    stdx::small_vector<std::pair<std::uint32_t, std::size_t>, 32> pc_to_pos;
+
     stdx::small_vector<std::size_t, 4> deopt_jumps;
 
     for (std::size_t idx = start_idx; idx < trace.instrs.size(); ++idx) {
         const TraceInstr& ti = trace.instrs[idx];
         const Instr& instr = ti.instr;
         Op op = static_cast<Op>(instr.op);
+
+        // Giga Tracing (1.10): record this instruction's emitter position
+        // BEFORE emitting it, so the JUMP case can resolve backedge targets
+        // to the correct position within the trace.
+        pc_to_pos.push_back({ti.pc, e.pos});
 
         // Bug fix 1.7.1: check buffer capacity before each instruction.
         // Worst case per instruction: ~30 bytes (guard + load + op + write).
@@ -732,11 +747,27 @@ namespace x86_cond {
                 break;
             }
             case Op::JUMP: {
-                // Backedge — jump to trace header (loop)
-                // Rule 88: safepoint poll
+                // Backedge — jump to the trace position of the target PC.
+                // Giga Tracing (1.10): resolve the target PC to its emitter
+                // position within the trace. For a simple single-loop trace,
+                // this is header_pos (the outer loop's header). For a nested
+                // loop where the outer trace recorded the inner backedge,
+                // the target is the inner header's position — NOT header_pos.
+                // Without this resolution, nested loops hang because the
+                // inner backedge jumps to the outer header, `i` never
+                // increments, and the outer loop runs forever.
+                // Rule 88: safepoint poll (placeholder NOP for now).
                 e.nop();  // safepoint placeholder
                 std::size_t j = e.jmp_rel32();
-                e.patch_rel32(j, header_pos);
+                // Look up the target PC in the pc_to_pos map.
+                std::size_t target_pos = header_pos;  // default: outer header
+                for (const auto& kv : pc_to_pos) {
+                    if (kv.first == instr.imm) {
+                        target_pos = kv.second;
+                        break;
+                    }
+                }
+                e.patch_rel32(j, target_pos);
                 break;
             }
             case Op::JUMP_IF_FALSE: {
@@ -896,7 +927,7 @@ bool MetaTracer::on_backedge(CodeUnit* unit, std::uint32_t pc,
     return false;
 }
 
-void MetaTracer::record_instr(const Instr& instr, std::uint8_t tag_a,
+void MetaTracer::record_instr(const Instr& instr, std::uint32_t pc, std::uint8_t tag_a,
                                std::uint8_t tag_b, std::uint8_t tag_dst) noexcept {
     if (!recording) return;
     if (recording->instrs.size() >= kMaxTraceLen) {
@@ -912,6 +943,7 @@ void MetaTracer::record_instr(const Instr& instr, std::uint8_t tag_a,
     ti.tag_a = tag_a;
     ti.tag_b = tag_b;
     ti.tag_dst = tag_dst;
+    ti.pc = pc;
     recording->instrs.push_back(ti);
 }
 

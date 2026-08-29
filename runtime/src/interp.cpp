@@ -1469,7 +1469,7 @@ L_LOAD_CONST: {
     const Value& c = f.unit->constants[cur->imm];
     // Meta-tracer: record this instruction.
     if (tracer.is_recording()) {
-        tracer.record_instr(*cur, 0, 0, static_cast<std::uint8_t>(c.tag));
+        tracer.record_instr(*cur, f.pc, 0, 0, static_cast<std::uint8_t>(c.tag));
     }
     write_reg_owned(cur->dst, c);
     ++f.pc;
@@ -1479,7 +1479,7 @@ L_LOAD_CONST: {
 L_MOVE: {
     // Meta-tracer: record this instruction.
     if (tracer.is_recording()) {
-        tracer.record_instr(*cur, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
+        tracer.record_instr(*cur, f.pc, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
     }
     move_reg(cur->dst, cur->a);
     ++f.pc;
@@ -1495,7 +1495,7 @@ L_PY_BINOP: {
 
     // Meta-tracer: record this instruction with observed types.
     if (tracer.is_recording()) {
-        tracer.record_instr(*cur, static_cast<std::uint8_t>(a.tag),
+        tracer.record_instr(*cur, f.pc, static_cast<std::uint8_t>(a.tag),
                             static_cast<std::uint8_t>(b.tag), 0);
     }
 
@@ -1750,7 +1750,7 @@ L_PY_CMP: {
 
     // Meta-tracer: record this instruction with observed types.
     if (tracer.is_recording()) {
-        tracer.record_instr(*cur, static_cast<std::uint8_t>(a.tag),
+        tracer.record_instr(*cur, f.pc, static_cast<std::uint8_t>(a.tag),
                             static_cast<std::uint8_t>(b.tag), 0);
     }
 
@@ -2139,7 +2139,7 @@ L_JUMP: {
         profiler.record_branch(f.pc, true);
         // Record the backedge JUMP BEFORE calling on_backedge
         if (tracer.is_recording()) {
-            tracer.record_instr(*cur, 0, 0, 0);
+            tracer.record_instr(*cur, f.pc, 0, 0, 0);
         }
         if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
             // Find the compiled trace via the traces map.
@@ -2197,7 +2197,7 @@ L_JUMP_IF_FALSE: {
     }
     // During recording, record this instruction with the condition's tag.
     if (tracer.is_recording()) {
-        tracer.record_instr(*cur, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
+        tracer.record_instr(*cur, f.pc, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
     }
     bool t = rt.truthy(regs[cur->a]);
     if (!t) {
