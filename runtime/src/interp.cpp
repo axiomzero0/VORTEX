@@ -1485,6 +1485,12 @@ L_PY_BINOP: {
     bool ok = false;
     const auto op = static_cast<BinOpKind>(cur->imm);
 
+    // Meta-tracer: record this instruction with observed types.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, static_cast<std::uint8_t>(a.tag),
+                            static_cast<std::uint8_t>(b.tag), 0);
+    }
+
     // --- Inline fast paths for the dominant numeric cases ---
     // These eliminate 3-4 function calls (values_add → numeric_binop →
     // lambda → int_fits_i64) per operation. For tight int loops this is
@@ -1733,6 +1739,12 @@ L_PY_CMP: {
     Value a = regs[cur->a];
     Value b = regs[cur->b];
     bool result = false;
+
+    // Meta-tracer: record this instruction with observed types.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, static_cast<std::uint8_t>(a.tag),
+                            static_cast<std::uint8_t>(b.tag), 0);
+    }
 
     // Inline int+int fast path — eliminates the values_compare function
     // call for the dominant case (loop conditions, equality checks).
@@ -2115,6 +2127,19 @@ L_YIELD: {
 L_JUMP: {
     if (cur->imm <= f.pc) {
         ++f.unit->backedge_count;
+        // Meta-tracer: check if we should start recording or invoke
+        // a compiled trace. on_backedge returns true if a compiled
+        // trace should be invoked (currently always false — traces
+        // are recorded but not yet compiled to native code).
+        if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
+            // Compiled trace exists — invoke it.
+            // TODO: call the native trace code here. For now, this
+            // path is never taken (native_code is null).
+        }
+    }
+    // During recording, record this instruction.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, 0, 0, 0);
     }
     f.pc = cur->imm;
     VM_LOAD();

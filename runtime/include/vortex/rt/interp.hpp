@@ -21,6 +21,7 @@
 #include "vortex/stdx/flat_map.hpp"
 #include "vortex/rt/code.hpp"
 #include "vortex/rt/object.hpp"
+#include "vortex/rt/tracer.hpp"
 #include "vortex/support/result.hpp"
 #include "vortex/stdx/small_vector.hpp"
 #include "vortex/support/telemetry.hpp"
@@ -104,10 +105,12 @@ public:
     Value frame_return_{};
 
     /// When true, the CALL handler skips jit_entry and runs Tier-0 directly.
-    /// Set by the bridge before calling step_one, so ops that need full
-    /// Frame machinery (call_value → exec_frame) don't re-enter the JIT
-    /// and cause infinite recursion.
     bool jit_disabled_in_bridge{false};
+
+    /// Meta-tracer for Tier 1 JIT. Records hot loop traces and compiles
+    /// them to native code. The dispatch loop calls tracer.on_backedge()
+    /// at every backedge and tracer.record_instr() during recording.
+    MetaTracer tracer{};
 
 private:
     Value pending_exception_{};   // owned ref
