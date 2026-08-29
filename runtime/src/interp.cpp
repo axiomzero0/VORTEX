@@ -2142,13 +2142,17 @@ L_JUMP: {
             tracer.record_instr(*cur, 0, 0, 0);
         }
         if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
-            auto trace_fn = reinterpret_cast<Value(*)(Value*)>(
-                tracer.active->native_code);
-            Value rv = trace_fn(f.regs);
-            if (rv.tag == Tag::None) {
-                ++f.pc;
-                VM_LOAD();
-                VM_DISPATCH();
+            // Find the compiled trace via the traces map.
+            std::uint64_t key = (static_cast<std::uint64_t>(f.unit->id) << 16) | cur->imm;
+            Trace** pp = tracer.traces.get(key);
+            if (pp && *pp && (*pp)->native_code) {
+                auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
+                Value rv = trace_fn(f.regs);
+                if (rv.tag == Tag::None) {
+                    ++f.pc;
+                    VM_LOAD();
+                    VM_DISPATCH();
+                }
             }
         }
     }
@@ -2160,20 +2164,17 @@ L_JUMP_IF_FALSE: {
     if (cur->imm <= f.pc) {
         ++f.unit->backedge_count;
         if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
-            auto trace_fn = reinterpret_cast<Value(*)(Value*)>(
-                tracer.active->native_code);
-            Value rv = trace_fn(f.regs);
-            if (rv.tag == Tag::None) {
-                // Trace exited (loop done or guard failure).
-                // The trace already evaluated the condition and it was
-                // false (loop exit). Jump to the JUMP_IF_FALSE target
-                // (past the loop body).
-                f.pc = cur->imm;
-                VM_LOAD();
-                VM_DISPATCH();
+            std::uint64_t key = (static_cast<std::uint64_t>(f.unit->id) << 16) | cur->imm;
+            Trace** pp = tracer.traces.get(key);
+            if (pp && *pp && (*pp)->native_code) {
+                auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
+                Value rv = trace_fn(f.regs);
+                if (rv.tag == Tag::None) {
+                    f.pc = cur->imm;
+                    VM_LOAD();
+                    VM_DISPATCH();
+                }
             }
-            // If rv is not None, the trace had a guard failure but
-            // wants to continue — fall through to the interpreter.
         }
     }
     // During recording, record this instruction with the condition's tag.

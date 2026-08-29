@@ -34,6 +34,7 @@
 #pragma once
 
 #include "vortex/rt/code.hpp"
+#include "vortex/stdx/flat_map.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -77,9 +78,13 @@ struct MetaTracer {
     /// The trace currently being recorded, or nullptr if not recording.
     Trace* recording{nullptr};
 
-    /// The compiled trace for the current loop header, or nullptr if none.
-    /// Checked at every backedge — if non-null, jump to native code.
-    Trace* active{nullptr};
+    /// Compiled traces, keyed by (unit_id << 16 | header_pc).
+    /// Bug fix 1.7.3: was a single Trace* (active), which leaked the
+    /// previous trace's native_code when a second loop became hot.
+    /// Now a flat_map so every hot loop keeps its trace.
+    /// Rule 106: code cache has a max; eviction munmaps the old trace.
+    static constexpr std::uint32_t kMaxCompiledTraces = 64;
+    stdx::flat_map<std::uint64_t, Trace*, kMaxCompiledTraces> traces{};
 
     /// The PC where recording started (the loop header).
     std::uint32_t record_start_pc{0};

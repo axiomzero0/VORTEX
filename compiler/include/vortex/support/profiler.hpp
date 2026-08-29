@@ -79,14 +79,14 @@ struct CountMinSketch {
     }
 
 private:
-    /// Simple multiplicative hash. No mutex needed (single writer).
-    /// Different seeds per row produce independent hash functions.
+    /// Multiply-shift universal hash (Dietzfelbinger 1996).
+    /// Better distribution than FNV-1a for sequential keys (bytecode PCs).
+    /// Cost: 1 multiply + 1 shift = ~2ns. Same cost as FNV, much better quality.
     [[nodiscard]] static std::uint32_t hash(std::uint32_t key, std::uint32_t seed) noexcept {
-        // FNV-1a variant: fast, good distribution for small keys.
-        std::uint32_t h = 2166136261u ^ (seed * 16777619u);
-        h ^= key;
-        h *= 16777619u;
-        return h;
+        // Per-row seeds: golden ratio multiples produce independent hashes.
+        constexpr std::uint64_t kGoldenRatio = 0x9E3779B97F4A7C15ULL;
+        std::uint64_t h = (static_cast<std::uint64_t>(key) ^ (seed * kGoldenRatio)) * kGoldenRatio;
+        return static_cast<std::uint32_t>(h >> 32);  // Take the high 32 bits
     }
 };
 

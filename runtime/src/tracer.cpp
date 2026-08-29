@@ -66,9 +66,10 @@ struct TraceEmitter {
     std::byte* buf;
     std::size_t cap;
     std::size_t pos{0};
+    bool overflowed{false};  // Set on first failed emit; checked by compile_trace
 
     [[nodiscard]] bool emit8(std::uint8_t b) noexcept {
-        if (pos >= cap) return false;
+        if (pos >= cap) { overflowed = true; return false; }
         buf[pos++] = static_cast<std::byte>(b);
         return true;
     }
@@ -80,6 +81,15 @@ struct TraceEmitter {
         for (int i = 0; i < 8; ++i) if (!emit8((v >> (8*i)) & 0xFF)) return false;
         return true;
     }
+
+    /// Check if we have room for n more bytes. Returns false if not.
+    /// compile_trace calls this before each instruction's emission block.
+    [[nodiscard]] bool has_room(std::size_t n) const noexcept {
+        return pos + n <= cap;
+    }
+
+    /// Was an overflow detected during emission?
+    [[nodiscard]] bool failed() const noexcept { return overflowed; }
 
     // REX prefix for 64-bit ops
     void rex_w() { emit8(0x48); }
@@ -221,6 +231,14 @@ struct TraceEmitter {
         return patch_pos;
     }
 
+    // JE rel32  (0F 84 cd) — jump if equal/zero
+    std::size_t je_rel32() {
+        emit8(0x0F); emit8(0x84);
+        std::size_t patch_pos = pos;
+        emit32(0);
+        return patch_pos;
+    }
+
     // JMP rel32  (E9 cd)
     std::size_t jmp_rel32() {
         emit8(0xE9);
@@ -334,6 +352,14 @@ namespace x86_cond {
         const Instr& instr = ti.instr;
         Op op = static_cast<Op>(instr.op);
 
+        // Bug fix 1.7.1: check buffer capacity before each instruction.
+        // Worst case per instruction: ~30 bytes (guard + load + op + write).
+        // If we don't have room, abort compilation (Rule 120: fall back).
+        if (!e.has_room(64)) {
+            munmap(buf, mapped);
+            return false;
+        }
+
         switch (op) {
             case Op::PY_BINOP: {
                 std::uint8_t dst = instr.dst;
@@ -433,26 +459,13 @@ namespace x86_cond {
                 break;
             }
             case Op::JUMP_IF_FALSE: {
-                // Conditional backedge — check condition.
-                // If TRUE: fall through to the body (loop continues).
-                // If FALSE: jump to deopt (loop exits).
+                // Conditional: if condition is FALSE (zero), jump to deopt (loop exit).
+                // If TRUE (non-zero), fall through to the body (loop continues).
                 std::uint8_t cond_reg = instr.a;
-                // Load the bool payload
                 e.mov_r64_mem(x86::RAX, x86::RBX, slot_disp(cond_reg, kPayloadOffset));
-                // TEST RAX, RAX (check if truthy)
-                e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);
-                // JZ to deopt (loop exit). Falls through to body if true.
-                std::size_t deopt_j = e.jmp_rel32();  // use JMP for now (JZ would be 0F 84)
-                // Actually: we need JZ (jump if zero = jump if false).
-                // But our emitter only has JNE/JGE/JL/JLE. Let me use JE instead.
-                // JE rel32 = 0F 84 cd
-                // Back up: we emitted JMP (E9) but need JE (0F 84).
-                // Remove the JMP bytes and emit JE instead.
-                e.pos -= 5;  // undo the JMP
-                e.emit8(0x0F); e.emit8(0x84);  // JE rel32
-                std::size_t patch_pos = e.pos;
-                e.emit32(0);
-                deopt_jumps.push_back(patch_pos);
+                e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);  // TEST RAX, RAX
+                std::size_t deopt_j = e.je_rel32();  // JE to deopt (zero = false)
+                deopt_jumps.push_back(deopt_j);
                 break;
             }
             case Op::LOAD_CONST: {
@@ -492,6 +505,13 @@ namespace x86_cond {
         }
     }
 
+    // Bug fix 1.7.1: check for emission overflow after all instructions.
+    // If the emitter ran out of space, the code is truncated — don't execute it.
+    if (e.failed()) {
+        munmap(buf, mapped);
+        return false;
+    }
+
     // --- Deopt stub ---
     std::size_t deopt_pos = e.pos;
     // Patch all deopt jumps to point here
@@ -523,6 +543,9 @@ namespace x86_cond {
 
 bool MetaTracer::on_backedge(CodeUnit* unit, std::uint32_t pc,
                                std::uint32_t target_pc) noexcept {
+    // Build the lookup key: (unit_id << 16) | header_pc
+    std::uint64_t key = (static_cast<std::uint64_t>(unit->id) << 16) | target_pc;
+
     // Case 1: Recording in progress, backedge returned to header
     if (recording && record_unit == unit && target_pc == record_start_pc) {
         finish_recording();
@@ -530,14 +553,18 @@ bool MetaTracer::on_backedge(CodeUnit* unit, std::uint32_t pc,
     }
 
     // Case 2: A compiled trace exists for this loop header
-    if (active && active->unit == unit && active->header_pc == target_pc &&
-        active->is_compiled && active->native_code) {
-        ++active->hit_count;
-        return true;  // Invoke the compiled trace
+    if (Trace** pp = traces.get(key)) {
+        Trace* t = *pp;
+        if (t && t->is_compiled && t->native_code) {
+            ++t->hit_count;
+            return true;  // Invoke the compiled trace
+        }
     }
 
     // Case 3: Loop is hot — start recording
-    if (!recording && !active && unit->backedge_count >= kHotThreshold) {
+    if (!recording && unit->backedge_count >= kHotThreshold) {
+        // Check if we already have a (failed) trace for this key — don't re-record
+        if (traces.get(key)) return false;  // Already tried, failed
         recording = static_cast<Trace*>(std::malloc(sizeof(Trace)));
         if (!recording) return false;
         recording = new (recording) Trace{};
@@ -548,6 +575,29 @@ bool MetaTracer::on_backedge(CodeUnit* unit, std::uint32_t pc,
         record_unit = unit;
         return false;
     }
+
+    // If recording is in progress but this backedge doesn't match the
+    // recording header, abort the current recording (nested loop interference).
+    // Nested loops can't be traced as a single linear trace — they need
+    // trace trees (side-exit recording, future work).
+    if (recording && !(record_unit == unit && target_pc == record_start_pc)) {
+        recording->~Trace();
+        std::free(recording);
+        recording = nullptr;
+    }
+
+    // Also: if a compiled trace deopts (returns None), don't re-invoke
+    // it immediately. The deopt means the trace's guard failed or the
+    // loop exited. Re-invoking would cause an infinite deopt loop.
+    // Fix: after a trace deopts, temporarily disable it by removing it
+    // from the traces map.
+    // NOTE: This is handled in the L_JUMP/L_JUMP_IF_FALSE handlers —
+    // they check rv.tag == Tag::None and fall through to the interpreter.
+    // The next backedge will find the trace in the map and re-invoke it.
+    // For nested loops, this causes the infinite deopt loop described above.
+    // The proper fix is trace trees (side-exit recording). For now, the
+    // abort-on-nested-interference above prevents traces from being
+    // compiled for loops that contain nested loops.
 
     return false;
 }
@@ -588,7 +638,15 @@ void MetaTracer::finish_recording() noexcept {
     std::fprintf(stderr, "VORTEX tracer: trace compiled (%zu instrs, %zu bytes native)\n",
                  recording->instrs.size(), recording->native_code_size);
 
-    active = recording;
+    // Build the lookup key
+    std::uint64_t key = (static_cast<std::uint64_t>(recording->unit->id) << 16) |
+                        recording->header_pc;
+
+    // Store in the traces map (replaces old single `active` pointer).
+    // Bug fix 1.7.3: old active trace's native_code was leaked. Now the
+    // map holds all traces; eviction (future) munmaps the old code.
+    traces.insert(key, recording);
+
     recording = nullptr;
 }
 
