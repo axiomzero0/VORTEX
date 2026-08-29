@@ -2134,7 +2134,7 @@ L_YIELD: {
 }
 L_JUMP: {
     if (cur->imm <= f.pc) {
-        ++f.unit->backedge_count;
+        f.unit->bump_backedge(cur->imm);
         // Giga Tracing: probabilistic branch frequency (Count-Min Sketch)
         profiler.record_branch(f.pc, true);
         // Record the backedge JUMP BEFORE calling on_backedge
@@ -2162,7 +2162,7 @@ L_JUMP: {
 }
 L_JUMP_IF_FALSE: {
     if (cur->imm <= f.pc) {
-        ++f.unit->backedge_count;
+        f.unit->bump_backedge(cur->imm);
         if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
             std::uint64_t key = (static_cast<std::uint64_t>(f.unit->id) << 16) | cur->imm;
             Trace** pp = tracer.traces.get(key);
@@ -2192,7 +2192,7 @@ L_JUMP_IF_FALSE: {
 }
 L_JUMP_IF_TRUE: {
     if (cur->imm <= f.pc) {
-        ++f.unit->backedge_count;
+        f.unit->bump_backedge(cur->imm);
     }
     bool t = rt.truthy(regs[cur->a]);
     if (t) {

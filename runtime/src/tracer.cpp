@@ -562,7 +562,10 @@ bool MetaTracer::on_backedge(CodeUnit* unit, std::uint32_t pc,
     }
 
     // Case 3: Loop is hot — start recording
-    if (!recording && unit->backedge_count >= kHotThreshold) {
+    // Use per-header backedge count (not total backedge_count) so nested
+    // loops don't interfere. Each loop header has its own counter.
+    std::uint64_t this_loop_backedges = unit->backedges_for(target_pc);
+    if (!recording && this_loop_backedges >= kHotThreshold) {
         // Check if we already have a (failed) trace for this key — don't re-record
         if (traces.get(key)) return false;  // Already tried, failed
         recording = static_cast<Trace*>(std::malloc(sizeof(Trace)));

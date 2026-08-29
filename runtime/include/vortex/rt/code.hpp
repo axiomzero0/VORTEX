@@ -113,8 +113,37 @@ struct CodeUnit {
     // path was 10-20x slowdown on loop-heavy code (a locked xadd per
     // backedge iteration stalls the pipeline and causes cache coherence
     // traffic). Plain increment is ~1ns; atomic is ~10-20ns.
-    mutable std::uint64_t backedge_count{0};
+    //
+    // Per-loop-header backedge counting: each loop header PC gets its
+    // own counter, so nested loops don't interfere. Uses a flat_map
+    // (Rule 17: cache-friendly, no std::unordered_map). The map is
+    // small (most functions have ≤4 loops) so lookup is ~4 comparisons.
+    mutable std::uint64_t backedge_count{0};  // Total (legacy, for telemetry)
     mutable std::uint64_t call_count{0};
+    /// Per-header backedge counts. Keyed by the backedge TARGET PC
+    /// (the loop header). Looked up by on_backedge to decide if a
+    /// specific loop is hot, not the whole unit.
+    struct BackedgeEntry { std::uint32_t pc; std::uint64_t count; };
+    mutable stdx::small_vector<BackedgeEntry, 4> per_header_backedges{};
+
+    /// Increment the per-header backedge count for a specific loop header.
+    /// O(N) where N = number of distinct loop headers (typically ≤4).
+    /// Called once per backedge from L_JUMP/L_JUMP_IF_FALSE.
+    void bump_backedge(std::uint32_t header_pc) const noexcept {
+        ++backedge_count;  // Total counter (for telemetry)
+        for (auto& e : per_header_backedges) {
+            if (e.pc == header_pc) { ++e.count; return; }
+        }
+        per_header_backedges.push_back({header_pc, 1});
+    }
+
+    /// Get the per-header backedge count for a specific loop header.
+    [[nodiscard]] std::uint64_t backedges_for(std::uint32_t header_pc) const noexcept {
+        for (const auto& e : per_header_backedges) {
+            if (e.pc == header_pc) return e.count;
+        }
+        return 0;
+    }
     mutable std::atomic<std::int32_t> current_tier{0};
     std::atomic<void*> jit_entry{nullptr};   // safepoint-swapped machine code
     void* jit_metadata{nullptr};             // deopt tables, owned by backend
