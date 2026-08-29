@@ -768,8 +768,32 @@ namespace x86_cond {
                 // Without this resolution, nested loops hang because the
                 // inner backedge jumps to the outer header, `i` never
                 // increments, and the outer loop runs forever.
-                // Rule 88: safepoint poll (placeholder NOP for now).
-                e.nop();  // safepoint placeholder
+
+                // Giga Tracing (1.14): Rule 88 safepoint poll.
+                // At every backedge, check the global safepoint flag. If set,
+                // call vortex_safepoint_poll() to pause (for GC, deopt, or
+                // suspension). Currently single-threaded so the flag is
+                // never set by another thread, but the infrastructure is
+                // required by Rule 88 for when multi-threading is added.
+                //
+                // Encoding:
+                //   MOV RAX, &g_safepoint_requested   (10 bytes)
+                //   MOVZX EAX, BYTE [RAX]             (3 bytes: 0F B6 00)
+                //   TEST EAX, EAX                      (2 bytes: 85 C0)
+                //   JZ +12  (skip MOV+CALL)           (2 bytes: 74 0C)
+                //   MOV RAX, &vortex_safepoint_poll    (10 bytes)
+                //   CALL RAX                           (2 bytes: FF D0)
+                // Total: 29 bytes. Well within the 64-byte per-instr budget.
+                e.mov_r64_imm64(x86::RAX,
+                    reinterpret_cast<std::uint64_t>(&vortex::rt::g_safepoint_requested));
+                e.emit8(0x0F); e.emit8(0xB6); e.emit8(0x00);  // MOVZX EAX, BYTE [RAX]
+                e.emit8(0x85); e.emit8(0xC0);                   // TEST EAX, EAX
+                e.emit8(0x74); e.emit8(0x0C);                   // JZ +12 (skip MOV+CALL = 10+2)
+                e.mov_r64_imm64(x86::RAX,
+                    reinterpret_cast<std::uint64_t>(&vortex::rt::vortex_safepoint_poll));
+                e.call_rax();
+
+                // Now emit the backedge JMP, resolved to the correct target.
                 std::size_t j = e.jmp_rel32();
                 // Look up the target PC in the pc_to_pos map.
                 std::size_t target_pos = header_pos;  // default: outer header
