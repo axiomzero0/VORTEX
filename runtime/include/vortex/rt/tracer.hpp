@@ -66,6 +66,11 @@ struct Trace {
     std::uint32_t hit_count{0};      // How many times this trace has executed
     void* native_code{nullptr};     // Compiled machine code (null = not yet compiled)
     std::size_t native_code_size{0};
+    /// Capacity of the native_code mmap'd buffer. Needed by free_trace
+    /// to call munmap with the correct size — without this, free_trace
+    /// had to hardcode 4096 (the compile_trace constant), which would
+    /// break if the capacity ever changed.
+    std::size_t native_code_capacity{0};
     bool is_compiled{false};        // Has the trace been compiled to native code?
     bool is_recording{false};       // Are we currently recording this trace?
     /// Giga Tracing (1.11): set when an unsupported op was recorded.
@@ -150,12 +155,12 @@ struct MetaTracer {
     static void free_trace(Trace* t) noexcept {
         if (!t) return;
         // munmap the native code buffer (allocated via mmap in compile_trace).
-        if (t->native_code) {
-            long pagesz = sysconf(_SC_PAGESIZE);
-            if (pagesz <= 0) pagesz = 4096;
-            std::size_t cap = ((4096 + pagesz - 1) / pagesz) * pagesz;  // matches compile_trace's kCodeCap
-            munmap(t->native_code, cap);
+        // Use the stored capacity (set by compile_trace) so munmap gets the
+        // correct size — don't hardcode 4096 here.
+        if (t->native_code && t->native_code_capacity > 0) {
+            munmap(t->native_code, t->native_code_capacity);
             t->native_code = nullptr;
+            t->native_code_capacity = 0;
         }
         t->~Trace();
         std::free(t);

@@ -857,6 +857,7 @@ namespace x86_cond {
 
     trace.native_code = buf;
     trace.native_code_size = e.pos;
+    trace.native_code_capacity = mapped;  // for munmap in free_trace
     trace.is_compiled = true;
     return true;
 }
@@ -969,8 +970,25 @@ void MetaTracer::finish_recording() noexcept {
     // guard elimination on hot traces (Giga Tracing 1.8).
     if (!compile_trace(*recording, profiler_)) {
         std::fprintf(stderr, "VORTEX tracer: trace compilation failed, staying Tier-0\n");
-        recording->~Trace();
-        std::free(recording);
+        // Giga Tracing (1.13): cache the failure so on_backedge doesn't
+        // re-record every kHotThreshold iterations. We store the trace
+        // with native_code=nullptr, is_compiled=false. Case 2's check
+        // (is_compiled && native_code) skips it; Case 3's check
+        // (traces.get(key)) prevents re-recording.
+        // This avoids burning CPU on fruitless recording attempts for
+        // loops that contain unsupported ops (CALL, LIST_APPEND, etc.).
+        std::uint64_t key = (static_cast<std::uint64_t>(recording->unit->id) << 16) |
+                            recording->header_pc;
+        // Free any existing entry for this key first (shouldn't happen
+        // since we returned early, but be safe).
+        if (Trace** existing = traces.get(key)) {
+            if (*existing) free_trace(*existing);
+            traces.erase(key);
+        }
+        if (traces.size() >= kMaxCompiledTraces) {
+            evict_coldest_trace();
+        }
+        traces.insert(key, recording);
         recording = nullptr;
         return;
     }
