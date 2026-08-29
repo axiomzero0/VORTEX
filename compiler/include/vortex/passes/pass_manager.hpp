@@ -127,9 +127,6 @@ template <typename P>
 /// Verifier hook (Rule 40): set in debug builds.
 extern bool (*g_verify_after_each_pass)(const ir::Graph&, const char*);
 
-/// Telemetry sink (Rule 26): optional global.
-extern Telemetry* g_pass_telemetry;
-
 }  // namespace abi_v1
 }  // namespace vortex::passes
 

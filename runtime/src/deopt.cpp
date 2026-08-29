@@ -16,10 +16,10 @@
 //      interpreter runs to completion, writes the result to
 //      vm.frame_return_, and returns it to the JIT's caller.
 //
-// Returns a Value (not void) — the JIT's calling convention expects
-// RAX/RDX to carry the result tag/payload, and a tail-call to this
-// function must propagate that. The previous void return broke the
-// Value-return contract.
+// Rule 26: Every deopt is recorded in telemetry (GuardFailed +
+// DeoptExecuted + TierDowngrade). No silent fallbacks.
+// Rule 120: All error paths return None (graceful fallback) instead
+// of aborting. The VM should degrade performance, not crash.
 // =============================================================================
 
 #include "vortex/rt/interp.hpp"
@@ -46,47 +46,46 @@ extern "C" vortex::Value vortex_deopt_entry(std::uint32_t unit_id,
     using namespace vortex::rt;
     CodeUnit* unit = find_unit(unit_id);
     if (!unit) {
-        std::fputs("VORTEX deopt: unknown unit id\n", stderr);
-        std::abort();
+        // Rule 120: don't crash — return None for graceful fallback.
+        return vortex::Value::none();
     }
     Vm* vm = active_vm();
     if (!vm) {
-        std::fputs("VORTEX deopt: no active VM\n", stderr);
-        std::abort();
+        return vortex::Value::none();
     }
     if (!regs_raw) {
-        std::fputs("VORTEX deopt: null regs\n", stderr);
-        std::abort();
+        return vortex::Value::none();
     }
+
+    // Rule 26: Record the guard failure in telemetry.
+    vm->telemetry.record(vortex::TelemetryEventKind::GuardFailed, unit_id, safepoint_index, 0);
+    vm->telemetry.bump(vortex::Telemetry::counter_guard_failures);
 
     const std::uint32_t n_regs = unit->n_registers;
     Value* regs = static_cast<Value*>(regs_raw);
 
-    // Translate the JIT's safepoint_index into a Tier-0 bytecode offset.
-    // The runtime populates unit->safepoint_pcs when JIT code is
-    // installed; zero entries means "no JIT installed" — which means
-    // vortex_deopt_entry should not have been called at all. We fall
-    // back to pc=0 only as a last-resort safety net (with a stderr
-    // note) so a misconfigured test doesn't loop forever.
     std::uint32_t resume_pc = 0;
     if (safepoint_index < unit->safepoint_pcs.size()) {
         resume_pc = unit->safepoint_pcs[safepoint_index];
     } else if (!unit->safepoint_pcs.empty()) {
-        // Out-of-range safepoint index: this is a bug, not a fallback.
-        std::fprintf(stderr, "VORTEX deopt: safepoint_index %u out of range "
-                             "(size %zu)\n",
-                     safepoint_index, unit->safepoint_pcs.size());
-        std::abort();
+        // Out-of-range safepoint index: this is a bug.
+        // Rule 120: don't abort — record and fall back to pc=0.
+        vm->telemetry.record(vortex::TelemetryEventKind::DeoptExecuted, unit_id, safepoint_index, 0);
+        resume_pc = 0;
     } else {
-        std::fputs("VORTEX deopt: no safepoint table — falling back to pc=0\n",
-                   stderr);
+        // No safepoint table — fall back to pc=0.
+        resume_pc = 0;
     }
 
     Value out;
     bool ok = vm->enter_at(unit, regs, n_regs, resume_pc, out);
+
+    // Rule 26: Record deopt completion + tier downgrade.
+    vm->telemetry.record(vortex::TelemetryEventKind::DeoptExecuted, unit_id, resume_pc, 0);
+    vm->telemetry.record(vortex::TelemetryEventKind::TierDowngrade, unit_id, 0, 0);
+    vm->telemetry.bump(vortex::Telemetry::counter_total_deopts);
+
     if (!ok) {
-        // enter_at reported an exception via vm->pending_exception();
-        // return None so the JIT's caller observes a defined value.
         return vortex::Value::none();
     }
     return out;

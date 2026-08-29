@@ -69,6 +69,11 @@ namespace {
                      static_cast<int>(d.message.size()), d.message.data());
         return 1;
     }
+
+    // Rule 26 / Rule 119: Dump telemetry on exit so every fallback, deopt,
+    // and tier transition is visible. No silent events.
+    vm.telemetry.write_report(stderr);
+
     return 0;
 }
 
