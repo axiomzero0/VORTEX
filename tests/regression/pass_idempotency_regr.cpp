@@ -92,7 +92,7 @@ const char* kKitchenSink =
 
     NodeId a = g.create(NodeKind::ConstPy);
     Node& an = g.node(a);
-    an.const_value = Value::none();
+    an.const_value.tag = Tag::None;
     an.aux0 = 0;
     an.aux1 = 3;
     an.symbol = 0xFFFF'FFFF;
@@ -100,7 +100,7 @@ const char* kKitchenSink =
 
     NodeId b = g.create(NodeKind::ConstPy);
     Node& bn = g.node(b);
-    bn.const_value = Value::none();
+    bn.const_value.tag = Tag::None;
     bn.aux0 = 3;
     bn.aux1 = 3;
     bn.symbol = 0xFFFF'FFFF;

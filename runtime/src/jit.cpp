@@ -105,7 +105,7 @@ extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id
         Runtime& rt = Runtime::instance();
         for (std::uint32_t i = 0; i < n_regs && i < f.n_regs; ++i) {
             f.regs[i] = regs[i];
-            if (regs[i].tag() == Tag::Obj && regs[i].as_obj()) rt.incref(regs[i].as_obj());
+            if (regs[i].tag == Tag::Obj && regs[i].as.obj) rt.incref(regs[i].as.obj);
         }
         f.pc = resume_pc;
         bool prev = vm->jit_disabled_in_bridge;
@@ -117,7 +117,7 @@ extern "C" vortex::Value vortex_jit_bridge(void* regs_raw, std::uint32_t unit_id
             regs[i] = f.regs[i];
             // The Frame's destructor will decref its copy; the JIT's copy
             // needs its own incref.
-            if (f.regs[i].tag() == Tag::Obj && f.regs[i].as_obj()) rt.incref(f.regs[i].as_obj());
+            if (f.regs[i].tag == Tag::Obj && f.regs[i].as.obj) rt.incref(f.regs[i].as.obj);
         }
         if (st == ExecStatus::Returned) {
             out = vm->frame_return_;

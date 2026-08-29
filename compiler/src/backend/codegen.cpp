@@ -86,19 +86,17 @@ using namespace vortex::ir;
 
 namespace {
 
-// NaN-boxed Value layout (8 bytes, was 16).
-// Tag is encoded in bits 63-48 of the 64-bit word. Payload in bits 47-0.
-// The codegen reads the FULL 64-bit word and uses shifts/masks.
-constexpr std::int32_t kValueSize = 8;       // NaN-boxed: 8 bytes per Value
-constexpr std::int32_t kTagOffset = 0;       // tag + payload in same word
-constexpr std::int32_t kPayloadOffset = 0;   // same word
+// Value layout: tag word at +0 (8 bytes incl. padding), payload at +8.
+constexpr std::int32_t kTagOffset = 0;
+constexpr std::int32_t kPayloadOffset = 8;
+constexpr std::int32_t kValueSize = 16;
 
-// Tag constants (NaN-boxed, top 16 bits). Must match value.hpp.
-constexpr std::uint64_t kTagNone = 0xFFF0000000000000ULL;
-constexpr std::uint64_t kTagBool = 0xFFF1000000000000ULL;
-constexpr std::uint64_t kTagInt  = 0xFFF2000000000000ULL;
-constexpr std::uint64_t kTagObj  = 0xFFF3000000000000ULL;
-// Float: any value with bits 63-48 < 0xFFF0 is a double.
+// Tag values (must match common/value.hpp).
+constexpr std::uint64_t kTagNone = 0;
+constexpr std::uint64_t kTagBool = 1;
+constexpr std::uint64_t kTagInt = 2;
+constexpr std::uint64_t kTagFloat = 3;
+constexpr std::uint64_t kTagObj = 4;
 
 // MCond -> x86-64 Jcc condition nibble (two-byte 0F 8x form). Emitter-side
 // table: the neutral MIR carries no x86 encodings.
@@ -656,7 +654,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // home write when has_reg=true, which left the tag
                     // uninitialized for subsequent GUARD_INT reads — the
                     // bool fast path's GUARD_INT fired spuriously because
-                    // home.tag() was 0 (Tag::None), not Tag::Int. The
+                    // home.tag was 0 (Tag::None), not Tag::Int. The
                     // IBE-18 revert was because the Return's tag_vreg
                     // MOVri shared home_slot=0 with the Return's MOVmr
                     // (which writes the actual return value to
@@ -671,9 +669,12 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // don't need to populate the GPR here.
                     a.mov_r64_imm64(x86::RAX,
                                     static_cast<std::uint64_t>(n.operands[0].imm));
-                    a.mov_r64_imm64(x86::RCX, kTagInt);
-                    a.alu_r64_r64(0x09, x86::RAX, x86::RCX);
-                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kTagOffset), x86::RAX);
+                    a.mov_mem_r64(frame_base,
+                                  slot_disp(n.home_slot, kPayloadOffset),
+                                  x86::RAX);
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagInt));
                     // Pass 54: record this vreg's immediate so a later
                     // ADDrr/SUBrr/CMPrr in the SAME block can fuse to
                     // ALU r64, imm32. Vregs are single-def in the MIR,
@@ -703,14 +704,14 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // slot. Source read offset: ALWAYS the payload offset
                     // (8). The source vreg's value (whether it's the Add
                     // result, a ConstInt's imm, or a tag_vreg's
-                    // kTagBool/kTagInt/kTagInt constant) lives at
+                    // kTagBool/kTagInt/kTagFloat constant) lives at
                     // home[src].payload.
                     //
                     // Dest write offset: dest.tag_off (controlled by the
                     // lowering — 8 for payload-writes, 0 for tag-writes).
                     // The earlier code used dest.tag_off for BOTH src read
                     // and dest write — that conflated the two offsets,
-                    // producing wrong values when src.payload → dest.tag()
+                    // producing wrong values when src.payload → dest.tag
                     // (the tag_vreg pattern in the Return terminator).
                     //
                     // Pass 54: the source read goes through stage_rax,
@@ -766,12 +767,10 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                             a.imul_r64_r64(x86::RAX, x86::RCX);
                         }
                     }
-                    // Write-back: NaN-boxed. The ALU result is in RAX
-                    // (48-bit payload). OR with kTagInt to set the top 16
-                    // bits, then write the full 64-bit word.
-                    a.mov_r64_imm64(x86::RCX, kTagInt);
-                    a.alu_r64_r64(0x09, x86::RAX, x86::RCX);  // OR rax, rcx
-                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kTagOffset), x86::RAX);
+                    // Write-back: payload + tag.
+                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
+                    a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagInt));
                     // Pass 54: populate dst_gpr from RAX so subsequent
                     // consumers can read from the GPR.
                     populate_dst_from_rax(id);
@@ -787,10 +786,9 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     RegOrSlot src = resolve(n.operands[0]);
                     stage_rax(src, kPayloadOffset);
                     a.neg_r64(x86::RAX);
-                    // NaN-boxed: OR tag, write full word
-                    a.mov_r64_imm64(x86::RCX, kTagInt);
-                    a.alu_r64_r64(0x09, x86::RAX, x86::RCX);
-                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kTagOffset), x86::RAX);
+                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kPayloadOffset), x86::RAX);
+                    a.mov_mem_imm32(frame_base, slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagInt));
                     // Pass 54: populate dst_gpr from RAX.
                     populate_dst_from_rax(id);
                     break;
@@ -897,19 +895,15 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // after this point — only tag words).
                     gpr_cache.clobber(x86::RAX);
                     gpr_cache.clobber(x86::RCX);
-                    // NaN-boxed: load full 64-bit word, shift right 48 to
-                    // extract the top 16 bits (the tag), compare against kTagInt >> 48.
                     a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(lhs.slot, kTagOffset));
-                    a.shr_r64_imm8(x86::RAX, 48);
-                    a.mov_r64_imm64(x86::RCX, kTagInt >> 48);
+                    a.mov_r64_imm64(x86::RCX, kTagInt);
                     a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                     std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
                     a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(rhs.slot, kTagOffset));
-                    a.shr_r64_imm8(x86::RAX, 48);
-                    a.mov_r64_imm64(x86::RCX, kTagInt >> 48);
+                    a.mov_r64_imm64(x86::RCX, kTagInt);
                     a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
                     std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
@@ -930,7 +924,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // regalloc — their home_slot is the authoritative source
                     // of the tag word (write-back discipline: any FPR op
                     // reads/writes through the home slot). We stage the tag
-                    // into RAX, compare against kTagInt, Jcc to the deopt
+                    // into RAX, compare against kTagFloat, Jcc to the deopt
                     // stub on mismatch.
                     if (n.operands.size() < 2) break;
                     RegOrSlot lhs = resolve(n.operands[0]);
@@ -940,22 +934,17 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // tag values into them.
                     gpr_cache.clobber(x86::RAX);
                     gpr_cache.clobber(x86::RCX);
-                    // NaN-boxed: floats are stored as-is (top 16 bits < 0xFFF0).
-                    // Check: load word, compare top 16 bits against 0xFFF0.
-                    // If >= 0xFFF0, it's NOT a float (it's a tagged non-double).
                     a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(lhs.slot, kTagOffset));
-                    a.shr_r64_imm8(x86::RAX, 48);
-                    a.mov_r64_imm64(x86::RCX, 0xFFF0);
+                    a.mov_r64_imm64(x86::RCX, kTagFloat);
                     a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
-                    std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::GE)]);
+                    std::size_t j1 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
                     a.mov_r64_mem(x86::RAX, frame_base,
                                   slot_disp(rhs.slot, kTagOffset));
-                    a.shr_r64_imm8(x86::RAX, 48);
-                    a.mov_r64_imm64(x86::RCX, 0xFFF0);
+                    a.mov_r64_imm64(x86::RCX, kTagFloat);
                     a.alu_r64_r64(0x39, x86::RAX, x86::RCX);
-                    std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::GE)]);
+                    std::size_t j2 = a.jcc_rel32(kX86Cond[static_cast<std::size_t>(MCond::NE)]);
 
                     std::uint32_t sp_idx = emit_safepoint(n.frame_state_id, 2);
                     out.mappings.push_back(SafepointMapping{x86::RAX, 0});
@@ -1000,7 +989,12 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // Write-back: payload + tag (FP home discipline — keeps
                     // the home slot authoritative for deopt + GUARD_FLOAT
                     // tag-word reads).
-                    a.movsd_mem_xmm(frame_base, slot_disp(n.home_slot, kTagOffset), x86::XMM0);
+                    a.movsd_mem_xmm(frame_base,
+                                    slot_disp(n.home_slot, kPayloadOffset),
+                                    x86::XMM0);
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagFloat));
                     // Pass 54 V3: populate dst_xmm from XMM0 so subsequent
                     // FP reads of this vreg hit the XMM cache.
                     populate_dst_from_xmm0(id);
@@ -1033,12 +1027,17 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     // FP constant materialization. Write the imm's low 64
                     // bits (the IEEE 754 bit pattern, carried as int64
                     // through the MIR) into the home slot's payload, then
-                    // write tag=kTagInt. RAX is the staging register
+                    // write tag=kTagFloat. RAX is the staging register
                     // (caller-saved scratch under SysV).
                     if (n.operands.empty()) break;
                     a.mov_r64_imm64(x86::RAX,
                                     static_cast<std::uint64_t>(n.operands[0].imm));
-                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kTagOffset), x86::RAX);
+                    a.mov_mem_r64(frame_base,
+                                  slot_disp(n.home_slot, kPayloadOffset),
+                                  x86::RAX);
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagFloat));
                     // Pass 54 V2 (legacy): populate dst_gpr from RAX (the
                     // FP constant's RAW bit pattern is now in RAX as an
                     // int64; a GPR-class consumer reading this as int64
@@ -1076,10 +1075,14 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
                     if (mc >= MCond::Count) break;
                     a.setcc_al(kX86Cond[static_cast<std::size_t>(mc)]);
                     a.movzx_eax_al();   // zero-extend AL → EAX (preserves flags, clears upper 56 bits)
-                    // NaN-boxed: OR kTagBool into result, write full word
-                    a.mov_r64_imm64(x86::RCX, kTagBool);
-                    a.alu_r64_r64(0x09, x86::RAX, x86::RCX);
-                    a.mov_mem_r64(frame_base, slot_disp(n.home_slot, kTagOffset), x86::RAX);
+                    // Store the bool payload.
+                    a.mov_mem_r64(frame_base,
+                                  slot_disp(n.home_slot, kPayloadOffset),
+                                  x86::RAX);
+                    // Write tag = kTagBool.
+                    a.mov_mem_imm32(frame_base,
+                                    slot_disp(n.home_slot, kTagOffset),
+                                    static_cast<std::int32_t>(kTagBool));
                     // Pass 54: populate dst_gpr from RAX (the bool payload
                     // is now in RAX after movzx_eax_al — 0 or 1).
                     populate_dst_from_rax(id);
@@ -1245,7 +1248,7 @@ CompiledCode compile_unit(const Graph& g, std::uint32_t unit_id, std::byte* buff
     out.valid = a.size() > 0 && a.size() < capacity;
     (void)kTagNone;
     (void)kTagBool;
-    (void)kTagInt;
+    (void)kTagFloat;
     (void)kTagObj;
     (void)vm_ctx;
     return out;

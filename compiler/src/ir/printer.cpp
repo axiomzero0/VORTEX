@@ -70,14 +70,14 @@ void print_node_line(const Graph& g, NodeId id, std::FILE* out) noexcept {
     // Payloads per kind.
     switch (n.kind) {
         case NodeKind::ConstInt:
-            std::fprintf(out, " %lld", static_cast<long long>(n.const_value.as_i()));
+            std::fprintf(out, " %lld", static_cast<long long>(n.const_value.as.i));
             break;
         case NodeKind::ConstFloat:
-            std::fprintf(out, " %.17g", n.const_value.as_f());
+            std::fprintf(out, " %.17g", n.const_value.as.f);
             break;
         case NodeKind::ConstPy:
-            std::fprintf(out, " tag=%d i=%lld", static_cast<int>(n.const_value.tag()),
-                         static_cast<long long>(n.const_value.as_i()));
+            std::fprintf(out, " tag=%d i=%lld", static_cast<int>(n.const_value.tag),
+                         static_cast<long long>(n.const_value.as.i));
             break;
         case NodeKind::Parameter:
             std::fprintf(out, " %u", n.aux0);

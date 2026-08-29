@@ -264,7 +264,7 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
                             cu->phi_init_node_ids.push_back(
                                 static_cast<std::uint32_t>(id));
                             cu->phi_init_values.push_back(
-                                entry.const_value.as_i());
+                                entry.const_value.as.i);
                             cu->phi_init_is_float.push_back(0);
                         } else if (entry.kind == ir::NodeKind::ConstFloat) {
                             cu->phi_init_node_ids.push_back(
@@ -273,8 +273,8 @@ CompileOutcome compile_program(Vm& vm, std::string_view source,
                             // transport; the CALL handler reinterprets
                             // back to double when writing Value::real.
                             std::int64_t bits;
-                            double fv = entry.const_value.as_f();
-                            std::memcpy(&bits, &fv, sizeof(double));
+                            std::memcpy(&bits, &entry.const_value.as.f,
+                                        sizeof(double));
                             cu->phi_init_values.push_back(bits);
                             cu->phi_init_is_float.push_back(1);
                         }

@@ -339,7 +339,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
         switch (n.kind) {
             case NodeKind::ConstInt: {
                 result = out.mir.create(MOp::MOVri, MachineRegClass::GPR, home);
-                out.mir.add_operand(result, MachineOperand::imm_op(n.const_value.as_i()));
+                out.mir.add_operand(result, MachineOperand::imm_op(n.const_value.as.i));
                 break;
             }
             case NodeKind::ConstFloat: {
@@ -354,7 +354,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                 // home slot's payload.
                 result = out.mir.create(MOp::FCONSTri, MachineRegClass::FPR, home);
                 out.mir.add_operand(result, MachineOperand::imm_op(
-                    n.const_value.as_i()));
+                    n.const_value.as.i));
                 break;
             }
             case NodeKind::ConstPy: {
@@ -544,15 +544,15 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                             out.mir.add_operand(wb, MachineOperand::slot_op(home, 8 /*payload off*/));
                             out.mir.add_operand(wb, MachineOperand::reg(res));
                             // Tag write-back: materialize Tag::Float constant
-                            // and write it to the PyBinary's home.tag() (NOT
+                            // and write it to the PyBinary's home.tag (NOT
                             // slot 0 — the IBE-18 final fix gives each
                             // tag_vreg a UNIQUE home_slot beyond frame_slots
-                            // so its MOVri's kTagInt write to tag_home.tag()
+                            // so its MOVri's kTagInt write to tag_home.tag
                             // doesn't clobber slot 0's tag word). The
                             // previous code used home=0 for the tag_vreg,
-                            // which wrote kTagInt (2) to home[0].tag() — when
+                            // which wrote kTagInt (2) to home[0].tag — when
                             // the PyBinary happened to be the function's
-                            // return value, this left home[0].tag()=kTagInt
+                            // return value, this left home[0].tag=kTagInt
                             // instead of kTagFloat, and the caller printed
                             // the FP bit pattern as a decimal int64. The
                             // regression `jit_loop_regr_parsed_float_loop`
@@ -760,12 +760,12 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
             // Task 24 (candidate j): give the zero_const a UNIQUE
             // home_slot beyond frame_slots (the IBE-18 final fix
             // pattern). The previous code used home=0, which made
-            // MOVri write kTagInt (2) to home[0].tag() — clobbering
+            // MOVri write kTagInt (2) to home[0].tag — clobbering
             // slot 0's tag word. For functions whose return value
             // happens to be int, this accidentally produced the right
             // tag (kTagInt). For functions returning float/bool, the
             // Return's else-branch (know_tag=false for src=PyBinary)
-            // leaves home[0].tag() at the clobbered kTagInt, so the
+            // leaves home[0].tag at the clobbered kTagInt, so the
             // caller prints FP bits as a decimal int64. The regression
             // `jit_loop_regr_parsed_float_loop` was masked until Task
             // 24 candidate (j) removed the has_loop_phis downgrade.
@@ -804,7 +804,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
             // kTagFloat. Pass 47 today only marks Box/Unbox identity
             // pairs as Unboxed, so PyBinary (the dominant arithmetic
             // producer) is never Unboxed — know_tag stayed false, the
-            // else branch wrote payload only, and home[0].tag() stayed at
+            // else branch wrote payload only, and home[0].tag stayed at
             // Tag::None. The caller then printed "None" for any
             // PyBinary-returning function. We now use infer_home_tag
             // (which inspects the IR kind + operands' provability
@@ -829,7 +829,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                 // clobber the return value's payload. With a fresh
                 // home_slot, the tag_vreg's MOVri writes to its own slot
                 // and the wb_tag MOVmr reads that tag and writes it to
-                // home[0].tag() — no clobber.
+                // home[0].tag — no clobber.
                 std::uint32_t tag_home = out.frame_slots;
                 out.frame_slots = tag_home + 1;
                 std::uint32_t tag_vreg = out.mir.create(MOp::MOVri, MachineRegClass::GPR, tag_home);
@@ -868,7 +868,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
         // each Phi P whose control input (P.ins.back()) == S, materialize
         // P.ins[pred_idx] (the backedge value coming from THIS block) and
         // emit a MOVmr writing its payload to P.home.payload, plus a
-        // tag-MOVmr writing the inferred source tag to P.home.tag().
+        // tag-MOVmr writing the inferred source tag to P.home.tag.
         //
         // If S's MIR block id != B's + 1 (backedge OR forward jump over
         // the next block in layout), also emit an unconditional JMP MOp
@@ -915,7 +915,7 @@ LoweringResult lower_to_mir(const Graph& g, const TargetDescriptor& target) noex
                                     MachineOperand::slot_op(phi_home, 8 /*payload off*/));
                 out.mir.add_operand(wb_payload, MachineOperand::reg(src));
                 // Tag write: materialize the inferred tag constant,
-                // then MOVmr to phi_home.tag(). Mirrors the Return
+                // then MOVmr to phi_home.tag. Mirrors the Return
                 // terminator's tag-vreg pattern (IBE-18 final fix:
                 // tag_vreg gets a unique home_slot beyond frame_slots
                 // so its MOVri write doesn't clobber the payload

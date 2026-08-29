@@ -663,19 +663,19 @@ TEST(regr_jit_int_arithmetic_matches_expected) {
             ++failures;
             continue;
         }
-        if (got.tag() != Tag::Int) {
+        if (got.tag != Tag::Int) {
             std::fprintf(stderr,
                          "  [jit-diff] %s: result tag %u (expected Int=%u)\n",
-                         c.name, static_cast<unsigned>(got.tag()),
+                         c.name, static_cast<unsigned>(got.tag),
                          static_cast<unsigned>(Tag::Int));
             ++failures;
             continue;
         }
-        if (got.as_i() != c.expected) {
+        if (got.as.i != c.expected) {
             std::fprintf(stderr,
                          "  [jit-diff] %s: result %lld (expected %lld)\n",
                          c.name,
-                         static_cast<long long>(got.as_i()),
+                         static_cast<long long>(got.as.i),
                          static_cast<long long>(c.expected));
             ++failures;
         }
@@ -740,10 +740,10 @@ TEST(regr_jit_float_arithmetic_matches_expected) {
             ++failures;
             continue;
         }
-        if (got.tag() != Tag::Float) {
+        if (got.tag != Tag::Float) {
             std::fprintf(stderr,
                          "  [jit-diff-float] %s: result tag %u (expected Float=%u)\n",
-                         c.name, static_cast<unsigned>(got.tag()),
+                         c.name, static_cast<unsigned>(got.tag),
                          static_cast<unsigned>(Tag::Float));
             ++failures;
             continue;
@@ -753,10 +753,10 @@ TEST(regr_jit_float_arithmetic_matches_expected) {
         // produced by the JIT to the IEEE 754 bits computed by the host
         // compiler for the same op. NaN is not in the corpus (none of the
         // operations produce NaN on these inputs).
-        if (got.as_f() != c.expected) {
+        if (got.as.f != c.expected) {
             std::fprintf(stderr,
                          "  [jit-diff-float] %s: result %g (expected %g)\n",
-                         c.name, got.as_f(), c.expected);
+                         c.name, got.as.f, c.expected);
             ++failures;
         }
     }
@@ -783,15 +783,15 @@ TEST(regr_jit_bool_arithmetic_matches_expected) {
             ++failures;
             continue;
         }
-        if (got.tag() != Tag::Bool) {
+        if (got.tag != Tag::Bool) {
             std::fprintf(stderr,
                          "  [jit-diff-bool] %s: result tag %u (expected Bool=%u)\n",
-                         c.name, static_cast<unsigned>(got.tag()),
+                         c.name, static_cast<unsigned>(got.tag),
                          static_cast<unsigned>(Tag::Bool));
             ++failures;
             continue;
         }
-        const bool got_b = got.as_i() != 0;
+        const bool got_b = got.as.i != 0;
         if (got_b != c.expected) {
             std::fprintf(stderr,
                          "  [jit-diff-bool] %s: result %s (expected %s)\n",

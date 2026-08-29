@@ -110,9 +110,8 @@ struct Node {
 
     /// Value-numbering key inputs for GVN: kind+subop+payload+inputs.
     [[nodiscard]] bool structurally_equal(const Node& o) const noexcept {
-        return kind == o.kind && subop == o.subop &&
-               const_value.structurally_equal(o.const_value) &&
-               symbol == o.symbol &&
+        return kind == o.kind && subop == o.subop && const_value.tag == o.const_value.tag &&
+               const_value.as.i == o.const_value.as.i && symbol == o.symbol &&
                shape_id == o.shape_id && aux0 == o.aux0 && ins.size() == o.ins.size() &&
                std::memcmp(ins.data(), o.ins.data(), ins.size() * sizeof(NodeId)) == 0;
     }

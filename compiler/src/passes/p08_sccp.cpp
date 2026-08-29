@@ -24,7 +24,7 @@ bool fold_const_op(Graph& g, NodeId id) noexcept {
     const Node& a = g.node(n.ins[2]);
     const Node& b = g.node(n.ins[3]);
     if (a.kind != NodeKind::ConstInt || b.kind != NodeKind::ConstInt) return false;
-    std::int64_t x = a.const_value.as_i(), y = b.const_value.as_i(), out = 0;
+    std::int64_t x = a.const_value.as.i, y = b.const_value.as.i, out = 0;
     switch (static_cast<BinOpKind>(n.subop)) {
         case BinOpKind::Add: if (__builtin_add_overflow(x, y, &out)) return false; break;
         case BinOpKind::Sub: if (__builtin_sub_overflow(x, y, &out)) return false; break;
@@ -44,10 +44,10 @@ bool decide_branch(Graph& g, NodeId id) noexcept {
     if (n.kind != NodeKind::If || n.ins.size() < 2) return false;
     const Node& cond = g.node(n.ins[1]);
     bool truth = false;
-    if (cond.kind == NodeKind::ConstPy && cond.const_value.tag() == Tag::Bool) {
-        truth = cond.const_value.as_i() != 0;
+    if (cond.kind == NodeKind::ConstPy && cond.const_value.tag == Tag::Bool) {
+        truth = cond.const_value.as.i != 0;
     } else if (cond.kind == NodeKind::ConstInt) {
-        truth = cond.const_value.as_i() != 0;
+        truth = cond.const_value.as.i != 0;
     } else {
         return false;
     }

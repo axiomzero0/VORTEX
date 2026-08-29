@@ -149,7 +149,7 @@ std::uint64_t Graph::node_hash(NodeId n) const noexcept {
     const Node& x = nodes_[n];
     std::uint64_t h = mix64(static_cast<std::uint64_t>(x.kind) << 48 |
                             static_cast<std::uint64_t>(x.subop) << 32 | x.symbol);
-    h = mix64(h ^ x.const_value.as_i());
+    h = mix64(h ^ x.const_value.as.i);
     h = mix64(h ^ (std::uint64_t{x.shape_id} << 32 | x.aux0));
     for (NodeId input : x.ins) {
         h = mix64(h ^ mix64(input + 0x9e3779b97f4a7c15ull));

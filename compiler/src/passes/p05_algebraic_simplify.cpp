@@ -35,7 +35,7 @@ bool try_rewrite(Graph& g, NodeId id) noexcept {
         return true;
     };
     auto is_int_const = [](const Node& x, std::int64_t want) noexcept {
-        return x.kind == NodeKind::ConstInt && x.const_value.as_i() == want;
+        return x.kind == NodeKind::ConstInt && x.const_value.as.i == want;
     };
 
     // PASS-1/PASS-2 fix: every rewrite that drops an operand (x & 0 -> 0,
