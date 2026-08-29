@@ -1467,12 +1467,20 @@ ExecStatus Vm::exec_frame(Frame& f) noexcept {
     VM_DISPATCH();
 L_LOAD_CONST: {
     const Value& c = f.unit->constants[cur->imm];
+    // Meta-tracer: record this instruction.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, 0, 0, static_cast<std::uint8_t>(c.tag));
+    }
     write_reg_owned(cur->dst, c);
     ++f.pc;
     VM_LOAD();
     VM_DISPATCH();
 }
 L_MOVE: {
+    // Meta-tracer: record this instruction.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
+    }
     move_reg(cur->dst, cur->a);
     ++f.pc;
     VM_LOAD();
@@ -2127,19 +2135,22 @@ L_YIELD: {
 L_JUMP: {
     if (cur->imm <= f.pc) {
         ++f.unit->backedge_count;
-        // Meta-tracer: check if we should start recording or invoke
-        // a compiled trace. on_backedge returns true if a compiled
-        // trace should be invoked (currently always false — traces
-        // are recorded but not yet compiled to native code).
-        if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
-            // Compiled trace exists — invoke it.
-            // TODO: call the native trace code here. For now, this
-            // path is never taken (native_code is null).
+        // Record the backedge JUMP BEFORE calling on_backedge, so it's
+        // the last instruction in the trace. on_backedge calls
+        // finish_recording() which compiles the trace.
+        if (tracer.is_recording()) {
+            tracer.record_instr(*cur, 0, 0, 0);
         }
-    }
-    // During recording, record this instruction.
-    if (tracer.is_recording()) {
-        tracer.record_instr(*cur, 0, 0, 0);
+        if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
+            auto trace_fn = reinterpret_cast<Value(*)(Value*)>(
+                tracer.active->native_code);
+            Value rv = trace_fn(f.regs);
+            if (rv.tag == Tag::None) {
+                ++f.pc;
+                VM_LOAD();
+                VM_DISPATCH();
+            }
+        }
     }
     f.pc = cur->imm;
     VM_LOAD();
@@ -2148,6 +2159,26 @@ L_JUMP: {
 L_JUMP_IF_FALSE: {
     if (cur->imm <= f.pc) {
         ++f.unit->backedge_count;
+        if (tracer.on_backedge(f.unit, f.pc, cur->imm)) {
+            auto trace_fn = reinterpret_cast<Value(*)(Value*)>(
+                tracer.active->native_code);
+            Value rv = trace_fn(f.regs);
+            if (rv.tag == Tag::None) {
+                // Trace exited (loop done or guard failure).
+                // The trace already evaluated the condition and it was
+                // false (loop exit). Jump to the JUMP_IF_FALSE target
+                // (past the loop body).
+                f.pc = cur->imm;
+                VM_LOAD();
+                VM_DISPATCH();
+            }
+            // If rv is not None, the trace had a guard failure but
+            // wants to continue — fall through to the interpreter.
+        }
+    }
+    // During recording, record this instruction with the condition's tag.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
     }
     bool t = rt.truthy(regs[cur->a]);
     if (!t) {
