@@ -109,6 +109,7 @@ Result<Stmt*> Parser::parse_statement() noexcept {
         case TokKind::KwWhile: return parse_while();
         case TokKind::KwFor: return parse_for();
         case TokKind::KwTry: return parse_try();
+        case TokKind::KwWith: return parse_with();
         case TokKind::At: {
             // PAR-1 fix: decorator must be followed by a newline, then def/class.
             // The previous code REJECTED @dec\n (newline after decorator)
@@ -397,6 +398,35 @@ Result<Stmt*> Parser::parse_try() noexcept {
         return fail_msg("parse: try requires at least one except or finally",
                         diag_code::parse_unexpected_token);
     }
+    return st;
+}
+
+Result<Stmt*> Parser::parse_with() noexcept {
+    // PEP 343 with statement: `with cm as name, cm2 as name2: body`
+    // Multiple items are nested. We parse them into a flat with_items list;
+    // the lowerer handles the nesting via __enter__/__exit__.
+    auto kw = expect(TokKind::KwWith, "'with'");
+    if (!kw) return std::unexpected(kw.error());
+    Stmt* st = new_stmt(StmtKind::With, kw.value().line);
+
+    for (;;) {
+        Result<Expr*> ctx = parse_expr();
+        if (!ctx) return std::unexpected(ctx.error());
+        WithItem item;
+        item.context = *ctx;
+        if (accept(TokKind::KwAs)) {
+            auto name = expect(TokKind::Ident, "name after 'as'");
+            if (!name) return std::unexpected(name.error());
+            item.bind_name = intern_tok(name.value());
+        }
+        st->with_items.push_back(item);
+        if (!accept(TokKind::Comma)) break;
+    }
+
+    // Use parse_block which handles both `: body` and `:\n  body` forms.
+    Result<StmtList> body = parse_block();
+    if (!body) return std::unexpected(body.error());
+    st->body = std::move(*body);
     return st;
 }
 

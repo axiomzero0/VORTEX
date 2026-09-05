@@ -73,7 +73,8 @@ TokKind keyword_kind(std::string_view text) noexcept {
         {"in", TokKind::KwIn}, {"is", TokKind::KwIs}, {"lambda", TokKind::KwLambda},
         {"nonlocal", TokKind::KwNonlocal}, {"not", TokKind::KwNot}, {"or", TokKind::KwOr},
         {"pass", TokKind::KwPass}, {"raise", TokKind::KwRaise}, {"return", TokKind::KwReturn},
-        {"try", TokKind::KwTry}, {"while", TokKind::KwWhile}, {"yield", TokKind::KwYield},
+        {"try", TokKind::KwTry}, {"while", TokKind::KwWhile}, {"with", TokKind::KwWith},
+        {"yield", TokKind::KwYield},
     };
     for (const E& e : table) {
         if (text == e.n) return e.k;

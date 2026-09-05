@@ -69,6 +69,8 @@ enum class NativeHelper : std::uint16_t {
     FormatValue,        // (value) -> str(value) for print
     NextIterator,       // (iterator) -> value or raises StopIteration
     RangeNew,           // fast range object constructor (used by for-range opt)
+    ContextEnter,       // (cm) -> cm.__enter__() — PEP 343
+    ContextExit,        // (cm, exc_or_none) -> bool (suppress if True) — PEP 343
     HelperCount
 };
 

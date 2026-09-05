@@ -1356,6 +1356,39 @@ bool Vm::native_helper(std::uint16_t helper, Value* args, std::uint32_t argc,
             }
             return iter_next(it, out);
         }
+        case NativeHelper::ContextEnter: {
+            // PEP 343: cm.__enter__()
+            // get_attr returns a bound method (recv already captured).
+            // Call it with 0 args — the bound method prepends recv internally.
+            Value cm = args[0];
+            Value enter_fn;
+            if (!get_attr(cm, global_symbols().intern("__enter__"), enter_fn)) {
+                raise_builtin(rt.type_attribute_error, "__enter__");
+                return false;
+            }
+            return call_value(enter_fn, nullptr, 0, out);
+        }
+        case NativeHelper::ContextExit: {
+            // PEP 343: cm.__exit__(exc_type, exc_value, traceback)
+            // get_attr returns a bound method (recv already captured).
+            // Call it with 3 args (all None for normal exit).
+            Value cm = args[0];
+            Value exc = args[1];  // None or the exception value
+            Value exit_fn;
+            if (!get_attr(cm, global_symbols().intern("__exit__"), exit_fn)) {
+                raise_builtin(rt.type_attribute_error, "__exit__");
+                return false;
+            }
+            // For normal exit: pass (None, None, None)
+            // For exception: pass (exc_type, exc_value, None)
+            Value none = Value::none();
+            Value call_args[3] = {none, none, none};
+            if (exc.tag != Tag::None) {
+                call_args[0] = exc;  // exc_type (simplified: pass the value)
+                call_args[1] = exc;  // exc_value
+            }
+            return call_value(exit_fn, call_args, 3, out);
+        }
         default:
             break;
     }

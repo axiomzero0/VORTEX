@@ -193,6 +193,14 @@ void names_of_stmt(Stmt* s, NameSets& out) noexcept {
             names_of_stmts(s->orelse, out);
             names_of_stmts(s->finalbody, out);
             return;
+        case StmtKind::With:
+            // with-items: context exprs are referenced; `as name` is bound.
+            for (auto& wi : s->with_items) {
+                names_of_expr(wi.context, out);
+                if (wi.bind_name != sym_invalid) add_unique(out.bound, wi.bind_name);
+            }
+            names_of_stmts(s->body, out);
+            return;
         default:
             names_of_expr(s->cond, out);
             names_of_expr(s->value, out);
@@ -487,6 +495,7 @@ private:
     Result<void> lower_while(Stmt* s) noexcept;
     Result<void> lower_for(Stmt* s) noexcept;
     Result<void> lower_try(Stmt* s) noexcept;
+    Result<void> lower_with(Stmt* s) noexcept;
     Result<void> lower_function_def(Stmt* s) noexcept;
     Result<void> lower_class_def(Stmt* s) noexcept;
     Result<NodeId> lower_assign_target(Expr* target, NodeId value) noexcept;
@@ -730,6 +739,8 @@ Result<void> Lowerer::lower_stmt(Stmt* s) noexcept {
             return lower_for(s);
         case StmtKind::Try:
             return lower_try(s);
+        case StmtKind::With:
+            return lower_with(s);
         case StmtKind::FunctionDef:
             return lower_function_def(s);
         case StmtKind::ClassDef:
@@ -1261,6 +1272,52 @@ Result<void> Lowerer::lower_try(Stmt* s) noexcept {
         // the handler chain (LOW-17 fix above runs finalbody before rethrow).
         VORTEX_TRY_VOID(lower_stmts(s->finalbody));
     }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// with statement (PEP 343)
+// ---------------------------------------------------------------------------
+// `with cm as name: body` lowers to:
+//   cm_val = <evaluate cm>
+//   name = ContextEnter(cm_val)
+//   <lower body>
+//   ContextExit(cm_val, None)    # normal exit
+//   # on exception: ContextExit(cm_val, exc) — if it returns True, suppress
+//
+// For simplicity (no full exception tables), we emit:
+//   - enter call
+//   - body
+//   - exit(None) on the normal path
+// Exceptions in the body propagate through the existing try/except machinery
+// (the user can wrap `with` in try/except to catch them). The __exit__ on
+// the normal path is always called.
+//
+// Multiple items are handled inline (not nested) — we call enter on all,
+// run the body, then call exit on all in reverse order. This is simpler
+// than full nesting and matches the common-case semantics.
+Result<void> Lowerer::lower_with(Stmt* s) noexcept {
+    // Evaluate each context manager and call __enter__.
+    // Store the CM value and the enter result for the exit call + binding.
+    stdx::small_vector<NodeId, 2> cm_values;
+    for (auto& wi : s->with_items) {
+        NodeId cm = VORTEX_TRY(lower_expr(wi.context));
+        NodeId entered = call_native(NativeHelper::ContextEnter, {cm}, true);
+        if (wi.bind_name != sym_invalid) {
+            write_var(wi.bind_name, entered);
+        }
+        cm_values.push_back(cm);
+    }
+
+    // Lower the body.
+    VORTEX_TRY_VOID(lower_stmts(s->body));
+
+    // Call __exit__(cm, None) on each CM in reverse order (LIFO).
+    NodeId none = const_none();
+    for (std::size_t i = cm_values.size(); i-- > 0;) {
+        call_native(NativeHelper::ContextExit, {cm_values[i], none}, true);
+    }
+
     return {};
 }
 

@@ -60,6 +60,7 @@ private:
     [[nodiscard]] Result<Stmt*> parse_while() noexcept;
     [[nodiscard]] Result<Stmt*> parse_for() noexcept;
     [[nodiscard]] Result<Stmt*> parse_try() noexcept;
+    [[nodiscard]] Result<Stmt*> parse_with() noexcept;
     [[nodiscard]] Result<Stmt*> parse_simple_stmt() noexcept;
 
     // --- expressions ----------------------------------------------------------

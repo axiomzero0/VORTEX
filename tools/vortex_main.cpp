@@ -47,8 +47,14 @@ namespace {
         vortex::rt::compile_program(vm, src, mod_name, options);
     if (!outcome.ok) {
         const vortex::Diagnostic& d = outcome.diagnostic;
-        std::fprintf(stderr, "vortex: %s: %.*s\n", origin,
+        std::fprintf(stderr, "vortex: %s:%u:%u: %.*s\n", origin,
+                     d.where.line, d.where.column,
                      static_cast<int>(d.message.size()), d.message.data());
+        if (!d.expected.empty()) {
+            std::fprintf(stderr, "  expected: %.*s, got: %.*s\n",
+                         static_cast<int>(d.expected.size()), d.expected.data(),
+                         static_cast<int>(d.actual.size()), d.actual.data());
+        }
         if (!d.fix.empty()) {
             std::fprintf(stderr, "  hint: %.*s\n",
                          static_cast<int>(d.fix.size()), d.fix.data());

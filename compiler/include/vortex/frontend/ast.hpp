@@ -39,7 +39,7 @@ enum class ExprKind : std::uint8_t {
 enum class StmtKind : std::uint8_t {
     FunctionDef, ClassDef, Return, Assign, AugAssign, If, While, For,
     Break, Continue, Pass, Global, Nonlocal, Assert, Raise, Try, Expr,
-    Del, Import,
+    Del, Import, With,
 };
 
 struct Expr;
@@ -76,6 +76,12 @@ struct ExceptClause {
     SymbolId type_name{0xFFFF'FFFF};   // class name to match (resolved at runtime); invalid = bare
     SymbolId bind_name{0xFFFF'FFFF};   // `as name` binding; invalid = none
     StmtList body{};
+};
+
+/// PEP 343 with-item: `context_expr as target` (target may be null).
+struct WithItem {
+    Expr* context{nullptr};          // the context expression
+    SymbolId bind_name{0xFFFF'FFFF};  // `as name` binding; invalid = no binding
 };
 
 struct Expr {
@@ -131,6 +137,11 @@ struct Stmt {
     // try
     stdx::small_vector<ExceptClause, 4> handlers{};
     StmtList finalbody{};
+    // with (PEP 343): list of context managers + optional `as` bindings.
+    // The body executes between __enter__ and __exit__. Multiple items
+    // are nested: `with A() as a, B() as b: body` ≡
+    // `with A() as a: with B() as b: body`.
+    stdx::small_vector<WithItem, 2> with_items{};
 };
 
 struct Module {

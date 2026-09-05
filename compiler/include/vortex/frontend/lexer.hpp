@@ -43,7 +43,7 @@ enum class TokKind : std::uint8_t {
     KwFalse, KwNone, KwTrue, KwAnd, KwAs, KwAssert, KwBreak, KwClass,
     KwContinue, KwDef, KwDel, KwElif, KwElse, KwExcept, KwFinally, KwFor,
     KwFrom, KwGlobal, KwIf, KwImport, KwIn, KwIs, KwLambda, KwNonlocal,
-    KwNot, KwOr, KwPass, KwRaise, KwReturn, KwTry, KwWhile, KwYield,
+    KwNot, KwOr, KwPass, KwRaise, KwReturn, KwTry, KwWhile, KwWith, KwYield,
     // operators & delimiters
     Plus, Minus, Star, Slash, DoubleSlash, Percent, At, StarStar,
     Lt, Gt, LtEq, GtEq, EqEq, NotEq, Arrow,
@@ -56,7 +56,7 @@ enum class TokKind : std::uint8_t {
 enum class Kw : std::uint8_t {
     None_ = 0, False_, True_, And, As, Assert, Break, Class, Continue, Def,
     Del, Elif, Else, Except, Finally, For, From, Global, If, Import, In,
-    Is, Lambda, Nonlocal, Not, Or, Pass, Raise, Return, Try, While, Yield,
+    Is, Lambda, Nonlocal, Not, Or, Pass, Raise, Return, Try, While, With, Yield,
 };
 
 struct Token {
