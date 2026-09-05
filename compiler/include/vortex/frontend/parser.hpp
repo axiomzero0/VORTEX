@@ -95,6 +95,11 @@ private:
     std::size_t pos_{0};
     std::uint32_t errors_{0};
     std::uint32_t suppress_in_operator_{0};   // >0 while parsing a for-header target
+    /// PEP 318 decorators: collected by the `@` handler, consumed by
+    /// parse_function_def / parse_class_def. Each entry is a decorator
+    /// expression (e.g., `staticmethod`, `property`, `my_dec(arg)`).
+    /// Cleared after the def/class consumes them.
+    stdx::small_vector<Expr*, 4> pending_decorators_{};
 };
 
 /// Convenience: lex + parse in one call.

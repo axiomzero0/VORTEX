@@ -50,6 +50,7 @@ enum class TokKind : std::uint8_t {
     Bang, Tilde, Amp, Pipe, Caret, Shl, Shr,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
     Comma, Colon, Semi, Dot, Assign,
+    ColonAssign,  // := (walrus operator, PEP 572)
 };
 
 enum class Kw : std::uint8_t {

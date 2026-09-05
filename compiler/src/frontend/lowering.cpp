@@ -91,6 +91,13 @@ void names_of_expr(Expr* e, NameSets& out) noexcept {
     if (!e) return;
     switch (e->kind) {
         case ExprKind::Name: out.referenced.push_back(e->name); return;
+        case ExprKind::NamedExpr:
+            // walrus: `name := expr` — name is BOTH bound and referenced.
+            // The store (assignment) dominates, so add to bound; the RHS
+            // sub-expression is recursed into below.
+            add_unique(out.bound, e->name);
+            add_unique(out.referenced, e->name);
+            break;
         default: break;
     }
     names_of_expr(e->sub, out);
@@ -1316,6 +1323,38 @@ Result<void> Lowerer::lower_function_def(Stmt* s) noexcept {
     memory_ = fn;
 
     write_var(s->name, fn);
+
+    // PEP 318: apply decorators. `@dec\n def f(): ...` is sugar for
+    // `f = dec(f)`. Decorators apply bottom-up: the decorator closest
+    // to the def wraps first, then the one above wraps that result.
+    // So for:
+    //   @a
+    //   @b
+    //   def f(): ...
+    // the result is `f = a(b(f))`.
+    // We iterate in REVERSE order so the last decorator (closest to def)
+    // is applied first.
+    if (!s->decorators_unused.empty()) {
+        NodeId val = fn;
+        for (std::size_t i = s->decorators_unused.size(); i-- > 0;) {
+            Expr* dec_expr = s->decorators_unused[i];
+            NodeId dec = VORTEX_TRY(lower_expr(dec_expr));
+            NodeId call = g().create(NodeKind::CallPy);
+            Node& cn = g().node(call);
+            cn.set_flag(NodeFlag::OnEffectChain);
+            cn.set_flag(NodeFlag::MayThrow);
+            cn.set_flag(NodeFlag::MayCall);
+            g().add_input(call, control_);
+            g().add_input(call, memory_);
+            g().add_input(call, dec);    // callee = decorator
+            g().add_input(call, val);    // arg = the function
+            cn.aux0 = 1;   // 1 positional arg
+            cn.aux1 = 0;   // no *args / **kwargs
+            memory_ = call;
+            val = call;
+        }
+        write_var(s->name, val);
+    }
     return {};
 }
 
@@ -1388,6 +1427,30 @@ Result<void> Lowerer::lower_class_def(Stmt* s) noexcept {
     NodeId cls = call_native(NativeHelper::MakeClass,
                              {const_symbol_str(s->name), ns, base}, false);
     write_var(s->name, cls);
+
+    // PEP 318: apply decorators to classes too.
+    // `@dec\n class C: ...` → `C = dec(C)`.
+    if (!s->decorators_unused.empty()) {
+        NodeId val = cls;
+        for (std::size_t i = s->decorators_unused.size(); i-- > 0;) {
+            Expr* dec_expr = s->decorators_unused[i];
+            NodeId dec = VORTEX_TRY(lower_expr(dec_expr));
+            NodeId call = g().create(NodeKind::CallPy);
+            Node& cn = g().node(call);
+            cn.set_flag(NodeFlag::OnEffectChain);
+            cn.set_flag(NodeFlag::MayThrow);
+            cn.set_flag(NodeFlag::MayCall);
+            g().add_input(call, control_);
+            g().add_input(call, memory_);
+            g().add_input(call, dec);    // callee = decorator
+            g().add_input(call, val);    // arg = the class
+            cn.aux0 = 1;
+            cn.aux1 = 0;
+            memory_ = call;
+            val = call;
+        }
+        write_var(s->name, val);
+    }
     return {};
 }
 
@@ -1576,6 +1639,17 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
             NodeId v = const_none();
             if (e->sub) v = VORTEX_TRY(lower_expr(e->sub));
             return effect_op(NodeKind::Yield, {v});
+        }
+
+        case ExprKind::NamedExpr: {
+            // PEP 572 walrus: `name := expr`
+            // Lower the RHS, store it to the variable, and RETURN the value
+            // (so the expression can be used inline). The store uses the
+            // same write_var path as normal assignment, so closure/global/
+            // nonlocal scoping is handled identically.
+            NodeId val = VORTEX_TRY(lower_expr(e->sub));
+            write_var(e->name, val);
+            return val;
         }
     }
     return fail_msg("lower: unhandled expression kind", diag_code::parse_unexpected_token);

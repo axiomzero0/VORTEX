@@ -33,6 +33,7 @@ enum class ExprKind : std::uint8_t {
     Name, IntLit, FloatLit, StrLit, BoolLit, NoneLit,
     BinOp, UnaryOp, BoolOp, Compare, Call, Attribute, Subscript,
     ListLit, TupleLit, DictLit, ListComp, Lambda, IfExp, Yield, SliceLit,
+    NamedExpr,  // walrus operator (PEP 572): `name := expr` — stores and returns value
 };
 
 enum class StmtKind : std::uint8_t {

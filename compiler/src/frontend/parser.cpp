@@ -115,9 +115,14 @@ Result<Stmt*> Parser::parse_statement() noexcept {
             // and ACCEPTED @dec def (no newline) — backwards. Python grammar
             // requires the decorator on its own line, then def/class on the
             // next line. Each decorator ends with a newline.
+            //
+            // PEP 318: decorators are collected in pending_decorators_ and
+            // consumed by parse_function_def / parse_class_def below.
+            pending_decorators_.clear();
             while (accept(TokKind::At)) {
                 Result<Expr*> dec = parse_atom_with_trailers();
                 if (!dec) return std::unexpected(dec.error());
+                pending_decorators_.push_back(*dec);
                 // Each decorator must end with a newline.
                 auto nl = expect(TokKind::Newline, "newline after decorator");
                 if (!nl) return std::unexpected(nl.error());
@@ -163,6 +168,10 @@ Result<Stmt*> Parser::parse_function_def() noexcept {
     if (!name) return std::unexpected(name.error());
     Stmt* fn = new_stmt(StmtKind::FunctionDef, kw.value().line);
     fn->name = intern_tok(name.value());
+    // PEP 318: consume any pending decorators collected by the `@` handler.
+    // Move (not copy) to avoid double-ownership; clear the pending list.
+    fn->decorators_unused = std::move(pending_decorators_);
+    pending_decorators_.clear();
 
     auto lp = expect(TokKind::LParen, "'(' after function name");
     if (!lp) return std::unexpected(lp.error());
@@ -249,6 +258,9 @@ Result<Stmt*> Parser::parse_class_def() noexcept {
     if (!name) return std::unexpected(name.error());
     Stmt* cls = new_stmt(StmtKind::ClassDef, kw.value().line);
     cls->name = intern_tok(name.value());
+    // PEP 318: consume any pending decorators collected by the `@` handler.
+    cls->decorators_unused = std::move(pending_decorators_);
+    pending_decorators_.clear();
 
     if (accept(TokKind::LParen)) {
         if (check(TokKind::Ident)) cls->base_name = intern_tok(advance());
@@ -542,6 +554,22 @@ bool Parser::stmt_boundaries() const noexcept {
 // expressions
 // -----------------------------------------------------------------------------
 Result<Expr*> Parser::parse_expr() noexcept {
+    // PEP 572 walrus operator: `name := expr`
+    // Precedence: just below lambda (you can write `lambda: (x := 1)` but
+    // not `(lambda: x) := 1`). The LHS must be a bare identifier.
+    // We check for `Ident :=` here, before lambda/ternary, so the walrus
+    // binds tightest of the "test" level productions.
+    if (check(TokKind::Ident) && peek(1).kind == TokKind::ColonAssign) {
+        Token name_tok = peek();
+        advance();  // consume Ident
+        advance();  // consume :=
+        Result<Expr*> val = parse_expr();
+        if (!val) return std::unexpected(val.error());
+        Expr* walrus = new_expr(ExprKind::NamedExpr, name_tok.line);
+        walrus->name = intern_tok(name_tok);
+        walrus->sub = *val;  // the RHS expression
+        return walrus;
+    }
     if (check(TokKind::KwLambda)) {
         advance();
         Expr* lam = new_expr(ExprKind::Lambda, peek().line);

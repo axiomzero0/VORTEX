@@ -715,6 +715,7 @@ Result<void> Lexer::run(stdx::small_vector<Token, 512>& tokens,
             try_op("==", TokKind::EqEq) || try_op("!=", TokKind::NotEq) ||
             try_op("<<", TokKind::Shl) || try_op(">>", TokKind::Shr) ||
             try_op("->", TokKind::Arrow) ||
+            try_op(":=", TokKind::ColonAssign) ||  // PEP 572 walrus — before ":" and "="
             try_op("+", TokKind::Plus) || try_op("-", TokKind::Minus) ||
             try_op("*", TokKind::Star) || try_op("/", TokKind::Slash) ||
             try_op("%", TokKind::Percent) || try_op("@", TokKind::At) ||

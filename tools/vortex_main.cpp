@@ -40,8 +40,11 @@ namespace {
     vortex::rt::install_builtins(vm.program);
 
     vortex::SymbolId mod_name = vortex::global_symbols().intern("__main__");
+    // Rule 132: VORTEX_NO_JIT env var disables JIT for bisection.
+    vortex::rt::CompileOptions options;
+    if (::getenv("VORTEX_NO_JIT")) options.disable_jit = true;
     vortex::rt::CompileOutcome outcome =
-        vortex::rt::compile_program(vm, src, mod_name);
+        vortex::rt::compile_program(vm, src, mod_name, options);
     if (!outcome.ok) {
         const vortex::Diagnostic& d = outcome.diagnostic;
         std::fprintf(stderr, "vortex: %s: %.*s\n", origin,
