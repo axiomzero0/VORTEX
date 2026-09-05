@@ -539,6 +539,402 @@ Value bi_type(void*, Value* args, std::uint32_t argc) noexcept {
     return Value::object(reinterpret_cast<PyObj*>(t));
 }
 
+// --- round --------------------------------------------------------------------
+Value bi_round(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc == 0) return error_msg("round() needs at least one argument");
+    double x = 0;
+    if (!as_f64(args[0], x)) return error_msg("round() needs a number");
+    if (argc == 1) {
+        // Python round() without ndigits returns an int for float input.
+        // Uses banker's rounding (round half to even).
+        double r = std::round(x);
+        // Adjust for .5 cases: round() rounds to even, std::round rounds away
+        if (std::fabs(x - std::floor(x) - 0.5) < 1e-15) {
+            std::int64_t floor_val = static_cast<std::int64_t>(std::floor(x));
+            if (floor_val % 2 != 0) r = floor_val;  // round to even
+        }
+        return Value::integer(static_cast<std::int64_t>(r));
+    }
+    std::int64_t ndigits = 0;
+    if (!as_i64(args[1], ndigits)) return error_msg("round() ndigits must be int");
+    double scale = std::pow(10.0, static_cast<double>(ndigits));
+    double r = std::round(x * scale) / scale;
+    return Value::real(r);
+}
+
+// --- divmod -------------------------------------------------------------------
+Value bi_divmod(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 2) return error_msg("divmod() takes two arguments");
+    std::int64_t a = 0, b = 0;
+    if (as_i64(args[0], a) && as_i64(args[1], b)) {
+        if (b == 0) return error_msg("divmod() by zero");
+        std::int64_t q = a / b;
+        std::int64_t r = a % b;
+        // Python floor division: adjust for negative
+        if (r != 0 && ((r < 0) != (b < 0))) { --q; r += b; }
+        Runtime& rt = Runtime::instance();
+        PyTupleObj* t = rt.new_tuple(2);
+        t->items[0] = Value::integer(q);
+        t->items[1] = Value::integer(r);
+        return Value::object(reinterpret_cast<PyObj*>(t));
+    }
+    double x = 0, y = 0;
+    if (as_f64(args[0], x) && as_f64(args[1], y)) {
+        if (y == 0.0) return error_msg("divmod() by zero");
+        double q = std::floor(x / y);
+        double r = x - q * y;
+        Runtime& rt = Runtime::instance();
+        PyTupleObj* t = rt.new_tuple(2);
+        t->items[0] = Value::real(q);
+        t->items[1] = Value::real(r);
+        return Value::object(reinterpret_cast<PyObj*>(t));
+    }
+    return error_msg("divmod() needs numbers");
+}
+
+// --- pow ----------------------------------------------------------------------
+Value bi_pow(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc < 2 || argc > 3) return error_msg("pow() takes 2 or 3 arguments");
+    std::int64_t a = 0, b = 0;
+    if (as_i64(args[0], a) && as_i64(args[1], b)) {
+        if (argc == 3) {
+            std::int64_t m = 0;
+            if (!as_i64(args[2], m) || m <= 0) return error_msg("pow() modulus must be positive int");
+            // Modular exponentiation
+            std::int64_t base = a % m;
+            if (base < 0) base += m;
+            std::int64_t result = 1;
+            std::uint64_t exp = static_cast<std::uint64_t>(b);
+            while (exp > 0) {
+                if (exp & 1) result = (result * base) % m;
+                base = (base * base) % m;
+                exp >>= 1;
+            }
+            return Value::integer(result);
+        }
+        // Integer pow without modulus
+        if (b < 0) {
+            // Negative exponent → float
+            return Value::real(std::pow(static_cast<double>(a), static_cast<double>(b)));
+        }
+        std::int64_t r = 1;
+        for (std::int64_t i = 0; i < b; ++i) r *= a;
+        return Value::integer(r);
+    }
+    double x = 0, y = 0;
+    if (as_f64(args[0], x) && as_f64(args[1], y)) {
+        return Value::real(std::pow(x, y));
+    }
+    return error_msg("pow() needs numbers");
+}
+
+// --- any / all ----------------------------------------------------------------
+Value bi_any(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("any() takes one argument");
+    if (!g_vm) return error_msg("any() without vm context");
+    Value it;
+    if (!g_vm->get_iter(args[0], it)) return Value::object(nullptr);
+    bool more = false;
+    if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    while (more) {
+        Value item;
+        if (!g_vm->iter_next(it, item)) return Value::object(nullptr);
+        if (Runtime::instance().truthy(item)) {
+            return Value::boolean(true);
+        }
+        if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    }
+    return Value::boolean(false);
+}
+
+Value bi_all(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("all() takes one argument");
+    if (!g_vm) return error_msg("all() without vm context");
+    Value it;
+    if (!g_vm->get_iter(args[0], it)) return Value::object(nullptr);
+    bool more = false;
+    if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    while (more) {
+        Value item;
+        if (!g_vm->iter_next(it, item)) return Value::object(nullptr);
+        if (!Runtime::instance().truthy(item)) {
+            return Value::boolean(false);
+        }
+        if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    }
+    return Value::boolean(true);
+}
+
+// --- reversed -----------------------------------------------------------------
+Value bi_reversed(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("reversed() takes one argument");
+    Runtime& rt = Runtime::instance();
+    if (args[0].tag == Tag::Obj && args[0].as.obj) {
+        if (args[0].as.obj->tag == ObjTag::List) {
+            auto* l = static_cast<PyListObj*>(args[0].as.obj);
+            auto* out = rt.new_list(l->length);
+            for (std::int64_t i = static_cast<std::int64_t>(l->length) - 1; i >= 0; --i) {
+                Value v = l->items[i];
+                if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
+                list_push(out, v);
+            }
+            return Value::object(reinterpret_cast<PyObj*>(out));
+        }
+        if (args[0].as.obj->tag == ObjTag::Str) {
+            auto* s = static_cast<PyStrObj*>(args[0].as.obj);
+            stdx::small_vector<char, 128> rev;
+            rev.resize(s->length);
+            for (std::uint32_t i = 0; i < s->length; ++i) {
+                rev[i] = s->data()[s->length - 1 - i];
+            }
+            auto* out = rt.new_str(std::string_view(rev.data(), s->length));
+            return Value::object(reinterpret_cast<PyObj*>(out));
+        }
+    }
+    return error_msg("reversed() argument is not reversible");
+}
+
+// --- map / filter (VM callback) ----------------------------------------------
+// map(f, iter) → list of f(x) for x in iter
+// We need the VM to call f for each element.
+Value bi_map(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 2) return error_msg("map() takes two arguments");
+    if (!g_vm) return error_msg("map() without vm context");
+    Value& func = args[0];
+    Value& iterable = args[1];
+    Runtime& rt = Runtime::instance();
+    auto* out = rt.new_list(0);
+    Value it;
+    if (!g_vm->get_iter(iterable, it)) return Value::object(nullptr);
+    bool more = false;
+    if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    while (more) {
+        Value item;
+        if (!g_vm->iter_next(it, item)) return Value::object(nullptr);
+        Value mapped;
+        if (!g_vm->call_value(func, &item, 1, mapped)) return Value::object(nullptr);
+        if (mapped.tag == Tag::Obj && mapped.as.obj) rt.incref(mapped.as.obj);
+        list_push(out, mapped);
+        if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    }
+    return Value::object(reinterpret_cast<PyObj*>(out));
+}
+
+// filter(f, iter) → list of x for x in iter where truthy(f(x))
+// filter(None, iter) → list of truthy items
+Value bi_filter(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 2) return error_msg("filter() takes two arguments");
+    if (!g_vm) return error_msg("filter() without vm context");
+    Value& func = args[0];
+    Value& iterable = args[1];
+    Runtime& rt = Runtime::instance();
+    auto* out = rt.new_list(0);
+    Value it;
+    if (!g_vm->get_iter(iterable, it)) return Value::object(nullptr);
+    bool more = false;
+    if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    while (more) {
+        Value item;
+        if (!g_vm->iter_next(it, item)) return Value::object(nullptr);
+        bool keep = false;
+        if (func.tag == Tag::None) {
+            keep = rt.truthy(item);
+        } else {
+            Value result;
+            if (!g_vm->call_value(func, &item, 1, result)) return Value::object(nullptr);
+            keep = rt.truthy(result);
+        }
+        if (keep) {
+            if (item.tag == Tag::Obj && item.as.obj) rt.incref(item.as.obj);
+            list_push(out, item);
+        }
+        if (!g_vm->iter_check(it, more)) return Value::object(nullptr);
+    }
+    return Value::object(reinterpret_cast<PyObj*>(out));
+}
+
+// --- chr / ord ----------------------------------------------------------------
+Value bi_chr(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("chr() takes one argument");
+    std::int64_t cp = 0;
+    if (!as_i64(args[0], cp)) return error_msg("chr() needs an int");
+    if (cp < 0 || cp > 0x10FFFF) return error_msg("chr() arg out of range");
+    Runtime& rt = Runtime::instance();
+    // UTF-8 encode the code point
+    char buf[4];
+    std::uint32_t len = 0;
+    if (cp < 0x80) {
+        buf[0] = static_cast<char>(cp);
+        len = 1;
+    } else if (cp < 0x800) {
+        buf[0] = static_cast<char>(0xC0 | (cp >> 6));
+        buf[1] = static_cast<char>(0x80 | (cp & 0x3F));
+        len = 2;
+    } else if (cp < 0x10000) {
+        buf[0] = static_cast<char>(0xE0 | (cp >> 12));
+        buf[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = static_cast<char>(0x80 | (cp & 0x3F));
+        len = 3;
+    } else {
+        buf[0] = static_cast<char>(0xF0 | (cp >> 18));
+        buf[1] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = static_cast<char>(0x80 | (cp & 0x3F));
+        len = 4;
+    }
+    auto* s = rt.new_str(std::string_view(buf, len));
+    return Value::object(reinterpret_cast<PyObj*>(s));
+}
+
+Value bi_ord(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("ord() takes one argument");
+    if (args[0].tag != Tag::Obj || !args[0].as.obj ||
+        args[0].as.obj->tag != ObjTag::Str) {
+        return error_msg("ord() needs a string");
+    }
+    auto* s = static_cast<PyStrObj*>(args[0].as.obj);
+    if (s->length == 0) return error_msg("ord() needs a non-empty string");
+    // Decode first UTF-8 code point
+    unsigned char c0 = static_cast<unsigned char>(s->data()[0]);
+    std::int64_t cp = 0;
+    if (c0 < 0x80) {
+        cp = c0;
+    } else if ((c0 & 0xE0) == 0xC0 && s->length >= 2) {
+        cp = (c0 & 0x1F) << 6;
+        cp |= (static_cast<unsigned char>(s->data()[1]) & 0x3F);
+    } else if ((c0 & 0xF0) == 0xE0 && s->length >= 3) {
+        cp = (c0 & 0x0F) << 12;
+        cp |= (static_cast<unsigned char>(s->data()[1]) & 0x3F) << 6;
+        cp |= (static_cast<unsigned char>(s->data()[2]) & 0x3F);
+    } else if ((c0 & 0xF8) == 0xF0 && s->length >= 4) {
+        cp = (c0 & 0x07) << 18;
+        cp |= (static_cast<unsigned char>(s->data()[1]) & 0x3F) << 12;
+        cp |= (static_cast<unsigned char>(s->data()[2]) & 0x3F) << 6;
+        cp |= (static_cast<unsigned char>(s->data()[3]) & 0x3F);
+    } else {
+        return error_msg("ord() invalid UTF-8");
+    }
+    return Value::integer(cp);
+}
+
+// --- hex / oct / bin ----------------------------------------------------------
+Value bi_hex(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("hex() takes one argument");
+    std::int64_t v = 0;
+    if (!as_i64(args[0], v)) return error_msg("hex() needs an int");
+    char buf[20];
+    int n;
+    if (v < 0) {
+        n = std::snprintf(buf, sizeof(buf), "-0x%llx", static_cast<unsigned long long>(-v));
+    } else {
+        n = std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
+    }
+    Runtime& rt = Runtime::instance();
+    auto* s = rt.new_str(std::string_view(buf, static_cast<std::size_t>(n)));
+    return Value::object(reinterpret_cast<PyObj*>(s));
+}
+
+Value bi_oct(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("oct() takes one argument");
+    std::int64_t v = 0;
+    if (!as_i64(args[0], v)) return error_msg("oct() needs an int");
+    char buf[24];
+    int n;
+    if (v < 0) {
+        n = std::snprintf(buf, sizeof(buf), "-0o%llo", static_cast<unsigned long long>(-v));
+    } else {
+        n = std::snprintf(buf, sizeof(buf), "0o%llo", static_cast<unsigned long long>(v));
+    }
+    Runtime& rt = Runtime::instance();
+    auto* s = rt.new_str(std::string_view(buf, static_cast<std::size_t>(n)));
+    return Value::object(reinterpret_cast<PyObj*>(s));
+}
+
+Value bi_bin(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("bin() takes one argument");
+    std::int64_t v = 0;
+    if (!as_i64(args[0], v)) return error_msg("bin() needs an int");
+    // C's printf has no %b format specifier — manually build the binary string.
+    bool negative = v < 0;
+    std::uint64_t u = negative ? static_cast<std::uint64_t>(-v) : static_cast<std::uint64_t>(v);
+    char tmp[66];
+    int pos = 0;
+    if (u == 0) {
+        tmp[pos++] = '0';
+    } else {
+        while (u > 0) {
+            tmp[pos++] = '0' + (u & 1);
+            u >>= 1;
+        }
+    }
+    // Reverse into the output buffer: sign + "0b" + digits
+    char buf[70];
+    int out_pos = 0;
+    if (negative) buf[out_pos++] = '-';
+    buf[out_pos++] = '0';
+    buf[out_pos++] = 'b';
+    for (int i = pos - 1; i >= 0; --i) {
+        buf[out_pos++] = tmp[i];
+    }
+    Runtime& rt = Runtime::instance();
+    auto* s = rt.new_str(std::string_view(buf, static_cast<std::size_t>(out_pos)));
+    return Value::object(reinterpret_cast<PyObj*>(s));
+}
+
+// --- hash / id ----------------------------------------------------------------
+Value bi_hash(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("hash() takes one argument");
+    // Hash by tag: int→itself, float→bit pattern, str→FNV-1a, bool→0/1
+    switch (args[0].tag) {
+        case Tag::Int: return Value::integer(args[0].as.i);
+        case Tag::Bool: return Value::integer(args[0].as.i);
+        case Tag::None: return Value::integer(0);
+        case Tag::Float: {
+            std::int64_t bits;
+            std::memcpy(&bits, &args[0].as.f, sizeof(double));
+            return Value::integer(bits);
+        }
+        case Tag::Obj: {
+            if (args[0].as.obj && args[0].as.obj->tag == ObjTag::Str) {
+                auto* s = static_cast<PyStrObj*>(args[0].as.obj);
+                std::uint64_t h = 14695981039346656037ULL;
+                for (std::uint32_t i = 0; i < s->length; ++i) {
+                    h ^= static_cast<unsigned char>(s->data()[i]);
+                    h *= 1099511628211ULL;
+                }
+                return Value::integer(static_cast<std::int64_t>(h));
+            }
+            return Value::integer(static_cast<std::int64_t>(
+                reinterpret_cast<std::uintptr_t>(args[0].as.obj)));
+        }
+    }
+    return error_msg("hash() unhashable type");
+}
+
+Value bi_id(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("id() takes one argument");
+    // For objects, return the pointer address; for ints/floats, return the value
+    if (args[0].tag == Tag::Obj) {
+        return Value::integer(static_cast<std::int64_t>(
+            reinterpret_cast<std::uintptr_t>(args[0].as.obj)));
+    }
+    return Value::integer(args[0].as.i);
+}
+
+// --- callable -----------------------------------------------------------------
+Value bi_callable(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 1) return error_msg("callable() takes one argument");
+    if (args[0].tag != Tag::Obj || !args[0].as.obj) return Value::boolean(false);
+    switch (args[0].as.obj->tag) {
+        case ObjTag::Function: case ObjTag::NativeFn:
+        case ObjTag::Type: case ObjTag::BoundMethod:
+        case ObjTag::Generator:
+            return Value::boolean(true);
+        default:
+            return Value::boolean(false);
+    }
+}
+
 // --- math module -------------------------------------------------------------------
 Value math_call(void* user, Value* args, std::uint32_t argc) noexcept {
     auto* fn = reinterpret_cast<double (*)(double)>(user);
@@ -684,6 +1080,13 @@ void install_builtins(Program& program) noexcept {
         {"bool", bi_bool}, {"list", bi_list}, {"tuple", bi_tuple}, {"dict", bi_dict},
         {"enumerate", bi_enumerate}, {"zip", bi_zip}, {"sorted", bi_sorted},
         {"next", bi_next}, {"isinstance", bi_isinstance}, {"type", bi_type},
+        // Python 3.16 features (batch): missing builtins.
+        {"round", bi_round}, {"divmod", bi_divmod}, {"pow", bi_pow},
+        {"any", bi_any}, {"all", bi_all}, {"reversed", bi_reversed},
+        {"map", bi_map}, {"filter", bi_filter},
+        {"chr", bi_chr}, {"ord", bi_ord},
+        {"hex", bi_hex}, {"oct", bi_oct}, {"bin", bi_bin},
+        {"hash", bi_hash}, {"id", bi_id}, {"callable", bi_callable},
     };
     for (const Entry& e : entries) {
         SymbolId sym = global_symbols().intern(e.name);
