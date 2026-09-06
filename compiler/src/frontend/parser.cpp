@@ -1222,6 +1222,117 @@ Result<Expr*> Parser::parse_atom() noexcept {
             e->str_length = len;
             return e;
         }
+        case TokKind::FStrLit: {
+            // PEP 498 f-string: build a concatenation of literal parts
+            // and str()/repr() calls on expression parts.
+            // "hello {x} world" → "hello " + str(x) + " world"
+            advance();
+            Expr* result = nullptr;
+            // Look up the f-string parts from the Lexer's side-vector.
+            const auto* parts = (fstr_parts_side_ && t.fstr_parts_idx > 0 &&
+                                 t.fstr_parts_idx < fstr_parts_side_->size())
+                                ? &(*fstr_parts_side_)[t.fstr_parts_idx]
+                                : nullptr;
+            if (parts) {
+                for (const FStrPart& part : *parts) {
+                Expr* part_expr = nullptr;
+                if (part.is_expr) {
+                    // Re-parse the expression source.
+                    // Use same InlineCapacity (512) as the main token stream —
+                    // the Parser constructor expects small_vector<Token, 512>&.
+                    stdx::small_vector<Token, 512> sub_tokens;
+                    // Append a newline so the lexer's line-processing logic
+                    // terminates cleanly (the lexer expects lines to end
+                    // with \n or EOF + proper flush).
+                    std::string expr_src_str(part.text);
+                    expr_src_str.push_back('\n');
+                    Lexer sub_lexer(expr_src_str);
+                    StringPool sub_pool;
+                    Result<void> lex_res = sub_lexer.run(sub_tokens, sub_pool);
+                    if (!lex_res) return std::unexpected(lex_res.error());
+                    // Strip leading/trailing INDENT/DEDENT/NEWLINE tokens —
+                    // the lexer's line machinery produces these but the
+                    // sub-parser's parse_testlist doesn't expect them.
+                    std::size_t start = 0;
+                    while (start < sub_tokens.size() &&
+                           (sub_tokens[start].kind == TokKind::Indent ||
+                            sub_tokens[start].kind == TokKind::Dedent ||
+                            sub_tokens[start].kind == TokKind::Newline)) {
+                        ++start;
+                    }
+                    std::size_t end = sub_tokens.size();
+                    while (end > start &&
+                           (sub_tokens[end-1].kind == TokKind::Indent ||
+                            sub_tokens[end-1].kind == TokKind::Dedent ||
+                            sub_tokens[end-1].kind == TokKind::Newline ||
+                            sub_tokens[end-1].kind == TokKind::End)) {
+                        --end;
+                    }
+                    // Rebuild the token vector without the stripped tokens.
+                    if (start > 0 || end < sub_tokens.size()) {
+                        stdx::small_vector<Token, 512> filtered;
+                        for (std::size_t k = start; k < end; ++k) {
+                            filtered.push_back(sub_tokens[k]);
+                        }
+                        // Add End token.
+                        Token end_tok{};
+                        end_tok.kind = TokKind::End;
+                        filtered.push_back(end_tok);
+                        sub_tokens = std::move(filtered);
+                    } else {
+                        // Add End token if not present.
+                        if (sub_tokens.empty() || sub_tokens.back().kind != TokKind::End) {
+                            Token end_tok{};
+                            end_tok.kind = TokKind::End;
+                            sub_tokens.push_back(end_tok);
+                        }
+                    }
+                    Parser sub_parser(sub_tokens, module_);
+                    Result<Expr*> expr_res = sub_parser.parse_testlist(false);
+                    if (!expr_res) return std::unexpected(expr_res.error());
+                    part_expr = *expr_res;
+                    // Wrap in conversion function: str(), repr(), or ascii().
+                    SymbolId fn_name;
+                    if (part.conversion == 'r') fn_name = global_symbols().intern("repr");
+                    else if (part.conversion == 'a') fn_name = global_symbols().intern("ascii");
+                    else fn_name = global_symbols().intern("str");
+                    Expr* call = new_expr(ExprKind::Call, t.line);
+                    Expr* callee = new_expr(ExprKind::Name, t.line);
+                    callee->name = fn_name;
+                    call->sub = callee;   // callee goes in `sub`, NOT `args`
+                    Argument arg;
+                    arg.value = part_expr;
+                    arg.keyword = arg_invalid;
+                    call->call_args.push_back(arg);
+                    part_expr = call;
+                } else {
+                    // Literal text part.
+                    part_expr = new_expr(ExprKind::StrLit, t.line);
+                    auto [off, len] = module_.pool_string(part.text);
+                    part_expr->str_offset = off;
+                    part_expr->str_length = len;
+                }
+                // Chain with + (BinOp Add).
+                if (!result) {
+                    result = part_expr;
+                } else {
+                    Expr* bin = new_expr(ExprKind::BinOp, t.line);
+                    bin->op = static_cast<std::uint16_t>(BinOpKind::Add);
+                    bin->args.push_back(result);
+                    bin->args.push_back(part_expr);
+                    result = bin;
+                }
+                }  // end for (const FStrPart& part : *parts)
+            }  // end if (parts)
+            // Empty f-string → empty string literal.
+            if (!result) {
+                result = new_expr(ExprKind::StrLit, t.line);
+                auto [off, len] = module_.pool_string(std::string_view{});
+                result->str_offset = off;
+                result->str_length = len;
+            }
+            return result;
+        }
         case TokKind::KwTrue:
         case TokKind::KwFalse: {
             bool v = t.kind == TokKind::KwTrue;
@@ -1296,6 +1407,9 @@ Result<Module*> compile_to_ast(BumpArena& module_arena, std::string_view source)
     Result<void> lexed = lexer.run(tokens, m->string_pool);
     if (!lexed) return std::unexpected(lexed.error());
     Parser parser(tokens, *m);
+    // Wire the f-string parts side-vector so the parser can resolve
+    // FStrLit tokens' parts (stored in the Lexer, not the Token).
+    parser.set_fstr_parts(&lexer.fstr_parts_side_);
     Result<void> parsed = parser.parse_module();
     if (!parsed) return std::unexpected(parsed.error());
     return m;

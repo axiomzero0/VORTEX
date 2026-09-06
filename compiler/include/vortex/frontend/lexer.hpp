@@ -54,6 +54,16 @@ enum class TokKind : std::uint8_t {
     // Augmented assignment operators (PEP 203)
     PlusEq, MinusEq, StarEq, SlashEq, DoubleSlashEq, PercentEq, StarStarEq,
     AmpEq, PipeEq, CaretEq, ShlEq, ShrEq, AtEq,
+    // F-string literal (PEP 498) — carries parts for interpolation
+    FStrLit,
+};
+
+/// One part of an f-string: either a literal text segment or an
+/// expression source to be parsed and str()'d at runtime.
+struct FStrPart {
+    std::string_view text{};    // literal text OR expression source
+    bool is_expr{false};        // true = expression source, false = literal
+    char conversion{0};          // 'r', 's', 'a', or 0 for none
 };
 
 enum class Kw : std::uint8_t {
@@ -69,6 +79,11 @@ struct Token {
     std::string_view text{};      // identifier / string bytes (cooked for StrLit)
     std::int64_t int_value{0};
     double float_value{0};
+    /// Index into the Lexer's fstr_parts_side_ vector (only for FStrLit
+    /// tokens; 0 = none). We store f-string parts in a side-vector rather
+    /// than inline in the Token to keep Token small (otherwise the 512-
+    /// inline token vector exceeds the 64KB small_vector inline limit).
+    std::uint32_t fstr_parts_idx{0};
 };
 
 /// Lexer over one source buffer. The buffer must outlive the Lexer and all
@@ -81,6 +96,19 @@ public:
     /// Errors produce Diagnostics with exact locations (Rule 47).
     [[nodiscard]] Result<void> run(stdx::small_vector<Token, 512>& tokens,
                                    StringPool& string_pool) noexcept;
+
+    /// Access f-string parts by index (stored in Token::fstr_parts_idx).
+    /// Called by the Parser when building the f-string concatenation AST.
+    /// Index 0 is reserved (empty). Returns nullptr if out of range.
+    [[nodiscard]] const stdx::small_vector<FStrPart, 4>* fstr_parts(
+        std::uint32_t idx) const noexcept {
+        if (idx == 0 || idx >= fstr_parts_side_.size()) return nullptr;
+        return &fstr_parts_side_[idx];
+    }
+
+    /// The f-string parts side-vector. Public so compile_to_ast can
+    /// pass its address to the Parser via set_fstr_parts().
+    stdx::small_vector<stdx::small_vector<FStrPart, 4>, 16> fstr_parts_side_{};
 
 private:
     [[nodiscard]] Result<void> scan_line_prefix(stdx::small_vector<Token, 512>& tokens) noexcept;
@@ -106,6 +134,10 @@ private:
     // body never moves once we stop mutating it) and use that stable
     // pointer in the token instead.
     stdx::small_vector<std::string, 16> stabilized_strings_{};
+
+    // Stable storage for f-string parts. Each FStrPart::text string_view
+    // points into one of these stabilized std::strings.
+    stdx::small_vector<std::string, 32> fstr_stabilized_{};
 
     // indentation machinery
     static constexpr std::size_t max_indent = 64;

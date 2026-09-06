@@ -413,22 +413,9 @@ Result<void> Lexer::run(stdx::small_vector<Token, 512>& tokens,
             continue;
         }
 
-        // --- identifiers -----------------------------------------------------------
-        if (is_ident_start(c)) {
-            std::size_t start = pos_;
-            std::uint32_t start_col = col_;
-            while (pos_ < src_.size() && is_ident_char(peek())) { ++pos_; ++col_; }
-            std::string_view text = src_.substr(start, pos_ - start);
-            TokKind k = keyword_kind(text);
-            Token t = make(k == TokKind::End ? TokKind::Ident : k, text);
-            t.col = start_col;
-            tokens.push_back(t);
-            emitted_value_this_logical_line = true;
-            continue;
-        }
-
         // --- strings (with r/b/f prefixes, triple-quoted, full escape set) --------
-        // LEX-8/9: detect r/b/f prefix.
+        // LEX-8/9: detect r/b/f prefix. MUST be before the identifier check —
+        // otherwise f"..." is lexed as Ident 'f' followed by StrLit.
         bool raw = false;
         bool bytes = false;
         bool fstring = false;
@@ -679,9 +666,128 @@ Result<void> Lexer::run(stdx::small_vector<Token, 512>& tokens,
             stabilized_strings_.push_back(std::move(snapshot));
             std::string_view cooked(stabilized_strings_.back().data(),
                                     stabilized_strings_.back().size());
-            Token t = make(TokKind::StrLit, cooked);
-            t.col = str_col;   // LEX-13
-            (void)bytes; (void)fstring;   // parser handles f-string interpolation
+
+            if (fstring) {
+                // PEP 498 f-string: parse the cooked body into parts
+                // (literal text + expression sources). The parser will
+                // re-parse each expression source and build a concatenation
+                // AST node.
+                Token t = make(TokKind::FStrLit, cooked);
+                t.col = str_col;
+                // Reserve index 0 as "empty" (no parts).
+                if (fstr_parts_side_.empty()) {
+                    fstr_parts_side_.push_back({});  // index 0 = empty
+                }
+                std::size_t parts_idx = fstr_parts_side_.size();
+                fstr_parts_side_.push_back({});
+                auto& parts = fstr_parts_side_.back();
+                // Parse the f-string body into parts.
+                std::string body(cooked);
+                std::size_t i = 0;
+                std::string lit_buf;
+                while (i < body.size()) {
+                    char ch = body[i];
+                    if (ch == '{' && i + 1 < body.size() && body[i+1] == '{') {
+                        lit_buf.push_back('{');
+                        i += 2;
+                        continue;
+                    }
+                    if (ch == '}' && i + 1 < body.size() && body[i+1] == '}') {
+                        lit_buf.push_back('}');
+                        i += 2;
+                        continue;
+                    }
+                    if (ch == '{') {
+                        // Flush accumulated literal text.
+                        if (!lit_buf.empty()) {
+                            fstr_stabilized_.push_back(std::move(lit_buf));
+                            lit_buf.clear();
+                            FStrPart p;
+                            p.text = std::string_view(fstr_stabilized_.back().data(),
+                                                       fstr_stabilized_.back().size());
+                            p.is_expr = false;
+                            p.conversion = 0;
+                            parts.push_back(p);
+                        }
+                        // Find the matching '}' — respecting nested braces,
+                        // strings, etc. For simplicity, we track brace depth.
+                        std::size_t expr_start = i + 1;
+                        int depth = 1;
+                        std::size_t j = expr_start;
+                        char conversion = 0;
+                        while (j < body.size() && depth > 0) {
+                            if (body[j] == '{') ++depth;
+                            else if (body[j] == '}') { --depth; if (depth == 0) break; }
+                            else if (body[j] == '!' && depth == 1 && j + 1 < body.size() &&
+                                     (body[j+1] == 'r' || body[j+1] == 's' || body[j+1] == 'a') &&
+                                     j + 2 < body.size() && body[j+2] == '}') {
+                                conversion = body[j+1];
+                                body[j] = '\0';  // truncate expr at '!'
+                                depth = 0;        // mark as terminated
+                                break;
+                            }
+                            ++j;
+                        }
+                        if (depth != 0) {
+                            return fail(lex_error(line_, col_,
+                                                  "unterminated f-string expression",
+                                                  body.c_str(),
+                                                  "Close with '}'"));
+                        }
+                        std::string expr_src(body.data() + expr_start,
+                                              j - expr_start);
+                        fstr_stabilized_.push_back(std::move(expr_src));
+                        FStrPart p;
+                        p.text = std::string_view(fstr_stabilized_.back().data(),
+                                                   fstr_stabilized_.back().size());
+                        p.is_expr = true;
+                        p.conversion = conversion;
+                        parts.push_back(p);
+                        // Skip past the expression + conversion + closing '}'.
+                        // For a plain {expr}: j points to '}', so i = j + 1.
+                        // For {expr!r}: j points to '!', we need i = j + 3
+                        // (skip '!', 'r', '}').
+                        if (conversion != 0) {
+                            i = j + 3;  // skip !, conversion char, }
+                        } else {
+                            i = j + 1;  // skip }
+                        }
+                        continue;
+                    }
+                    lit_buf.push_back(ch);
+                    ++i;
+                }
+                // Flush trailing literal text.
+                if (!lit_buf.empty()) {
+                    fstr_stabilized_.push_back(std::move(lit_buf));
+                    FStrPart p;
+                    p.text = std::string_view(fstr_stabilized_.back().data(),
+                                               fstr_stabilized_.back().size());
+                    p.is_expr = false;
+                    p.conversion = 0;
+                    parts.push_back(p);
+                }
+                t.fstr_parts_idx = static_cast<std::uint32_t>(parts_idx);
+                tokens.push_back(t);
+            } else {
+                Token t = make(TokKind::StrLit, cooked);
+                t.col = str_col;   // LEX-13
+                (void)bytes;   // bytes prefix handled at runtime if needed
+                tokens.push_back(t);
+            }
+            emitted_value_this_logical_line = true;
+            continue;
+        }
+
+        // --- identifiers -----------------------------------------------------------
+        if (is_ident_start(c)) {
+            std::size_t start = pos_;
+            std::uint32_t start_col = col_;
+            while (pos_ < src_.size() && is_ident_char(peek())) { ++pos_; ++col_; }
+            std::string_view text = src_.substr(start, pos_ - start);
+            TokKind k = keyword_kind(text);
+            Token t = make(k == TokKind::End ? TokKind::Ident : k, text);
+            t.col = start_col;
             tokens.push_back(t);
             emitted_value_this_logical_line = true;
             continue;

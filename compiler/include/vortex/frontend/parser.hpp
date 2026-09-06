@@ -25,6 +25,15 @@ public:
     Parser(stdx::small_vector<Token, 512>& tokens, Module& module) noexcept
         : tokens_(tokens), module_(module) {}
 
+    /// Set the f-string parts side-vector from the Lexer. Called by
+    /// compile_to_ast after lexing, before parsing. Sub-parsers created
+    /// for f-string expression sources don't need this (their tokens
+    /// can't contain FStrLit tokens).
+    void set_fstr_parts(
+        const stdx::small_vector<stdx::small_vector<FStrPart, 4>, 16>* parts) noexcept {
+        fstr_parts_side_ = parts;
+    }
+
     [[nodiscard]] Result<void> parse_module() noexcept;
 
 private:
@@ -101,6 +110,10 @@ private:
     /// expression (e.g., `staticmethod`, `property`, `my_dec(arg)`).
     /// Cleared after the def/class consumes them.
     stdx::small_vector<Expr*, 4> pending_decorators_{};
+    /// Pointer to the Lexer's f-string parts side-vector. Set by
+    /// compile_to_ast via set_fstr_parts(). Null in sub-parsers (which
+    /// don't encounter FStrLit tokens).
+    const stdx::small_vector<stdx::small_vector<FStrPart, 4>, 16>* fstr_parts_side_{nullptr};
 };
 
 /// Convenience: lex + parse in one call.
