@@ -26,6 +26,13 @@ void sweep(Graph& g) noexcept {
             Node& n = g.node(id);
             if (is_control(n.kind)) return;
             if (n.use_count > 0) return;
+            // Never kill Parameter nodes — they represent the function's
+            // calling convention. Even if a parameter is unused in the
+            // body, the caller still passes it, and bind_parameters
+            // expects param_regs to have an entry for every declared
+            // parameter. Killing an unused Parameter shrinks param_regs,
+            // causing "too many positional arguments" at call time.
+            if (n.kind == NodeKind::Parameter) return;
             if (!n.has(NodeFlag::OnEffectChain)) {
                 g.kill(id);
                 changed = true;

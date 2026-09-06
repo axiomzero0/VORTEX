@@ -51,6 +51,9 @@ enum class TokKind : std::uint8_t {
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
     Comma, Colon, Semi, Dot, Assign,
     ColonAssign,  // := (walrus operator, PEP 572)
+    // Augmented assignment operators (PEP 203)
+    PlusEq, MinusEq, StarEq, SlashEq, DoubleSlashEq, PercentEq, StarStarEq,
+    AmpEq, PipeEq, CaretEq, ShlEq, ShrEq, AtEq,
 };
 
 enum class Kw : std::uint8_t {

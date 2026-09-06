@@ -31,6 +31,9 @@ void sweep(Graph& g) noexcept {
                 return;
             }
             if (n.use_count > 0) return;
+            // Never kill Parameter nodes — see p03_trivial_dce.cpp for
+            // the full rationale (calling-convention contract).
+            if (n.kind == NodeKind::Parameter) return;
             if (!n.has(NodeFlag::OnEffectChain)) {
                 g.kill(id);
                 changed = true;

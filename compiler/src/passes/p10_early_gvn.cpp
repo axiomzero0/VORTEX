@@ -53,6 +53,8 @@ void sweep(Graph& g) noexcept {
         g.for_each_live([&](NodeId id) {
             Node& n = g.node(id);
             if (is_control(n.kind)) return;
+            // Never kill Parameter nodes — see p03_trivial_dce.cpp.
+            if (n.kind == NodeKind::Parameter) return;
             if (n.use_count == 0 && !n.has(NodeFlag::OnEffectChain)) {
                 g.kill(id);
                 changed = true;

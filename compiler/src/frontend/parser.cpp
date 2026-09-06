@@ -544,24 +544,23 @@ Result<Stmt*> Parser::parse_simple_stmt() noexcept {
 
     std::uint16_t aug = 0xFFFF;
     switch (peek().kind) {
-        case TokKind::Plus: aug = static_cast<std::uint16_t>(BinOpKind::Add); break;
-        case TokKind::Minus: aug = static_cast<std::uint16_t>(BinOpKind::Sub); break;
-        case TokKind::Star: aug = static_cast<std::uint16_t>(BinOpKind::Mul); break;
-        case TokKind::Slash: aug = static_cast<std::uint16_t>(BinOpKind::TrueDiv); break;
-        case TokKind::DoubleSlash: aug = static_cast<std::uint16_t>(BinOpKind::FloorDiv); break;
-        case TokKind::Percent: aug = static_cast<std::uint16_t>(BinOpKind::Mod); break;
-        case TokKind::StarStar: aug = static_cast<std::uint16_t>(BinOpKind::Pow); break;
-        case TokKind::Shl: aug = static_cast<std::uint16_t>(BinOpKind::LShift); break;
-        case TokKind::Shr: aug = static_cast<std::uint16_t>(BinOpKind::RShift); break;
-        case TokKind::Amp: aug = static_cast<std::uint16_t>(BinOpKind::BitAnd); break;
-        case TokKind::Pipe: aug = static_cast<std::uint16_t>(BinOpKind::BitOr); break;
-        case TokKind::Caret: aug = static_cast<std::uint16_t>(BinOpKind::BitXor); break;
+        case TokKind::PlusEq: aug = static_cast<std::uint16_t>(BinOpKind::Add); break;
+        case TokKind::MinusEq: aug = static_cast<std::uint16_t>(BinOpKind::Sub); break;
+        case TokKind::StarEq: aug = static_cast<std::uint16_t>(BinOpKind::Mul); break;
+        case TokKind::SlashEq: aug = static_cast<std::uint16_t>(BinOpKind::TrueDiv); break;
+        case TokKind::DoubleSlashEq: aug = static_cast<std::uint16_t>(BinOpKind::FloorDiv); break;
+        case TokKind::PercentEq: aug = static_cast<std::uint16_t>(BinOpKind::Mod); break;
+        case TokKind::StarStarEq: aug = static_cast<std::uint16_t>(BinOpKind::Pow); break;
+        case TokKind::ShlEq: aug = static_cast<std::uint16_t>(BinOpKind::LShift); break;
+        case TokKind::ShrEq: aug = static_cast<std::uint16_t>(BinOpKind::RShift); break;
+        case TokKind::AmpEq: aug = static_cast<std::uint16_t>(BinOpKind::BitAnd); break;
+        case TokKind::PipeEq: aug = static_cast<std::uint16_t>(BinOpKind::BitOr); break;
+        case TokKind::CaretEq: aug = static_cast<std::uint16_t>(BinOpKind::BitXor); break;
         default: aug = 0xFFFF; break;
     }
     if (aug != 0xFFFF) {
         advance();
-        auto eq = expect(TokKind::Assign, "'=' after augmented operator");
-        if (!eq) return std::unexpected(eq.error());
+        // No need to expect '=' — the augmented assignment is a single token.
         Stmt* s = new_stmt(StmtKind::AugAssign, t.line);
         s->targets.push_back(*lhs);
         s->aug_op = aug;

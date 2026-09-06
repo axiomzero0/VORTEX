@@ -711,12 +711,25 @@ Result<void> Lexer::run(stdx::small_vector<Token, 512>& tokens,
             return false;
         };
 
-        if (try_op("**", TokKind::StarStar) || try_op("//", TokKind::DoubleSlash) ||
+        // 3-char operators first (must be before 2-char prefixes):
+        // **= must be before **, //= must be before //, <<= before <<, >>= before >>
+        if (try_op("**=", TokKind::StarStarEq) ||
+            try_op("//=", TokKind::DoubleSlashEq) ||
+            try_op("<<=", TokKind::ShlEq) ||
+            try_op(">>=", TokKind::ShrEq) ||
+            try_op("**", TokKind::StarStar) || try_op("//", TokKind::DoubleSlash) ||
             try_op("<=", TokKind::LtEq) || try_op(">=", TokKind::GtEq) ||
             try_op("==", TokKind::EqEq) || try_op("!=", TokKind::NotEq) ||
             try_op("<<", TokKind::Shl) || try_op(">>", TokKind::Shr) ||
             try_op("->", TokKind::Arrow) ||
             try_op(":=", TokKind::ColonAssign) ||  // PEP 572 walrus — before ":" and "="
+            // 2-char augmented assignment (PEP 203) — must be before single-char ops
+            try_op("+=", TokKind::PlusEq) || try_op("-=", TokKind::MinusEq) ||
+            try_op("*=", TokKind::StarEq) || try_op("/=", TokKind::SlashEq) ||
+            try_op("%=", TokKind::PercentEq) ||
+            try_op("&=", TokKind::AmpEq) || try_op("|=", TokKind::PipeEq) ||
+            try_op("^=", TokKind::CaretEq) ||
+            try_op("@=", TokKind::AtEq) ||
             try_op("+", TokKind::Plus) || try_op("-", TokKind::Minus) ||
             try_op("*", TokKind::Star) || try_op("/", TokKind::Slash) ||
             try_op("%", TokKind::Percent) || try_op("@", TokKind::At) ||
