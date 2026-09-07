@@ -438,6 +438,13 @@ Runtime::Runtime() noexcept {
     // fix the typo'd symbol: AssertionError
     type_assertion_error->name_symbol = global_symbols().intern("AssertionError");
     type_int = mk_type("int", nullptr);
+    type_str = mk_type("str", nullptr);
+    type_float = mk_type("float", nullptr);
+    type_bool = mk_type("bool", nullptr);
+    type_list = mk_type("list", nullptr);
+    type_tuple = mk_type("tuple", nullptr);
+    type_dict = mk_type("dict", nullptr);
+    type_none = mk_type("NoneType", nullptr);
 }
 
 Runtime& Runtime::instance() noexcept {
@@ -866,14 +873,18 @@ bool Runtime::shape_find(ShapeNode* shape, std::uint32_t symbol,
 
 PyTypeObj* Runtime::type_of(const Value& v) noexcept {
     switch (v.tag) {
-        case Tag::None: return nullptr;
-        case Tag::Bool: return nullptr;
+        case Tag::None: return type_none;
+        case Tag::Bool: return type_bool;
         case Tag::Int: return type_int;
-        case Tag::Float: return nullptr;
+        case Tag::Float: return type_float;
         case Tag::Obj: {
             PyObj* o = v.as.obj;
             switch (o->tag) {
                 case ObjTag::Long: return type_int;
+                case ObjTag::Str: return type_str;
+                case ObjTag::List: return type_list;
+                case ObjTag::Tuple: return type_tuple;
+                case ObjTag::Dict: return type_dict;
                 case ObjTag::Instance: return static_cast<PyInstanceObj*>(o)->type;
                 case ObjTag::Type: return static_cast<PyTypeObj*>(o);
                 default: break;

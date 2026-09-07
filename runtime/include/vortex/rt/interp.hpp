@@ -145,6 +145,15 @@ public:
         return call_value(callee, args, argc, out);
     }
 
+    /// Public wrappers for builtins (hasattr/getattr/setattr) to access
+    /// the private get_attr/set_attr methods.
+    [[nodiscard]] bool get_attr_public(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
+        return get_attr(obj, symbol, out);
+    }
+    [[nodiscard]] bool set_attr_public(const Value& obj, std::uint32_t symbol, Value value) noexcept {
+        return set_attr(obj, symbol, value);
+    }
+
 private:
     [[nodiscard]] bool get_global(std::uint32_t symbol, Value& out) noexcept;
     [[nodiscard]] bool builtin_call(PyNativeFnObj* fn, Value* args, std::uint32_t argc,

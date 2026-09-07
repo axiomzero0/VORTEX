@@ -276,6 +276,13 @@ public:
     PyBoolObj* true_obj{};
     PyBoolObj* false_obj{};
     PyTypeObj* type_int{};       // builtin exception & base types
+    PyTypeObj* type_str{};       // str type
+    PyTypeObj* type_float{};     // float type
+    PyTypeObj* type_bool{};      // bool type
+    PyTypeObj* type_list{};      // list type
+    PyTypeObj* type_tuple{};     // tuple type
+    PyTypeObj* type_dict{};      // dict type
+    PyTypeObj* type_none{};      // NoneType
     PyTypeObj* type_exc_base{};
     PyTypeObj* type_value_error{};
     PyTypeObj* type_type_error{};

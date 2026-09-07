@@ -935,6 +935,59 @@ Value bi_callable(void*, Value* args, std::uint32_t argc) noexcept {
     }
 }
 
+// --- hasattr / getattr / setattr ---------------------------------------------
+// These use the active Vm's get_attr/set_attr methods, which handle the
+// shape-based slot lookup for instances and dict lookup for types.
+Value bi_hasattr(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 2) return error_msg("hasattr() takes two arguments");
+    if (args[1].tag != Tag::Obj || !args[1].as.obj ||
+        args[1].as.obj->tag != ObjTag::Str) {
+        return error_msg("hasattr() name must be a string");
+    }
+    auto* name = static_cast<PyStrObj*>(args[1].as.obj);
+    SymbolId sym = global_symbols().intern(std::string_view(name->data(), name->length));
+    Vm* vm = active_vm();
+    if (!vm) return Value::boolean(false);
+    Value out;
+    return Value::boolean(vm->get_attr_public(args[0], sym, out));
+}
+
+Value bi_getattr(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc < 2) return error_msg("getattr() takes at least two arguments");
+    if (args[1].tag != Tag::Obj || !args[1].as.obj ||
+        args[1].as.obj->tag != ObjTag::Str) {
+        return error_msg("getattr() name must be a string");
+    }
+    auto* name = static_cast<PyStrObj*>(args[1].as.obj);
+    SymbolId sym = global_symbols().intern(std::string_view(name->data(), name->length));
+    Vm* vm = active_vm();
+    if (!vm) return error_msg("getattr() no active VM");
+    Value out;
+    if (vm->get_attr_public(args[0], sym, out)) {
+        return out;  // owned ref returned
+    }
+    if (argc >= 3) return args[2];  // default value
+    return error_msg("getattr() attribute not found");
+}
+
+Value bi_setattr(void*, Value* args, std::uint32_t argc) noexcept {
+    if (argc != 3) return error_msg("setattr() takes three arguments");
+    if (args[1].tag != Tag::Obj || !args[1].as.obj ||
+        args[1].as.obj->tag != ObjTag::Str) {
+        return error_msg("setattr() name must be a string");
+    }
+    auto* name = static_cast<PyStrObj*>(args[1].as.obj);
+    SymbolId sym = global_symbols().intern(std::string_view(name->data(), name->length));
+    Vm* vm = active_vm();
+    if (!vm) return error_msg("setattr() no active VM");
+    Value v = args[2];
+    if (v.tag == Tag::Obj && v.as.obj) Runtime::instance().incref(v.as.obj);
+    if (vm->set_attr_public(args[0], sym, v)) {
+        return Value::none();
+    }
+    return error_msg("setattr() target must be an instance or type");
+}
+
 // --- math module -------------------------------------------------------------------
 Value math_call(void* user, Value* args, std::uint32_t argc) noexcept {
     auto* fn = reinterpret_cast<double (*)(double)>(user);
@@ -1087,6 +1140,7 @@ void install_builtins(Program& program) noexcept {
         {"chr", bi_chr}, {"ord", bi_ord},
         {"hex", bi_hex}, {"oct", bi_oct}, {"bin", bi_bin},
         {"hash", bi_hash}, {"id", bi_id}, {"callable", bi_callable},
+        {"hasattr", bi_hasattr}, {"getattr", bi_getattr}, {"setattr", bi_setattr},
     };
     for (const Entry& e : entries) {
         SymbolId sym = global_symbols().intern(e.name);
@@ -1120,6 +1174,26 @@ void install_builtins(Program& program) noexcept {
         SymbolId sym = global_symbols().intern(types[i].name);
         dict_set(program.globals, Value::integer(sym),
                  Value::object(reinterpret_cast<PyObj*>(type_map[i])));
+    }
+
+    // Register built-in type objects so isinstance(x, int) / isinstance(x, str)
+    // etc. work. These are the type singletons from Runtime — the same
+    // objects returned by type() and type_of(). We OVERWRITE the function
+    // entries for int/str/float/bool/list/tuple/dict with the type objects
+    // so that `isinstance(5, int)` finds the type, not the conversion function.
+    // The conversion function (int(x), str(x), etc.) is still accessible
+    // via call_value: PyTypeObj is callable (it calls __init__).
+    struct BuiltinType { const char* name; PyTypeObj* type; };
+    static const BuiltinType builtin_types[] = {
+        {"int", rt.type_int}, {"str", rt.type_str}, {"float", rt.type_float},
+        {"bool", rt.type_bool}, {"list", rt.type_list}, {"tuple", rt.type_tuple},
+        {"dict", rt.type_dict}, {"NoneType", rt.type_none},
+    };
+    for (const BuiltinType& bt : builtin_types) {
+        if (!bt.type) continue;
+        SymbolId sym = global_symbols().intern(bt.name);
+        dict_set(program.globals, Value::integer(sym),
+                 Value::object(reinterpret_cast<PyObj*>(bt.type)));
     }
 }
 void set_vm_for_builtins(Vm* vm) noexcept { g_vm = vm; }
