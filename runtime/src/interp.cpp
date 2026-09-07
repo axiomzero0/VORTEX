@@ -209,6 +209,13 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                 {"upper", 0x300},    {"lower", 0x301},   {"split", 0x302},
                 {"startswith", 0x303}, {"endswith", 0x304}, {"strip", 0x305},
                 {"replace", 0x306},  {"join", 0x307},
+                // Giga Tracing 2.0: more string methods
+                {"find", 0x308},     {"rfind", 0x309},   {"count", 0x30A},
+                {"index", 0x30B},     {"isdigit", 0x30C}, {"isalpha", 0x30D},
+                {"isalnum", 0x30E},  {"isspace", 0x30F},  {"center", 0x310},
+                {"ljust", 0x311},    {"rjust", 0x312},   {"zfill", 0x313},
+                {"lstrip", 0x314},   {"rstrip", 0x315},  {"title", 0x316},
+                {"capitalize", 0x317},
             };
             for (const StrMethod& m : str_methods) {
                 if (sym == m.name) {
@@ -1068,6 +1075,256 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                         auto* ps = static_cast<PyStrObj*>(p.as.obj);
                         for (std::uint32_t k = 0; k < ps->length; ++k) buf.push_back(ps->data()[k]);
                     }
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x308: {   // find(sub[, start]) → int (-1 if not found)
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "find expects a string");
+                    return false;
+                }
+                auto* sub = static_cast<PyStrObj*>(args[0].as.obj);
+                std::string_view subv(sub->data(), sub->length);
+                std::size_t start = 0;
+                if (argc >= 2 && args[1].tag == Tag::Int) {
+                    start = static_cast<std::size_t>(args[1].as.i);
+                    if (start > sv.size()) start = sv.size();
+                }
+                std::size_t at = sv.find(subv, start);
+                out = Value::integer(at == std::string_view::npos ? -1 : static_cast<std::int64_t>(at));
+                return true;
+            }
+            case 0x309: {   // rfind(sub) → int (-1 if not found)
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "rfind expects a string");
+                    return false;
+                }
+                auto* sub = static_cast<PyStrObj*>(args[0].as.obj);
+                std::string_view subv(sub->data(), sub->length);
+                std::size_t at = sv.rfind(subv);
+                out = Value::integer(at == std::string_view::npos ? -1 : static_cast<std::int64_t>(at));
+                return true;
+            }
+            case 0x30A: {   // count(sub) → int
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "count expects a string");
+                    return false;
+                }
+                auto* sub = static_cast<PyStrObj*>(args[0].as.obj);
+                std::string_view subv(sub->data(), sub->length);
+                if (subv.empty()) {
+                    out = Value::integer(static_cast<std::int64_t>(sv.size() + 1));
+                    return true;
+                }
+                std::size_t count = 0, pos = 0;
+                while ((pos = sv.find(subv, pos)) != std::string_view::npos) {
+                    ++count;
+                    pos += subv.size();
+                }
+                out = Value::integer(static_cast<std::int64_t>(count));
+                return true;
+            }
+            case 0x30B: {   // index(sub) → int (raises ValueError if not found)
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Str) {
+                    raise_builtin(rt.type_type_error, "index expects a string");
+                    return false;
+                }
+                auto* sub = static_cast<PyStrObj*>(args[0].as.obj);
+                std::string_view subv(sub->data(), sub->length);
+                std::size_t at = sv.find(subv);
+                if (at == std::string_view::npos) {
+                    raise_builtin(rt.type_value_error, "substring not found");
+                    return false;
+                }
+                out = Value::integer(static_cast<std::int64_t>(at));
+                return true;
+            }
+            case 0x30C: {   // isdigit() → bool
+                if (sv.empty()) { out = Value::boolean(false); return true; }
+                for (char c : sv) {
+                    if (!std::isdigit((unsigned char)c)) {
+                        out = Value::boolean(false);
+                        return true;
+                    }
+                }
+                out = Value::boolean(true);
+                return true;
+            }
+            case 0x30D: {   // isalpha() → bool
+                if (sv.empty()) { out = Value::boolean(false); return true; }
+                for (char c : sv) {
+                    if (!std::isalpha((unsigned char)c)) {
+                        out = Value::boolean(false);
+                        return true;
+                    }
+                }
+                out = Value::boolean(true);
+                return true;
+            }
+            case 0x30E: {   // isalnum() → bool
+                if (sv.empty()) { out = Value::boolean(false); return true; }
+                for (char c : sv) {
+                    if (!std::isalnum((unsigned char)c)) {
+                        out = Value::boolean(false);
+                        return true;
+                    }
+                }
+                out = Value::boolean(true);
+                return true;
+            }
+            case 0x30F: {   // isspace() → bool
+                if (sv.empty()) { out = Value::boolean(false); return true; }
+                for (char c : sv) {
+                    if (!std::isspace((unsigned char)c)) {
+                        out = Value::boolean(false);
+                        return true;
+                    }
+                }
+                out = Value::boolean(true);
+                return true;
+            }
+            case 0x310: {   // center(width[, fillchar])
+                if (argc < 1 || args[0].tag != Tag::Int) {
+                    raise_builtin(rt.type_type_error, "center expects an integer width");
+                    return false;
+                }
+                std::size_t width = static_cast<std::size_t>(args[0].as.i);
+                if (width <= sv.size()) {
+                    out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(sv)));
+                    return true;
+                }
+                char fill = ' ';
+                if (argc >= 2 && args[1].tag == Tag::Obj && args[1].as.obj &&
+                    args[1].as.obj->tag == ObjTag::Str) {
+                    auto* fc = static_cast<PyStrObj*>(args[1].as.obj);
+                    if (fc->length > 0) fill = fc->data()[0];
+                }
+                std::size_t total = width - sv.size();
+                std::size_t left = total / 2;
+                std::size_t right = total - left;
+                stdx::small_vector<char, 128> buf;
+                for (std::size_t i = 0; i < left; ++i) buf.push_back(fill);
+                for (char c : sv) buf.push_back(c);
+                for (std::size_t i = 0; i < right; ++i) buf.push_back(fill);
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x311: {   // ljust(width[, fillchar])
+                if (argc < 1 || args[0].tag != Tag::Int) {
+                    raise_builtin(rt.type_type_error, "ljust expects an integer width");
+                    return false;
+                }
+                std::size_t width = static_cast<std::size_t>(args[0].as.i);
+                if (width <= sv.size()) {
+                    out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(sv)));
+                    return true;
+                }
+                char fill = ' ';
+                if (argc >= 2 && args[1].tag == Tag::Obj && args[1].as.obj &&
+                    args[1].as.obj->tag == ObjTag::Str) {
+                    auto* fc = static_cast<PyStrObj*>(args[1].as.obj);
+                    if (fc->length > 0) fill = fc->data()[0];
+                }
+                stdx::small_vector<char, 128> buf;
+                for (char c : sv) buf.push_back(c);
+                for (std::size_t i = sv.size(); i < width; ++i) buf.push_back(fill);
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x312: {   // rjust(width[, fillchar])
+                if (argc < 1 || args[0].tag != Tag::Int) {
+                    raise_builtin(rt.type_type_error, "rjust expects an integer width");
+                    return false;
+                }
+                std::size_t width = static_cast<std::size_t>(args[0].as.i);
+                if (width <= sv.size()) {
+                    out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(sv)));
+                    return true;
+                }
+                char fill = ' ';
+                if (argc >= 2 && args[1].tag == Tag::Obj && args[1].as.obj &&
+                    args[1].as.obj->tag == ObjTag::Str) {
+                    auto* fc = static_cast<PyStrObj*>(args[1].as.obj);
+                    if (fc->length > 0) fill = fc->data()[0];
+                }
+                stdx::small_vector<char, 128> buf;
+                for (std::size_t i = sv.size(); i < width; ++i) buf.push_back(fill);
+                for (char c : sv) buf.push_back(c);
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x313: {   // zfill(width) → str (pad with zeros)
+                if (argc < 1 || args[0].tag != Tag::Int) {
+                    raise_builtin(rt.type_type_error, "zfill expects an integer width");
+                    return false;
+                }
+                std::size_t width = static_cast<std::size_t>(args[0].as.i);
+                if (width <= sv.size()) {
+                    out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(sv)));
+                    return true;
+                }
+                stdx::small_vector<char, 128> buf;
+                // Handle sign: "+123".zfill(6) → "+00123", "-123".zfill(6) → "-00123"
+                std::size_t start = 0;
+                if (!sv.empty() && (sv[0] == '+' || sv[0] == '-')) {
+                    buf.push_back(sv[0]);
+                    start = 1;
+                }
+                for (std::size_t i = sv.size(); i < width; ++i) buf.push_back('0');
+                for (std::size_t i = start; i < sv.size(); ++i) buf.push_back(sv[i]);
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x314: {   // lstrip() → str
+                std::size_t b = 0;
+                while (b < sv.size() && std::isspace((unsigned char)sv[b])) ++b;
+                out = Value::object(reinterpret_cast<PyObj*>(
+                    rt.new_str(sv.substr(b))));
+                return true;
+            }
+            case 0x315: {   // rstrip() → str
+                std::size_t e = sv.size();
+                while (e > 0 && std::isspace((unsigned char)sv[e - 1])) --e;
+                out = Value::object(reinterpret_cast<PyObj*>(
+                    rt.new_str(sv.substr(0, e))));
+                return true;
+            }
+            case 0x316: {   // title() → str (capitalize first char of each word)
+                stdx::small_vector<char, 128> buf;
+                bool prev_alpha = false;
+                for (char c : sv) {
+                    if (std::isalpha((unsigned char)c)) {
+                        if (!prev_alpha) buf.push_back(static_cast<char>(std::toupper((unsigned char)c)));
+                        else buf.push_back(static_cast<char>(std::tolower((unsigned char)c)));
+                        prev_alpha = true;
+                    } else {
+                        buf.push_back(c);
+                        prev_alpha = false;
+                    }
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x317: {   // capitalize() → str (first char upper, rest lower)
+                if (sv.empty()) {
+                    out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(sv)));
+                    return true;
+                }
+                stdx::small_vector<char, 128> buf;
+                buf.push_back(static_cast<char>(std::toupper((unsigned char)sv[0])));
+                for (std::size_t i = 1; i < sv.size(); ++i) {
+                    buf.push_back(static_cast<char>(std::tolower((unsigned char)sv[i])));
                 }
                 out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
                     std::string_view(buf.data(), buf.size()))));
