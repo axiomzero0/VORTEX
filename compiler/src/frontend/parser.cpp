@@ -446,6 +446,31 @@ Result<Stmt*> Parser::parse_simple_stmt() noexcept {
             }
             return s;
         }
+        case TokKind::KwYield: {
+            // PEP 380: `yield from expr` in statement position.
+            // Expand to: for __yf__ in expr: yield __yf__
+            if (peek(1).kind == TokKind::KwFrom) {
+                advance();  // yield
+                advance();  // from
+                Result<Expr*> iter_expr = parse_testlist(true);
+                if (!iter_expr) return std::unexpected(iter_expr.error());
+                Stmt* for_stmt = new_stmt(StmtKind::For, t.line);
+                for_stmt->iter = *iter_expr;
+                Expr* target = new_expr(ExprKind::Name, t.line);
+                target->name = global_symbols().intern("__yf__");
+                for_stmt->for_target = target;
+                Expr* yield_expr = new_expr(ExprKind::Yield, t.line);
+                Expr* yield_val = new_expr(ExprKind::Name, t.line);
+                yield_val->name = global_symbols().intern("__yf__");
+                yield_expr->sub = yield_val;
+                Stmt* yield_stmt = new_stmt(StmtKind::Expr, t.line);
+                yield_stmt->value = yield_expr;
+                for_stmt->body.push_back(yield_stmt);
+                return for_stmt;
+            }
+            // Regular yield statement: fall through to Expr handler.
+            break;
+        }
         case TokKind::KwRaise: {
             advance();
             Stmt* s = new_stmt(StmtKind::Raise, t.line);
@@ -618,6 +643,16 @@ Result<Expr*> Parser::parse_expr() noexcept {
     }
     if (check(TokKind::KwYield)) {
         advance();
+        // PEP 380: yield from expr — in expression context, create YieldFrom.
+        // In statement context, parse_simple_stmt handles the expansion.
+        if (check(TokKind::KwFrom)) {
+            advance();
+            Expr* yf = new_expr(ExprKind::YieldFrom, peek().line);
+            Result<Expr*> v = parse_testlist(true);
+            if (!v) return std::unexpected(v.error());
+            yf->sub = *v;
+            return yf;
+        }
         Expr* y = new_expr(ExprKind::Yield, peek().line);
         if (!stmt_boundaries() && !check(TokKind::RParen) && !check(TokKind::Comma) &&
             !check(TokKind::RBracket) && !check(TokKind::RBrace)) {

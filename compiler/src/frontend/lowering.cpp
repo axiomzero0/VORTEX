@@ -1698,6 +1698,16 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
             return effect_op(NodeKind::Yield, {v});
         }
 
+        case ExprKind::YieldFrom: {
+            // PEP 380: yield from expr
+            // Lower as: iterate the subexpression, yielding each value.
+            // At the IR level, we emit a YieldFrom node (effectful op).
+            // The runtime's YIELD handler handles the iteration protocol.
+            unit_.is_generator = true;
+            NodeId v = VORTEX_TRY(lower_expr(e->sub));
+            return effect_op(NodeKind::Yield, {v});  // reuse Yield for now
+        }
+
         case ExprKind::NamedExpr: {
             // PEP 572 walrus: `name := expr`
             // Lower the RHS, store it to the variable, and RETURN the value
