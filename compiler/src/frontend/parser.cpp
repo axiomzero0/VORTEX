@@ -1230,8 +1230,18 @@ Result<Expr*> Parser::parse_dict_or_set() noexcept {
         if (!rb) return std::unexpected(rb.error());
         return dict;
     }
-    return fail_msg("parse: set literals are outside the VORTEX subset (use dict or list)",
-                    diag_code::parse_unexpected_token);
+    // Set literal: {elem1, elem2, ...}
+    Expr* set_expr = new_expr(ExprKind::SetLit, (*first_key)->line);
+    set_expr->args.push_back(*first_key);
+    while (accept(TokKind::Comma)) {
+        if (check(TokKind::RBrace)) break;
+        Result<Expr*> elem = parse_expr();
+        if (!elem) return std::unexpected(elem.error());
+        set_expr->args.push_back(*elem);
+    }
+    auto rb = expect(TokKind::RBrace, "'}' closing set");
+    if (!rb) return std::unexpected(rb.error());
+    return set_expr;
 }
 
 Result<Expr*> Parser::parse_atom() noexcept {

@@ -63,6 +63,7 @@ enum class ObjTag : std::uint8_t {
     Module,         // native module namespace (math, ...)
     IterSentinel,
     BoundMethod,    // func + receiver pair
+    Set,            // set (hash-based, like dict with only keys)
 };
 
 struct PyLongObj; struct PyFloatObj; struct PyStrObj; struct PyListObj;
@@ -174,6 +175,14 @@ struct PyDictObj : PyObj {
     std::uint32_t insert_seq{0};
 };
 
+// Set: hash-based collection, implemented as a dict with only keys (values = None).
+struct PySetObj : PyObj {
+    std::uint32_t count{0};
+    std::uint32_t capacity{8};   // power of two
+    DictEntry* entries{nullptr};  // reuse DictEntry (key + value, value unused)
+    std::uint32_t insert_seq{0};
+};
+
 // --- Shapes & instances ---------------------------------------------------------------
 struct ShapeNode {
     ShapeNode* parent{nullptr};
@@ -282,6 +291,7 @@ public:
     PyTypeObj* type_list{};      // list type
     PyTypeObj* type_tuple{};     // tuple type
     PyTypeObj* type_dict{};      // dict type
+    PyTypeObj* type_set{};       // set type
     PyTypeObj* type_none{};      // NoneType
     PyTypeObj* type_exc_base{};
     PyTypeObj* type_value_error{};
@@ -305,6 +315,7 @@ public:
     [[nodiscard]] PyListObj* new_list(std::uint32_t cap = 4) noexcept;
     [[nodiscard]] PyTupleObj* new_tuple(std::uint32_t n) noexcept;
     [[nodiscard]] PyDictObj* new_dict() noexcept;
+    [[nodiscard]] PySetObj* new_set(std::uint32_t cap = 8) noexcept;
     [[nodiscard]] PyTypeObj* new_type(std::uint32_t name_symbol, PyTypeObj* base,
                                       PyDictObj* dict) noexcept;
     [[nodiscard]] PyInstanceObj* new_instance(PyTypeObj* type) noexcept;
@@ -389,6 +400,11 @@ template <typename T>
 [[nodiscard]] bool dict_set(PyDictObj* d, Value key, Value value) noexcept;    // takes ownership of both
 [[nodiscard]] bool dict_get(PyDictObj* d, const Value& key, Value& out) noexcept;  // borrowed out
 [[nodiscard]] bool dict_del(PyDictObj* d, const Value& key) noexcept;   // frees key/value refs
+
+// Set helpers (sets reuse DictEntry but ignore the value field).
+[[nodiscard]] bool set_add(PySetObj* s, Value v) noexcept;             // takes ownership of v
+[[nodiscard]] bool set_contains(const PySetObj* s, const Value& v) noexcept;
+[[nodiscard]] bool set_remove(PySetObj* s, const Value& v) noexcept;   // frees v's ref
 
 // --- bignum numeric core (used by both interpreter and JIT slow paths) -----------
 [[nodiscard]] bool values_add(const Value& a, const Value& b, Value& out) noexcept;

@@ -35,6 +35,7 @@ enum class ExprKind : std::uint8_t {
     ListLit, TupleLit, DictLit, ListComp, Lambda, IfExp, Yield, SliceLit,
     NamedExpr,  // walrus operator (PEP 572): `name := expr` — stores and returns value
     YieldFrom,  // `yield from expr` (PEP 380)
+    SetLit,     // `{1, 2, 3}` — set literal (PEP 218)
 };
 
 enum class StmtKind : std::uint8_t {

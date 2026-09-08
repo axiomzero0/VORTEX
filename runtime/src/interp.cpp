@@ -344,6 +344,21 @@ bool Vm::get_iter(const Value& obj, Value& out) noexcept {
                 out = Value::object(reinterpret_cast<PyObj*>(di));
                 return true;
             }
+            case ObjTag::Set: {
+                // Sets are iterable (yield each element). We reuse DictIter
+                // since PySetObj has the same entries/count/capacity layout
+                // as PyDictObj — the iterator just reads keys (values are
+                // unused in sets).
+                auto* di = static_cast<PyDictIterObj*>(std::malloc(sizeof(PyDictIterObj)));
+                di->tag = ObjTag::DictIter;
+                di->flags = 0;
+                di->refcount = 1;
+                di->dict = reinterpret_cast<PyDictObj*>(obj.as.obj);
+                di->slot = 0;
+                di->remaining = static_cast<PySetObj*>(obj.as.obj)->count;
+                out = Value::object(reinterpret_cast<PyObj*>(di));
+                return true;
+            }
             default:
                 break;
         }

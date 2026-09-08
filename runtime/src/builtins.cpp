@@ -50,6 +50,7 @@ Value bi_len(void*, Value* args, std::uint32_t argc) noexcept {
             case ObjTag::List: return Value::integer(static_cast<PyListObj*>(v.as.obj)->length);
             case ObjTag::Tuple: return Value::integer(static_cast<PyTupleObj*>(v.as.obj)->length);
             case ObjTag::Dict: return Value::integer(static_cast<PyDictObj*>(v.as.obj)->count);
+            case ObjTag::Set: return Value::integer(static_cast<PySetObj*>(v.as.obj)->count);
             default: break;
         }
     }
@@ -319,6 +320,15 @@ Value bi_list(void*, Value* args, std::uint32_t argc) noexcept {
             }
             return Value::object(reinterpret_cast<PyObj*>(l));
         }
+        if (o->tag == ObjTag::Set) {
+            auto* s = static_cast<PySetObj*>(o);
+            for (std::uint32_t i = 0; i < s->capacity; ++i) {
+                if (s->entries[i].used && s->entries[i].key.tag != Tag::None) {
+                    list_push(l, s->entries[i].key);
+                }
+            }
+            return Value::object(reinterpret_cast<PyObj*>(l));
+        }
     }
     return Value::object(reinterpret_cast<PyObj*>(l));
 }
@@ -340,6 +350,23 @@ Value bi_dict(void*, Value* args, std::uint32_t argc) noexcept {
     (void)args;
     (void)argc;
     return Value::object(reinterpret_cast<PyObj*>(Runtime::instance().new_dict()));
+}
+
+Value bi_set(void*, Value* args, std::uint32_t argc) noexcept {
+    Runtime& rt = Runtime::instance();
+    auto* s = rt.new_set();
+    if (argc == 1 && args[0].tag == Tag::Obj && args[0].as.obj) {
+        // Build a list from the iterable, then add each element to the set.
+        Value lv = bi_list(nullptr, args, 1);
+        if (lv.tag == Tag::Obj && lv.as.obj && lv.as.obj->tag == ObjTag::List) {
+            auto* l = static_cast<PyListObj*>(lv.as.obj);
+            for (std::uint32_t i = 0; i < l->length; ++i) {
+                set_add(s, l->items[i]);
+            }
+            rt.decref(reinterpret_cast<PyObj*>(l));
+        }
+    }
+    return Value::object(reinterpret_cast<PyObj*>(s));
 }
 
 // --- enumerate / zip / map / filter / sorted ---------------------------------------
@@ -445,8 +472,8 @@ Value bi_sorted(void*, Value* args, std::uint32_t argc) noexcept {
     }
     PyObj* src_obj = args[0].as.obj;
     if (src_obj->tag != ObjTag::List && src_obj->tag != ObjTag::Tuple &&
-        src_obj->tag != ObjTag::Str) {
-        return error_msg("sorted() expects a list/tuple/str (subset)");
+        src_obj->tag != ObjTag::Str && src_obj->tag != ObjTag::Set) {
+        return error_msg("sorted() expects a list/tuple/str/set (subset)");
     }
     Value lv = bi_list(nullptr, args, 1);
     if (lv.tag == Tag::Obj && lv.as.obj == nullptr) return lv;
@@ -1131,6 +1158,7 @@ void install_builtins(Program& program) noexcept {
         {"abs", bi_abs}, {"min", bi_min}, {"max", bi_max}, {"sum", bi_sum},
         {"str", bi_str}, {"repr", bi_repr}, {"int", bi_int}, {"float", bi_float},
         {"bool", bi_bool}, {"list", bi_list}, {"tuple", bi_tuple}, {"dict", bi_dict},
+        {"set", bi_set},
         {"enumerate", bi_enumerate}, {"zip", bi_zip}, {"sorted", bi_sorted},
         {"next", bi_next}, {"isinstance", bi_isinstance}, {"type", bi_type},
         // Python 3.16 features (batch): missing builtins.

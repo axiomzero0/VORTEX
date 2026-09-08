@@ -444,6 +444,7 @@ Runtime::Runtime() noexcept {
     type_list = mk_type("list", nullptr);
     type_tuple = mk_type("tuple", nullptr);
     type_dict = mk_type("dict", nullptr);
+    type_set = mk_type("set", nullptr);
     type_none = mk_type("NoneType", nullptr);
 }
 
@@ -547,6 +548,19 @@ void Runtime::decref(PyObj* o) noexcept {
                         }
                     }
                     std::free(d->entries);
+                }
+                /* region-managed */
+                break;
+            }
+            case ObjTag::Set: {
+                auto* s = static_cast<PySetObj*>(o);
+                if (s->entries) {
+                    for (std::uint32_t i = 0; i < s->capacity; ++i) {
+                        if (s->entries[i].used) {
+                            if (s->entries[i].key.tag == Tag::Obj) decref(s->entries[i].key.as.obj);
+                        }
+                    }
+                    std::free(s->entries);
                 }
                 /* region-managed */
                 break;
@@ -687,6 +701,24 @@ PyDictObj* Runtime::new_dict() noexcept {
     std::memset(d->entries, 0, sizeof(DictEntry) * d->capacity);
     ++allocations;
     return d;
+}
+
+PySetObj* Runtime::new_set(std::uint32_t cap) noexcept {
+    // Round up to power of two.
+    std::uint32_t c = 8;
+    while (c < cap) c <<= 1;
+    auto* s = static_cast<PySetObj*>(heap_alloc(sizeof(PySetObj)));
+    s->tag = ObjTag::Set;
+    s->refcount = 1;
+    s->flags = 0;
+    s->pad = 0;
+    s->count = 0;
+    s->insert_seq = 0;
+    s->capacity = c;
+    s->entries = static_cast<DictEntry*>(std::calloc(c, sizeof(DictEntry)));
+    std::memset(s->entries, 0, sizeof(DictEntry) * c);
+    ++allocations;
+    return s;
 }
 
 PyTypeObj* Runtime::new_type(std::uint32_t name_symbol, PyTypeObj* base,
@@ -885,6 +917,7 @@ PyTypeObj* Runtime::type_of(const Value& v) noexcept {
                 case ObjTag::List: return type_list;
                 case ObjTag::Tuple: return type_tuple;
                 case ObjTag::Dict: return type_dict;
+                case ObjTag::Set: return type_set;
                 case ObjTag::Instance: return static_cast<PyInstanceObj*>(o)->type;
                 case ObjTag::Type: return static_cast<PyTypeObj*>(o);
                 default: break;
@@ -921,6 +954,7 @@ bool Runtime::truthy(const Value& v) noexcept {
                 case ObjTag::List: return static_cast<PyListObj*>(o)->length != 0;
                 case ObjTag::Tuple: return static_cast<PyTupleObj*>(o)->length != 0;
                 case ObjTag::Dict: return static_cast<PyDictObj*>(o)->count != 0;
+                case ObjTag::Set: return static_cast<PySetObj*>(o)->count != 0;
                 case ObjTag::Long: {
                     auto* l = static_cast<PyLongObj*>(o);
                     return l->flags & PyLongObj::kBigFlag ? !l->big.is_zero() : l->value != 0;
@@ -1136,6 +1170,25 @@ void Runtime::repr_into(const Value& v, stdx::small_vector<char, 128>& out) noex
                 out.push_back(':');
                 out.push_back(' ');
                 repr_into(d->entries[i].value, out);
+            }
+            out.push_back('}');
+            return;
+        }
+        case ObjTag::Set: {
+            auto* s = static_cast<PySetObj*>(o);
+            if (s->count == 0) {
+                // Empty set repr is "set()", not "{}" (which would be an empty dict).
+                out.push_back('s'); out.push_back('e'); out.push_back('t');
+                out.push_back('('); out.push_back(')');
+                return;
+            }
+            out.push_back('{');
+            bool first = true;
+            for (std::uint32_t i = 0; i < s->capacity; ++i) {
+                if (!s->entries[i].used) continue;
+                if (!first) { out.push_back(','); out.push_back(' '); }
+                first = false;
+                repr_into(s->entries[i].key, out);
             }
             out.push_back('}');
             return;
@@ -1387,6 +1440,72 @@ bool dict_del(PyDictObj* d, const Value& key) noexcept {
 // defensively, in case a future caller hands us a table that was
 // constructed by an older deletion scheme. Probe invariants hold without
 // rehash-on-delete because the cluster is rebuilt in-place.
+
+// =============================================================================
+// Set helpers (sets reuse DictEntry; value field is unused)
+// =============================================================================
+
+bool set_add(PySetObj* s, Value v) noexcept {
+    Runtime& rt = Runtime::instance();
+    // Grow if load factor > 0.75.
+    if ((s->count + 1) * 4 > s->capacity * 3) {
+        std::uint32_t new_cap = s->capacity * 2;
+        DictEntry* new_entries = static_cast<DictEntry*>(
+            std::calloc(new_cap, sizeof(DictEntry)));
+        if (!new_entries) return false;
+        std::uint32_t new_mask = new_cap - 1;
+        for (std::uint32_t i = 0; i < s->capacity; ++i) {
+            if (!s->entries[i].used) continue;
+            DictEntry& e = s->entries[i];
+            std::uint32_t j = e.hash & new_mask;
+            while (new_entries[j].used) j = (j + 1) & new_mask;
+            new_entries[j] = e;
+        }
+        std::free(s->entries);
+        s->entries = new_entries;
+        s->capacity = new_cap;
+    }
+    std::uint32_t h = rt.hash(v);
+    std::uint32_t mask = s->capacity - 1;
+    std::uint32_t i = h & mask;
+    for (;;) {
+        DictEntry& e = s->entries[i];
+        if (!e.used) {
+            e.key = v;
+            e.value = Value::none();
+            e.used = true;
+            e.hash = h;
+            e.seq = s->insert_seq++;
+            ++s->count;
+            return true;
+        }
+        if (e.hash == h && rt.eq(e.key, v)) {
+            // Already present — don't add duplicate. Drop the new ref.
+            if (v.tag == Tag::Obj && v.as.obj) rt.decref(v.as.obj);
+            return true;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+bool set_contains(const PySetObj* s, const Value& v) noexcept {
+    Runtime& rt = Runtime::instance();
+    std::uint32_t h = rt.hash(v);
+    std::uint32_t mask = s->capacity - 1;
+    std::uint32_t i = h & mask;
+    for (;;) {
+        const DictEntry& e = s->entries[i];
+        if (!e.used) return false;
+        if (e.hash == h && rt.eq(e.key, v)) return true;
+        i = (i + 1) & mask;
+    }
+}
+
+bool set_remove(PySetObj* s, const Value& v) noexcept {
+    // Reuse dict_del's backward-shift logic (identical for key-only tables).
+    // We temporarily cast to PyDictObj since the layout is compatible.
+    return dict_del(reinterpret_cast<PyDictObj*>(s), v);
+}
 // =============================================================================
 // Box / numeric tower
 // =============================================================================
@@ -1847,6 +1966,8 @@ bool values_compare(const Value& a, const Value& b, std::uint16_t op, bool& out)
             } else if (container->tag == ObjTag::Dict) {
                 Value tmp;
                 found = dict_get(static_cast<PyDictObj*>(container), a, tmp);
+            } else if (container->tag == ObjTag::Set) {
+                found = set_contains(static_cast<PySetObj*>(container), a);
             } else {
                 return false;
             }

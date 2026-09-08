@@ -1632,6 +1632,36 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
             return n;
         }
 
+        case ExprKind::SetLit: {
+            // Lower {a, b, c} as: build a list [a, b, c], then call set(list).
+            NodeId list_n = g().create(NodeKind::NewList);
+            Node& ln = g().node(list_n);
+            ln.set_flag(NodeFlag::OnEffectChain);
+            ln.set_flag(NodeFlag::MayThrow);
+            g().add_input(list_n, control_);
+            g().add_input(list_n, memory_);
+            for (Expr* elem : e->args) {
+                g().add_input(list_n, VORTEX_TRY(lower_expr(elem)));
+            }
+            memory_ = list_n;
+            // Load the `set` builtin from globals (it's a NativeFn).
+            NodeId set_fn = effect_op(NodeKind::LoadGlobal, {}, true);
+            g().node(set_fn).symbol = global_symbols().intern("set");
+            // Call set(list)
+            NodeId call = g().create(NodeKind::CallPy);
+            Node& cn = g().node(call);
+            cn.set_flag(NodeFlag::OnEffectChain);
+            cn.set_flag(NodeFlag::MayThrow);
+            cn.aux0 = 1;  // 1 positional arg
+            cn.aux1 = 0;  // no *args / **kwargs
+            g().add_input(call, control_);
+            g().add_input(call, memory_);
+            g().add_input(call, set_fn);
+            g().add_input(call, list_n);
+            memory_ = call;
+            return call;
+        }
+
         case ExprKind::ListComp:
             return lower_listcomp(e);
 
