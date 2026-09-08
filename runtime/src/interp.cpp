@@ -167,37 +167,52 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
         }
         case ObjTag::List: {
             // bound sequence methods
-            const char* name = nullptr;
             std::string_view sym = global_symbols().text(symbol);
-            if (sym == "append") name = "append";
-            if (sym == "pop") name = "pop";
-            if (name) {
-                auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
-                bm->tag = ObjTag::BoundMethod;
-                bm->flags = 0;
-                bm->refcount = 1;
-                bm->func = Value::integer(0x100 + (sym == "append" ? 0 : 1));  // marker
-                bm->recv = obj;
-                rt.incref(obj.as.obj);
-                out = Value::object(reinterpret_cast<PyObj*>(bm));
-                return true;
+            struct ListMethod { const char* name; std::uint64_t kind; };
+            static const ListMethod list_methods[] = {
+                {"append", 0x100}, {"pop", 0x101},
+                {"sort", 0x102}, {"reverse", 0x103},
+                {"insert", 0x104}, {"remove", 0x105},
+                {"count", 0x106}, {"index", 0x107},
+                {"extend", 0x108}, {"copy", 0x109},
+                {"clear", 0x10A},
+            };
+            for (const ListMethod& m : list_methods) {
+                if (sym == m.name) {
+                    auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
+                    bm->tag = ObjTag::BoundMethod;
+                    bm->flags = 0;
+                    bm->refcount = 1;
+                    bm->func = Value::integer(m.kind);
+                    bm->recv = obj;
+                    rt.incref(obj.as.obj);
+                    out = Value::object(reinterpret_cast<PyObj*>(bm));
+                    return true;
+                }
             }
             raise_builtin(rt.type_attribute_error, "list attribute not found");
             return false;
         }
         case ObjTag::Dict: {
             std::string_view sym = global_symbols().text(symbol);
-            if (sym == "get" || sym == "keys" || sym == "values" || sym == "items") {
-                auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
-                bm->tag = ObjTag::BoundMethod;
-                bm->flags = 0;
-                bm->refcount = 1;
-                bm->func = Value::integer(0x200 + (sym == "get" ? 0 : sym == "keys" ? 1
-                                                  : sym == "values" ? 2 : 3));
-                bm->recv = obj;
-                rt.incref(obj.as.obj);
-                out = Value::object(reinterpret_cast<PyObj*>(bm));
-                return true;
+            struct DictMethod { const char* name; std::uint64_t kind; };
+            static const DictMethod dict_methods[] = {
+                {"get", 0x200}, {"keys", 0x201}, {"values", 0x202}, {"items", 0x203},
+                {"update", 0x204}, {"pop", 0x205}, {"setdefault", 0x206},
+                {"copy", 0x207}, {"clear", 0x208},
+            };
+            for (const DictMethod& m : dict_methods) {
+                if (sym == m.name) {
+                    auto* bm = static_cast<PyBoundMethodObj*>(std::malloc(sizeof(PyBoundMethodObj)));
+                    bm->tag = ObjTag::BoundMethod;
+                    bm->flags = 0;
+                    bm->refcount = 1;
+                    bm->func = Value::integer(m.kind);
+                    bm->recv = obj;
+                    rt.incref(obj.as.obj);
+                    out = Value::object(reinterpret_cast<PyObj*>(bm));
+                    return true;
+                }
             }
             raise_builtin(rt.type_attribute_error, "dict attribute not found");
             return false;
@@ -855,7 +870,8 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
     if (kind >= 0x100 && kind < 0x200) {
         // list methods
         auto* l = static_cast<PyListObj*>(recv.as.obj);
-        if (kind == 0x100) {   // append
+        switch (kind) {
+        case 0x100: {   // append
             if (argc != 1) {
                 raise_builtin(rt.type_type_error, "append takes exactly one argument");
                 return false;
@@ -869,7 +885,7 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
             out = Value::none();
             return true;
         }
-        if (kind == 0x101) {   // pop([index])
+        case 0x101: {   // pop([index])
             if (l->length == 0) {
                 raise_builtin(rt.type_index_error, "pop from empty list");
                 return false;
@@ -901,8 +917,165 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
             l->length--;
             return true;
         }
+        case 0x102: {   // sort([reverse=False]) — in-place, returns None
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            bool reverse = false;
+            if (argc >= 1 && args[0].tag == Tag::Bool) reverse = (args[0].as.i != 0);
+            // Insertion sort (stable, in-place). Sufficient for small lists.
+            for (std::uint32_t i = 1; i < l->length; ++i) {
+                Value key = l->items[i];
+                std::int32_t j = static_cast<std::int32_t>(i) - 1;
+                while (j >= 0) {
+                    bool less = false;
+                    values_compare(key, l->items[j], static_cast<std::uint16_t>(CmpOpKind::LT), less);
+                    bool swap = reverse ? less : false;
+                    if (!reverse) {
+                        values_compare(l->items[j], key, static_cast<std::uint16_t>(CmpOpKind::GT), swap);
+                    }
+                    if (!swap) break;
+                    l->items[j + 1] = l->items[j];
+                    --j;
+                }
+                l->items[j + 1] = key;
+            }
+            out = Value::none();
+            return true;
+        }
+        case 0x103: {   // reverse() — in-place
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            std::uint32_t i = 0, j = l->length - 1;
+            while (i < j) {
+                Value tmp = l->items[i];
+                l->items[i] = l->items[j];
+                l->items[j] = tmp;
+                ++i; --j;
+            }
+            out = Value::none();
+            return true;
+        }
+        case 0x104: {   // insert(index, value)
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            if (argc < 2) {
+                raise_builtin(rt.type_type_error, "insert expects index and value");
+                return false;
+            }
+            std::int64_t idx = 0;
+            if (!as_i64(args[0], idx)) {
+                raise_builtin(rt.type_type_error, "insert index must be int");
+                return false;
+            }
+            if (idx < 0) idx += static_cast<std::int64_t>(l->length);
+            if (idx < 0) idx = 0;
+            if (idx > static_cast<std::int64_t>(l->length))
+                idx = static_cast<std::int64_t>(l->length);
+            std::uint32_t u_idx = static_cast<std::uint32_t>(idx);
+            // Grow the list by one slot and shift elements right.
+            if (!list_push(l, args[1])) {
+                raise_builtin(rt.type_memory_error, "list allocation failed");
+                return false;
+            }
+            // list_push appended at the end; shift it to u_idx.
+            for (std::uint32_t k = l->length - 1; k > u_idx; --k) {
+                l->items[k] = l->items[k - 1];
+            }
+            l->items[u_idx] = args[1];
+            if (args[1].tag == Tag::Obj && args[1].as.obj) rt.incref(args[1].as.obj);
+            out = Value::none();
+            return true;
+        }
+        case 0x105: {   // remove(value) — remove first occurrence
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            if (argc < 1) {
+                raise_builtin(rt.type_type_error, "remove expects a value");
+                return false;
+            }
+            for (std::uint32_t i = 0; i < l->length; ++i) {
+                bool eq = false;
+                values_compare(l->items[i], args[0], static_cast<std::uint16_t>(CmpOpKind::EQ), eq);
+                if (eq) {
+                    if (l->items[i].tag == Tag::Obj && l->items[i].as.obj)
+                        rt.decref(l->items[i].as.obj);
+                    std::memmove(l->items + i, l->items + i + 1,
+                                 sizeof(Value) * (l->length - i - 1));
+                    l->length--;
+                    out = Value::none();
+                    return true;
+                }
+            }
+            raise_builtin(rt.type_value_error, "list.remove(x): x not in list");
+            return false;
+        }
+        case 0x106: {   // count(value) → int
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            if (argc < 1) {
+                raise_builtin(rt.type_type_error, "count expects a value");
+                return false;
+            }
+            std::uint32_t count = 0;
+            for (std::uint32_t i = 0; i < l->length; ++i) {
+                bool eq = false;
+                values_compare(l->items[i], args[0], static_cast<std::uint16_t>(CmpOpKind::EQ), eq);
+                if (eq) ++count;
+            }
+            out = Value::integer(static_cast<std::int64_t>(count));
+            return true;
+        }
+        case 0x107: {   // index(value) → int (raises ValueError if not found)
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            if (argc < 1) {
+                raise_builtin(rt.type_type_error, "index expects a value");
+                return false;
+            }
+            for (std::uint32_t i = 0; i < l->length; ++i) {
+                bool eq = false;
+                values_compare(l->items[i], args[0], static_cast<std::uint16_t>(CmpOpKind::EQ), eq);
+                if (eq) {
+                    out = Value::integer(static_cast<std::int64_t>(i));
+                    return true;
+                }
+            }
+            raise_builtin(rt.type_value_error, "list.index(x): x not in list");
+            return false;
+        }
+        case 0x108: {   // extend(iterable) — append all items from iterable
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                args[0].as.obj->tag != ObjTag::List) {
+                raise_builtin(rt.type_type_error, "extend expects a list");
+                return false;
+            }
+            auto* other = static_cast<PyListObj*>(args[0].as.obj);
+            for (std::uint32_t i = 0; i < other->length; ++i) {
+                list_push(l, other->items[i]);
+            }
+            out = Value::none();
+            return true;
+        }
+        case 0x109: {   // copy() → new list
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            auto* result = rt.new_list(l->length);
+            for (std::uint32_t i = 0; i < l->length; ++i) {
+                list_push(result, l->items[i]);
+            }
+            out = Value::object(reinterpret_cast<PyObj*>(result));
+            return true;
+        }
+        case 0x10A: {   // clear()
+            auto* l = static_cast<PyListObj*>(recv.as.obj);
+            for (std::uint32_t i = 0; i < l->length; ++i) {
+                if (l->items[i].tag == Tag::Obj && l->items[i].as.obj)
+                    rt.decref(l->items[i].as.obj);
+            }
+            l->length = 0;
+            out = Value::none();
+            return true;
+        }
+        default:
+            raise_builtin(rt.type_not_implemented_error, "unknown list method");
+            return false;
+        }  // end switch (kind) for list methods
     }
-    if (kind >= 0x200 && kind < 0x300) {
+    if (kind >= 0x200 && kind <= 0x203) {
         // dict methods: get/keys/values/items
         auto* d = static_cast<PyDictObj*>(recv.as.obj);
         if (kind == 0x200) {   // get(key[, default])
@@ -947,6 +1120,85 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
         }
         out = Value::object(reinterpret_cast<PyObj*>(result));
         return true;
+    }
+    if (kind >= 0x204 && kind <= 0x208) {
+        // dict methods: update/pop/setdefault/copy/clear
+        auto* d = static_cast<PyDictObj*>(recv.as.obj);
+        switch (kind) {
+            case 0x204: {   // update(dict)
+                if (argc < 1 || args[0].tag != Tag::Obj || !args[0].as.obj ||
+                    args[0].as.obj->tag != ObjTag::Dict) {
+                    raise_builtin(rt.type_type_error, "update expects a dict");
+                    return false;
+                }
+                auto* other = static_cast<PyDictObj*>(args[0].as.obj);
+                for (std::uint32_t i = 0; i < other->capacity; ++i) {
+                    if (!other->entries[i].used) continue;
+                    if (other->entries[i].key.tag == Tag::None) continue;
+                    dict_set(d, other->entries[i].key, other->entries[i].value);
+                }
+                out = Value::none();
+                return true;
+            }
+            case 0x205: {   // pop(key[, default])
+                if (argc < 1) {
+                    raise_builtin(rt.type_type_error, "pop needs a key");
+                    return false;
+                }
+                Value val;
+                if (!dict_get(d, args[0], val)) {
+                    if (argc >= 2) { out = args[1]; return true; }
+                    raise_builtin(rt.type_key_error, "pop(): key not found");
+                    return false;
+                }
+                dict_del(d, args[0]);
+                out = val;
+                if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+                return true;
+            }
+            case 0x206: {   // setdefault(key[, default])
+                if (argc < 1) {
+                    raise_builtin(rt.type_type_error, "setdefault needs a key");
+                    return false;
+                }
+                Value val;
+                if (dict_get(d, args[0], val)) {
+                    out = val;
+                    if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+                    return true;
+                }
+                val = argc >= 2 ? args[1] : Value::none();
+                if (val.tag == Tag::Obj && val.as.obj) rt.incref(val.as.obj);
+                dict_set(d, args[0], val);
+                out = val;
+                if (out.tag == Tag::Obj && out.as.obj) rt.incref(out.as.obj);
+                return true;
+            }
+            case 0x207: {   // copy() → new dict
+                auto* result = rt.new_dict();
+                for (std::uint32_t i = 0; i < d->capacity; ++i) {
+                    if (!d->entries[i].used) continue;
+                    if (d->entries[i].key.tag == Tag::None) continue;
+                    dict_set(result, d->entries[i].key, d->entries[i].value);
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(result));
+                return true;
+            }
+            case 0x208: {   // clear()
+                for (std::uint32_t i = 0; i < d->capacity; ++i) {
+                    if (d->entries[i].used) {
+                        if (d->entries[i].key.tag == Tag::Obj && d->entries[i].key.as.obj)
+                            rt.decref(d->entries[i].key.as.obj);
+                        if (d->entries[i].value.tag == Tag::Obj && d->entries[i].value.as.obj)
+                            rt.decref(d->entries[i].value.as.obj);
+                        d->entries[i].used = false;
+                    }
+                }
+                d->count = 0;
+                out = Value::none();
+                return true;
+            }
+        }
     }
     if (kind >= 0x300) {
         // Str bound methods. Kinds assigned at LOAD_ATTR:
