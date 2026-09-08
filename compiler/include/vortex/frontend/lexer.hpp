@@ -133,7 +133,15 @@ private:
     // cooked string into an immutable heap allocation (the std::string
     // body never moves once we stop mutating it) and use that stable
     // pointer in the token instead.
-    stdx::small_vector<std::string, 16> stabilized_strings_{};
+    //
+    // CRITICAL: the inline capacity must be large enough to hold ALL
+    // string literals in a module without reallocation. If it reallocates,
+    // the std::string objects are MOVED to a new buffer, and all token
+    // string_views (which point into the std::string's SBO buffer) dangle.
+    // This was the root cause of the "18-line string corruption" bug:
+    // modules with 17+ string literals triggered a reallocation that
+    // zeroed the first byte of every earlier string.
+    stdx::small_vector<std::string, 256> stabilized_strings_{};
 
     // Stable storage for f-string parts. Each FStrPart::text string_view
     // points into one of these stabilized std::strings.
