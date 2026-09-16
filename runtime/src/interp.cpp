@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <string>
 
 #include "vortex/backend/codegen.hpp"   // Task 24: JitEntryFn for CALL fast path
 
@@ -231,6 +232,7 @@ bool Vm::get_attr(const Value& obj, std::uint32_t symbol, Value& out) noexcept {
                 {"ljust", 0x311},    {"rjust", 0x312},   {"zfill", 0x313},
                 {"lstrip", 0x314},   {"rstrip", 0x315},  {"title", 0x316},
                 {"capitalize", 0x317},
+                {"format", 0x318},
             };
             for (const StrMethod& m : str_methods) {
                 if (sym == m.name) {
@@ -1623,6 +1625,165 @@ bool Vm::builtin_bound_method(std::uint64_t kind, const Value& recv, Value* args
                 buf.push_back(static_cast<char>(std::toupper((unsigned char)sv[0])));
                 for (std::size_t i = 1; i < sv.size(); ++i) {
                     buf.push_back(static_cast<char>(std::tolower((unsigned char)sv[i])));
+                }
+                out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
+                    std::string_view(buf.data(), buf.size()))));
+                return true;
+            }
+            case 0x318: {   // format(*args, **kwargs) — basic {} substitution
+                // Supports: {}, {0}, {name}, {:.2f}, {:>10}, {:<10}, {:^10}
+                // kwargs are passed as the last arg (a dict).
+                stdx::small_vector<char, 128> buf;
+                std::uint32_t auto_idx = 0;
+                // Check if last arg is a dict (kwargs). The CALL_KW handler
+                // passes kwargs as a trailing dict argument.
+                bool has_kwargs = (argc > 0 && args[argc - 1].tag == Tag::Obj &&
+                                   args[argc - 1].as.obj &&
+                                   args[argc - 1].as.obj->tag == ObjTag::Dict);
+                std::uint32_t pos_argc = has_kwargs ? argc - 1 : argc;
+                auto* kwargs = has_kwargs
+                    ? static_cast<PyDictObj*>(args[argc - 1].as.obj)
+                    : nullptr;
+
+                std::size_t i = 0;
+                while (i < sv.size()) {
+                    if (sv[i] == '{') {
+                        // Check for {{ escape
+                        if (i + 1 < sv.size() && sv[i + 1] == '{') {
+                            buf.push_back('{');
+                            i += 2;
+                            continue;
+                        }
+                        // Find matching }
+                        std::size_t end = sv.find('}', i + 1);
+                        if (end == std::string_view::npos) {
+                            buf.push_back('{');
+                            ++i;
+                            continue;
+                        }
+                        // Parse the format spec: {field:spec} or {field} or {}
+                        std::string_view field_spec = sv.substr(i + 1, end - i - 1);
+                        std::string field_name;
+                        std::string format_spec;
+                        auto colon_pos = field_spec.find(':');
+                        if (colon_pos != std::string_view::npos) {
+                            field_name = std::string(field_spec.substr(0, colon_pos));
+                            format_spec = std::string(field_spec.substr(colon_pos + 1));
+                        } else {
+                            field_name = std::string(field_spec);
+                        }
+
+                        // Resolve the value
+                        Value val;
+                        if (field_name.empty()) {
+                            // Auto-numbered: {}
+                            if (auto_idx >= pos_argc) {
+                                raise_builtin(rt.type_index_error, "format: not enough arguments");
+                                return false;
+                            }
+                            val = args[auto_idx++];
+                        } else if (field_name[0] >= '0' && field_name[0] <= '9') {
+                            // Positional: {0}, {1}
+                            std::int64_t idx = 0;
+                            for (char c : field_name) idx = idx * 10 + (c - '0');
+                            if (idx < 0 || idx >= static_cast<std::int64_t>(pos_argc)) {
+                                raise_builtin(rt.type_index_error, "format: index out of range");
+                                return false;
+                            }
+                            val = args[idx];
+                        } else {
+                            // Keyword: {name}
+                            if (!kwargs) {
+                                raise_builtin(rt.type_key_error, "format: no keyword arguments");
+                                return false;
+                            }
+                            SymbolId sym = global_symbols().intern(field_name);
+                            if (!dict_get(kwargs, Value::integer(sym), val)) {
+                                raise_builtin(rt.type_key_error, "format: key not found");
+                                return false;
+                            }
+                        }
+
+                        // Apply format spec
+                        if (format_spec.empty()) {
+                            rt.str_into(val, buf);
+                        } else {
+                            // Parse format spec: [align][width] or [.precision]type
+                            char align = 0;
+                            std::size_t width = 0;
+                            std::size_t precision = 0;
+                            bool has_precision = false;
+                            char type = 0;
+                            std::size_t pos = 0;
+                            if (pos < format_spec.size() &&
+                                (format_spec[pos] == '<' || format_spec[pos] == '>' ||
+                                 format_spec[pos] == '^')) {
+                                align = format_spec[pos++];
+                            }
+                            while (pos < format_spec.size() && format_spec[pos] >= '0' && format_spec[pos] <= '9') {
+                                width = width * 10 + (format_spec[pos++] - '0');
+                            }
+                            if (pos < format_spec.size() && format_spec[pos] == '.') {
+                                has_precision = true;
+                                ++pos;
+                                while (pos < format_spec.size() && format_spec[pos] >= '0' && format_spec[pos] <= '9') {
+                                    precision = precision * 10 + (format_spec[pos++] - '0');
+                                }
+                            }
+                            if (pos < format_spec.size()) {
+                                type = format_spec[pos];
+                            }
+
+                            // Format the value into a temp buffer
+                            stdx::small_vector<char, 128> val_buf;
+                            if (val.tag == Tag::Float || val.tag == Tag::Int) {
+                                double d = 0;
+                                if (val.tag == Tag::Float) d = val.as.f;
+                                else if (val.tag == Tag::Int) d = static_cast<double>(val.as.i);
+                                else if (!as_f64(val, d)) d = 0;
+                                char numbuf[64];
+                                if (has_precision && type == 'f') {
+                                    std::snprintf(numbuf, sizeof(numbuf), "%.*f", (int)precision, d);
+                                } else if (type == 'd' && val.tag == Tag::Int) {
+                                    std::snprintf(numbuf, sizeof(numbuf), "%lld", (long long)val.as.i);
+                                } else {
+                                    // Default float formatting
+                                    std::snprintf(numbuf, sizeof(numbuf), "%g", d);
+                                }
+                                for (char* p = numbuf; *p; ++p) val_buf.push_back(*p);
+                            } else {
+                                rt.str_into(val, val_buf);
+                            }
+
+                            // Apply width/align
+                            if (width > val_buf.size()) {
+                                std::size_t pad = width - val_buf.size();
+                                if (align == '<') {
+                                    for (char c : val_buf) buf.push_back(c);
+                                    for (std::size_t p = 0; p < pad; ++p) buf.push_back(' ');
+                                } else if (align == '^') {
+                                    std::size_t left = pad / 2;
+                                    std::size_t right = pad - left;
+                                    for (std::size_t p = 0; p < left; ++p) buf.push_back(' ');
+                                    for (char c : val_buf) buf.push_back(c);
+                                    for (std::size_t p = 0; p < right; ++p) buf.push_back(' ');
+                                } else {
+                                    // Default or '>' (right-align)
+                                    for (std::size_t p = 0; p < pad; ++p) buf.push_back(' ');
+                                    for (char c : val_buf) buf.push_back(c);
+                                }
+                            } else {
+                                for (char c : val_buf) buf.push_back(c);
+                            }
+                        }
+                        i = end + 1;
+                    } else if (sv[i] == '}' && i + 1 < sv.size() && sv[i + 1] == '}') {
+                        buf.push_back('}');
+                        i += 2;
+                    } else {
+                        buf.push_back(sv[i]);
+                        ++i;
+                    }
                 }
                 out = Value::object(reinterpret_cast<PyObj*>(rt.new_str(
                     std::string_view(buf.data(), buf.size()))));
