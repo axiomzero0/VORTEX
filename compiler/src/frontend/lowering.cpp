@@ -1618,6 +1618,28 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
         }
 
         case ExprKind::DictLit: {
+            // Check if this is actually a dict comprehension wrapper
+            // (parser wraps dict comprehensions as DictLit with a ListComp
+            // in args[0]). If so, lower as dict(listcomp).
+            if (e->args.size() == 1 && e->args[0]->kind == ExprKind::ListComp) {
+                NodeId list_n = VORTEX_TRY(lower_expr(e->args[0]));
+                // Call dict(list)
+                NodeId dict_fn = effect_op(NodeKind::LoadGlobal, {}, true);
+                g().node(dict_fn).symbol = global_symbols().intern("dict");
+                NodeId call = g().create(NodeKind::CallPy);
+                Node& cn = g().node(call);
+                cn.set_flag(NodeFlag::OnEffectChain);
+                cn.set_flag(NodeFlag::MayThrow);
+                cn.aux0 = 1;
+                cn.aux1 = 0;
+                g().add_input(call, control_);
+                g().add_input(call, memory_);
+                g().add_input(call, dict_fn);
+                g().add_input(call, list_n);
+                memory_ = call;
+                return call;
+            }
+            // Regular dict literal
             NodeId n = g().create(NodeKind::NewDict);
             Node& dn = g().node(n);
             dn.set_flag(NodeFlag::OnEffectChain);
@@ -1634,16 +1656,24 @@ Result<NodeId> Lowerer::lower_expr(Expr* e) noexcept {
 
         case ExprKind::SetLit: {
             // Lower {a, b, c} as: build a list [a, b, c], then call set(list).
-            NodeId list_n = g().create(NodeKind::NewList);
-            Node& ln = g().node(list_n);
-            ln.set_flag(NodeFlag::OnEffectChain);
-            ln.set_flag(NodeFlag::MayThrow);
-            g().add_input(list_n, control_);
-            g().add_input(list_n, memory_);
-            for (Expr* elem : e->args) {
-                g().add_input(list_n, VORTEX_TRY(lower_expr(elem)));
+            // Special case: if there's exactly one arg and it's a ListComp,
+            // this is a set comprehension — lower the ListComp directly
+            // and pass its result to set().
+            NodeId list_n;
+            if (e->args.size() == 1 && e->args[0]->kind == ExprKind::ListComp) {
+                list_n = VORTEX_TRY(lower_expr(e->args[0]));
+            } else {
+                list_n = g().create(NodeKind::NewList);
+                Node& ln = g().node(list_n);
+                ln.set_flag(NodeFlag::OnEffectChain);
+                ln.set_flag(NodeFlag::MayThrow);
+                g().add_input(list_n, control_);
+                g().add_input(list_n, memory_);
+                for (Expr* elem : e->args) {
+                    g().add_input(list_n, VORTEX_TRY(lower_expr(elem)));
+                }
+                memory_ = list_n;
             }
-            memory_ = list_n;
             // Load the `set` builtin from globals (it's a NativeFn).
             NodeId set_fn = effect_op(NodeKind::LoadGlobal, {}, true);
             g().node(set_fn).symbol = global_symbols().intern("set");

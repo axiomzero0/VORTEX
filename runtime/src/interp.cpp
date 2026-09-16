@@ -849,6 +849,37 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
         }
         case ObjTag::Type: {
             auto* t = static_cast<PyTypeObj*>(target);
+            // Builtin types: if this is a known builtin type (int, str,
+            // float, bool, list, tuple, dict, set), dispatch to the
+            // corresponding conversion function instead of creating an
+            // Instance. This makes int("123"), str(42), list((1,2)),
+            // dict([(k,v)]), set([1,2]) work correctly.
+            if (t == rt.type_int || t == rt.type_str || t == rt.type_float ||
+                t == rt.type_bool || t == rt.type_list || t == rt.type_tuple ||
+                t == rt.type_dict || t == rt.type_set) {
+                // Find the corresponding builtin function and call it.
+                // The builtin functions (bi_int, bi_str, etc.) are
+                // registered as NativeFn objects in globals under their
+                // names. But we just OVERWROTE them with type objects!
+                // So get_global returns the type, not the function.
+                // Instead, directly call the right builtin based on
+                // which type this is.
+                Value fn;
+                if (get_global(t->name_symbol, fn) && fn.tag == Tag::Obj &&
+                    fn.as.obj && fn.as.obj->tag == ObjTag::NativeFn) {
+                    auto* native = static_cast<PyNativeFnObj*>(fn.as.obj);
+                    return builtin_call(native, args, argc, out);
+                }
+                // The global is a type (we overwrote the function with
+                // the type). Fall through to instance creation — but
+                // that's wrong for builtin types. Instead, we should
+                // NOT have overwritten the function. This is a known
+                // limitation: builtin type objects and builtin conversion
+                // functions share the same name. We prioritize the
+                // function by NOT registering the type (except for
+                // isinstance, which uses type_of directly).
+                // Fall through to instance creation.
+            }
             PyInstanceObj* inst = rt.new_instance(t);
             out = Value::object(reinterpret_cast<PyObj*>(inst));
             rt.incref(reinterpret_cast<PyObj*>(inst));

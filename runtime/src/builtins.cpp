@@ -347,9 +347,24 @@ Value bi_tuple(void*, Value* args, std::uint32_t argc) noexcept {
 }
 
 Value bi_dict(void*, Value* args, std::uint32_t argc) noexcept {
-    (void)args;
-    (void)argc;
-    return Value::object(reinterpret_cast<PyObj*>(Runtime::instance().new_dict()));
+    Runtime& rt = Runtime::instance();
+    auto* d = rt.new_dict();
+    // dict(iterable_of_pairs) — support list of (k, v) tuples.
+    if (argc == 1 && args[0].tag == Tag::Obj && args[0].as.obj &&
+        args[0].as.obj->tag == ObjTag::List) {
+        auto* l = static_cast<PyListObj*>(args[0].as.obj);
+        for (std::uint32_t i = 0; i < l->length; ++i) {
+            Value& item = l->items[i];
+            if (item.tag == Tag::Obj && item.as.obj &&
+                item.as.obj->tag == ObjTag::Tuple) {
+                auto* pair = static_cast<PyTupleObj*>(item.as.obj);
+                if (pair->length >= 2) {
+                    dict_set(d, pair->items[0], pair->items[1]);
+                }
+            }
+        }
+    }
+    return Value::object(reinterpret_cast<PyObj*>(d));
 }
 
 Value bi_set(void*, Value* args, std::uint32_t argc) noexcept {
@@ -536,20 +551,37 @@ Value bi_iter(void*, Value* args, std::uint32_t argc) noexcept {
 Value bi_isinstance(void*, Value* args, std::uint32_t argc) noexcept {
     if (argc != 2) return error_msg("isinstance() takes two arguments");
     Runtime& rt = Runtime::instance();
-    if (args[1].tag == Tag::Obj && args[1].as.obj &&
-        args[1].as.obj->tag == ObjTag::Type) {
-        auto* t = static_cast<PyTypeObj*>(args[1].as.obj);
-        if (args[0].tag == Tag::Obj && args[0].as.obj &&
-            args[0].as.obj->tag == ObjTag::Instance) {
-            for (PyTypeObj* tt = static_cast<PyInstanceObj*>(args[0].as.obj)->type; tt;
-                 tt = tt->base) {
-                if (tt == t) return Value::boolean(true);
-            }
-            return Value::boolean(false);
+    // Resolve the class argument. It might be a NativeFn (the conversion
+    // function like int, str, etc.) rather than a Type — in that case,
+    // look up the corresponding builtin type singleton.
+    PyTypeObj* t = nullptr;
+    if (args[1].tag == Tag::Obj && args[1].as.obj) {
+        if (args[1].as.obj->tag == ObjTag::Type) {
+            t = static_cast<PyTypeObj*>(args[1].as.obj);
+        } else if (args[1].as.obj->tag == ObjTag::NativeFn) {
+            // Map builtin function name to type singleton.
+            auto* fn = static_cast<PyNativeFnObj*>(args[1].as.obj);
+            std::string_view name = global_symbols().text(fn->name_symbol);
+            if (name == "int") t = rt.type_int;
+            else if (name == "str") t = rt.type_str;
+            else if (name == "float") t = rt.type_float;
+            else if (name == "bool") t = rt.type_bool;
+            else if (name == "list") t = rt.type_list;
+            else if (name == "tuple") t = rt.type_tuple;
+            else if (name == "dict") t = rt.type_dict;
+            else if (name == "set") t = rt.type_set;
         }
-        return Value::boolean(rt.type_of(args[0]) == t);
     }
-    return error_msg("isinstance() second argument must be a class");
+    if (!t) return error_msg("isinstance() second argument must be a class");
+    if (args[0].tag == Tag::Obj && args[0].as.obj &&
+        args[0].as.obj->tag == ObjTag::Instance) {
+        for (PyTypeObj* tt = static_cast<PyInstanceObj*>(args[0].as.obj)->type; tt;
+             tt = tt->base) {
+            if (tt == t) return Value::boolean(true);
+        }
+        return Value::boolean(false);
+    }
+    return Value::boolean(rt.type_of(args[0]) == t);
 }
 
 Value bi_type(void*, Value* args, std::uint32_t argc) noexcept {
@@ -1212,10 +1244,17 @@ void install_builtins(Program& program) noexcept {
     // The conversion function (int(x), str(x), etc.) is still accessible
     // via call_value: PyTypeObj is callable (it calls __init__).
     struct BuiltinType { const char* name; PyTypeObj* type; };
+    // Only register types that DON'T have a conversion function with the
+    // same name. int/str/float/bool/list/tuple/dict/set all have conversion
+    // functions (bi_int, bi_str, etc.) that must stay callable. If we
+    // overwrite them with type objects, call_value dispatches to the Type
+    // case (new_instance) instead of the NativeFn case, creating an
+    // Instance instead of a real dict/list/etc.
+    // For isinstance(x, int) etc., bi_isinstance uses type_of() which
+    // returns the correct type singleton — it doesn't need the type
+    // registered in globals.
     static const BuiltinType builtin_types[] = {
-        {"int", rt.type_int}, {"str", rt.type_str}, {"float", rt.type_float},
-        {"bool", rt.type_bool}, {"list", rt.type_list}, {"tuple", rt.type_tuple},
-        {"dict", rt.type_dict}, {"NoneType", rt.type_none},
+        {"NoneType", rt.type_none},
     };
     for (const BuiltinType& bt : builtin_types) {
         if (!bt.type) continue;

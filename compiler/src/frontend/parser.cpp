@@ -1210,9 +1210,60 @@ Result<Expr*> Parser::parse_dict_or_set() noexcept {
     Result<Expr*> first_key = parse_expr();
     if (!first_key) return first_key;
     if (accept(TokKind::Colon)) {
-        Expr* dict = new_expr(ExprKind::DictLit, (*first_key)->line);
         Result<Expr*> v = parse_expr();
         if (!v) return std::unexpected(v.error());
+        // Dict comprehension: {k: v for ...}
+        if (check(TokKind::KwFor)) {
+            advance();
+            // Build a ListComp with a tuple (k, v) as the element, then
+            // convert to dict at runtime via dict(). We store the k:v pair
+            // as args[0]=k, args[1]=v and use ListComp with a TupleLit.
+            Expr* pair = new_expr(ExprKind::TupleLit, (*first_key)->line);
+            pair->args.push_back(*first_key);
+            pair->args.push_back(*v);
+            // Parse the comprehension clauses.
+            stdx::small_vector<Comprehension, 4> clauses;
+            for (;;) {
+                Comprehension clause;
+                ++suppress_in_operator_;
+                Result<Expr*> target = parse_testlist(true);
+                --suppress_in_operator_;
+                if (!target) return std::unexpected(target.error());
+                clause.target = *target;
+                auto in_tok = expect(TokKind::KwIn, "'in' inside comprehension");
+                if (!in_tok) return std::unexpected(in_tok.error());
+                Result<Expr*> iter = parse_or();
+                if (!iter) return std::unexpected(iter.error());
+                clause.iter = *iter;
+                if (check(TokKind::KwIf)) {
+                    advance();
+                    Result<Expr*> c = parse_expr();
+                    if (!c) return std::unexpected(c.error());
+                    clause.cond = *c;
+                }
+                clauses.push_back(clause);
+                if (check(TokKind::KwFor)) { advance(); continue; }
+                break;
+            }
+            auto rb = expect(TokKind::RBrace, "'}' closing dict comprehension");
+            if (!rb) return std::unexpected(rb.error());
+            // Build nested ListComp structure.
+            Expr* comp = new_expr(ExprKind::ListComp, (*first_key)->line);
+            comp->comp = clauses[clauses.size() - 1];
+            comp->args.push_back(pair);
+            for (std::size_t i = clauses.size() - 1; i-- > 0;) {
+                Expr* outer = new_expr(ExprKind::ListComp, (*first_key)->line);
+                outer->comp = clauses[i];
+                outer->args.push_back(comp);
+                comp = outer;
+            }
+            // Wrap in a DictLit so the lowerer knows to call dict().
+            Expr* dict_comp = new_expr(ExprKind::DictLit, (*first_key)->line);
+            dict_comp->args.push_back(comp);
+            return dict_comp;
+        }
+        // Regular dict literal.
+        Expr* dict = new_expr(ExprKind::DictLit, (*first_key)->line);
         dict->args.push_back(*first_key);
         dict->args.push_back(*v);
         while (accept(TokKind::Comma)) {
@@ -1229,6 +1280,49 @@ Result<Expr*> Parser::parse_dict_or_set() noexcept {
         auto rb = expect(TokKind::RBrace, "'}' closing dict");
         if (!rb) return std::unexpected(rb.error());
         return dict;
+    }
+    // Set comprehension: {expr for ...}
+    if (check(TokKind::KwFor)) {
+        advance();
+        stdx::small_vector<Comprehension, 4> clauses;
+        for (;;) {
+            Comprehension clause;
+            ++suppress_in_operator_;
+            Result<Expr*> target = parse_testlist(true);
+            --suppress_in_operator_;
+            if (!target) return std::unexpected(target.error());
+            clause.target = *target;
+            auto in_tok = expect(TokKind::KwIn, "'in' inside comprehension");
+            if (!in_tok) return std::unexpected(in_tok.error());
+            Result<Expr*> iter = parse_or();
+            if (!iter) return std::unexpected(iter.error());
+            clause.iter = *iter;
+            if (check(TokKind::KwIf)) {
+                advance();
+                Result<Expr*> c = parse_expr();
+                if (!c) return std::unexpected(c.error());
+                clause.cond = *c;
+            }
+            clauses.push_back(clause);
+            if (check(TokKind::KwFor)) { advance(); continue; }
+            break;
+        }
+        auto rb = expect(TokKind::RBrace, "'}' closing set comprehension");
+        if (!rb) return std::unexpected(rb.error());
+        // Build nested ListComp, then wrap in a set() call at lowering time.
+        Expr* comp = new_expr(ExprKind::ListComp, (*first_key)->line);
+        comp->comp = clauses[clauses.size() - 1];
+        comp->args.push_back(*first_key);
+        for (std::size_t i = clauses.size() - 1; i-- > 0;) {
+            Expr* outer = new_expr(ExprKind::ListComp, (*first_key)->line);
+            outer->comp = clauses[i];
+            outer->args.push_back(comp);
+            comp = outer;
+        }
+        // Mark as a set comprehension by wrapping in a SetLit node.
+        Expr* set_comp = new_expr(ExprKind::SetLit, (*first_key)->line);
+        set_comp->args.push_back(comp);
+        return set_comp;
     }
     // Set literal: {elem1, elem2, ...}
     Expr* set_expr = new_expr(ExprKind::SetLit, (*first_key)->line);
