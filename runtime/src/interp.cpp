@@ -800,11 +800,8 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 std::uint64_t fkey = (static_cast<std::uint64_t>(unit->id) << 16);
                 Trace** pp = tracer.traces.get(fkey);
                 if (pp && *pp && (*pp)->native_code && !jit_disabled_in_bridge &&
+                    !tracer.is_recording() &&  // Don't invoke during recording
                     (*pp)->consecutive_deopts < 3 &&
-                    // Only invoke if the trace is worth it: inline ops
-                    // must be at least 3x the shim ops (otherwise the
-                    // C shim overhead for CALL/LOAD_GLOBAL makes the
-                    // trace slower than the interpreter).
                     (*pp)->inline_op_count >= (*pp)->shim_op_count * 3) {
                     auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
                     Value rv = trace_fn(f.regs);

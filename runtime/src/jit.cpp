@@ -172,3 +172,90 @@ extern "C" vortex::Value vortex_trace_step_one(void* regs_raw, std::uint32_t uni
     }
     return out;
 }
+
+// =============================================================================
+// Trace call: fast function call from compiled traces.
+//
+// When a compiled trace encounters a CALL instruction, it calls this
+// function instead of step_one. This function:
+//   1. Reads the CALL instruction to get callee + args.
+//   2. If the callee has a compiled function trace, invokes it DIRECTLY
+//      — no Frame allocation, no interpreter dispatch. Just copy args
+//      to a stack-allocated register array and call the trace function.
+//   3. If no trace exists, falls back to call_value (creates Frame,
+//      calls exec_frame).
+//
+// This is the key optimization for recursive functions: each recursive
+// call invokes the callee's trace directly, skipping Frame allocation
+// and interpreter dispatch. For fib(20), this eliminates 21891 Frame
+// constructions and 21891 exec_frame dispatch loops.
+// =============================================================================
+
+extern "C" vortex::Value vortex_trace_call(void* regs_raw, std::uint32_t unit_id,
+                                             std::uint32_t pc) noexcept {
+    using namespace vortex::rt;
+    Vm* vm = active_vm();
+    if (!vm) return vortex::Value::none();
+    if (unit_id >= vm->program.units.size()) return vortex::Value::none();
+    CodeUnit* unit = vm->program.units[unit_id];
+    if (!unit || pc >= unit->code.size()) return vortex::Value::none();
+
+    Value* caller_regs = static_cast<Value*>(regs_raw);
+    const Instr& instr = unit->code[pc];
+    Value callee = caller_regs[instr.a];
+    Value* args = instr.c > 0 ? &caller_regs[instr.b] : nullptr;
+    std::uint32_t argc = instr.c;
+
+    // Fast path: if the callee is a Function with a compiled trace,
+    // invoke the trace directly with a stack-allocated register file.
+    if (callee.tag == Tag::Obj && callee.as.obj &&
+        callee.as.obj->tag == ObjTag::Function) {
+        auto* fn = static_cast<PyFuncObj*>(callee.as.obj);
+        if (fn->code_unit_id < vm->program.units.size()) {
+            CodeUnit* callee_unit = vm->program.units[fn->code_unit_id];
+            if (callee_unit && !callee_unit->is_generator) {
+                // Check for a compiled function trace.
+                std::uint64_t fkey = (static_cast<std::uint64_t>(callee_unit->id) << 16);
+                Trace** pp = vm->tracer.traces.get(fkey);
+                if (pp && *pp && (*pp)->native_code &&
+                    // Only invoke if profitable (inline >= shim*3)
+                    (*pp)->inline_op_count >= (*pp)->shim_op_count * 3) {
+                    // Stack-allocate the callee's register file.
+                    // max_registers_per_frame = 256, sizeof(Value) = 16
+                    // = 4KB on the stack — fine for recursion depth < ~500.
+                    constexpr std::uint32_t kMaxStackRegs = 256;
+                    Value callee_regs[kMaxStackRegs];
+                    std::uint32_t n_regs = callee_unit->n_registers;
+                    if (n_regs > kMaxStackRegs) n_regs = kMaxStackRegs;
+                    // Initialize to None.
+                    for (std::uint32_t i = 0; i < n_regs; ++i) {
+                        callee_regs[i] = Value::none();
+                    }
+                    // Copy arguments to parameter slots.
+                    // callee_unit->param_regs[i] is the register index for param i.
+                    for (std::uint32_t i = 0; i < argc && i < callee_unit->param_regs.size(); ++i) {
+                        callee_regs[callee_unit->param_regs[i]] = args[i];
+                    }
+                    // Invoke the callee's trace function.
+                    auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
+                    Value rv = trace_fn(callee_regs);
+                    if (rv.tag != Tag::None) {
+                        // Success! Record the guard outcome.
+                        vm->profiler.record_guard((*pp)->header_pc, true);
+                        (*pp)->consecutive_deopts = 0;
+                        return rv;
+                    }
+                    // Deopt — record and fall through to interpreter.
+                    vm->profiler.record_guard((*pp)->header_pc, false);
+                }
+            }
+        }
+    }
+
+    // Fallback: call_value (creates Frame, calls exec_frame).
+    Value out;
+    if (!vm->call_value(callee, args, argc, out)) {
+        return vortex::Value::none();  // deopt signal
+    }
+    return out;
+}

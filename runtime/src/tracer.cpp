@@ -39,6 +39,10 @@ using CmpOpKind = vortex::ir::CmpOpKind;
 // Executes ONE Tier-0 instruction via step_one.
 extern "C" vortex::Value vortex_trace_step_one(void* regs_raw, std::uint32_t unit_id,
                                                 std::uint32_t pc) noexcept;
+// Fast function call from compiled traces (defined in jit.cpp).
+// Invokes the callee's trace directly if one exists.
+extern "C" vortex::Value vortex_trace_call(void* regs_raw, std::uint32_t unit_id,
+                                             std::uint32_t pc) noexcept;
 
 namespace vortex::rt {
 inline namespace abi_v1 {
@@ -900,6 +904,60 @@ namespace x86_cond {
                 }
                 break;
             }
+            case Op::CALL: {
+                // CALL: emit a call to vortex_trace_call, which invokes
+                // the callee's trace directly if one exists (fast path),
+                // or falls back to call_value (creates Frame, calls
+                // exec_frame). This is the key optimization for recursive
+                // functions — no Frame allocation, no interpreter dispatch.
+                std::uint8_t dst = instr.dst;
+                // Pass RDI = RBX (regs pointer)
+                e.emit8(0x48); e.emit8(0x89); e.emit8(0xDF);  // MOV RDI, RBX
+                // Pass ESI = unit_id
+                e.emit8(0xBE); e.emit32(trace.unit->id);
+                // Pass EDX = pc
+                e.emit8(0xBA); e.emit32(ti.pc);
+                // Call vortex_trace_call
+                e.mov_r64_imm64(x86::RAX,
+                    reinterpret_cast<std::uint64_t>(&vortex_trace_call));
+                e.call_rax();
+                // The return value is a Value (16 bytes in RAX:RDX).
+                // RAX = tag+pad, RDX = payload.
+                // Store the result to regs[dst].
+                e.mov_mem_r64(x86::RBX, slot_disp(dst, kPayloadOffset), x86::RDX);
+                // For the tag, store the low byte of RAX.
+                // MOV [RBX + dst*16 + 0], AL
+                e.emit8(0x88);
+                e.emit8(0x80 | (x86::RAX << 3) | x86::RBX);
+                e.emit32(slot_disp(dst, kTagOffset));
+                // Check for deopt: if tag == 0 (None), jump to deopt
+                e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);  // TEST RAX, RAX
+                std::size_t je_j = e.je_rel32();
+                deopt_jumps.push_back(je_j);
+                break;
+            }
+            case Op::LOAD_GLOBAL: {
+                // LOAD_GLOBAL: emit a call to the C shim (step_one).
+                // This looks up a global variable by symbol ID.
+                // Could be optimized further by caching the global pointer.
+                std::uint8_t dst = instr.dst;
+                e.emit8(0x48); e.emit8(0x89); e.emit8(0xDF);  // MOV RDI, RBX
+                e.emit8(0xBE); e.emit32(trace.unit->id);       // MOV ESI, unit_id
+                e.emit8(0xBA); e.emit32(ti.pc);                 // MOV EDX, pc
+                e.mov_r64_imm64(x86::RAX,
+                    reinterpret_cast<std::uint64_t>(&vortex_trace_step_one));
+                e.call_rax();
+                // Store result (RAX:RDX = tag:payload) to regs[dst]
+                e.mov_mem_r64(x86::RBX, slot_disp(dst, kPayloadOffset), x86::RDX);
+                e.emit8(0x88);
+                e.emit8(0x80 | (x86::RAX << 3) | x86::RBX);
+                e.emit32(slot_disp(dst, kTagOffset));
+                // Check for deopt
+                e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);
+                std::size_t je_j = e.je_rel32();
+                deopt_jumps.push_back(je_j);
+                break;
+            }
             case Op::RETURN: {
                 // Return: load the full 16-byte Value from regs[a].
                 // The SysV ABI returns a 16-byte struct in RAX (first 8
@@ -1035,6 +1093,8 @@ namespace x86_cond {
             case Op::JUMP:
             case Op::JUMP_IF_FALSE:
             case Op::RETURN:
+            case Op::CALL:        // CALL is now handled by vortex_trace_call
+            case Op::LOAD_GLOBAL: // LOAD_GLOBAL is handled by C shim but is cheap
                 ++trace.inline_op_count;
                 break;
             default:
