@@ -749,11 +749,28 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 raise_builtin(rt.type_runtime_error, "code unit not linked");
                 return false;
             }
-            // Telemetry: call_count. Skip the atomic RMW in the hot path —
-            // it's ~10ns per call (relaxed atomic is still a serialization
-            // point on x86). Sampled lazily if needed for tiering decisions.
-            // Re-enable when the tiering daemon actually reads it.
-            // unit->call_count.fetch_add(1, std::memory_order_relaxed);
+            // Telemetry: call_count — used by the tracer to detect hot
+            // functions (not just hot loops). When a function is called
+            // kHotThreshold times, the tracer starts recording from the
+            // function entry point — this makes the tracer handle
+            // recursive and non-loop code (like fib_recursion), not just
+            // loops.
+            ++unit->call_count;
+
+            // Function-entry tracing: if the function is hot (called
+            // kHotThreshold times) and no trace exists yet, start
+            // recording. This makes the tracer handle ALL hot code,
+            // not just loops with backedges. The recording captures
+            // the function body from entry to return. CALLs within
+            // the body are recorded and compiled via a C shim.
+            if (!tracer.is_recording() &&
+                unit->call_count >= tracer.kHotThreshold &&
+                !jit_disabled_in_bridge) {
+                std::uint64_t key = (static_cast<std::uint64_t>(unit->id) << 16);
+                if (!tracer.traces.get(key)) {
+                    tracer.start_function_trace(unit);
+                }
+            }
 
             if (unit->is_generator) {
                 auto* gen = static_cast<PyGeneratorObj*>(std::malloc(sizeof(PyGeneratorObj)));
@@ -774,6 +791,40 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
 
             Frame f(unit);
             if (!bind_parameters(f, fn, args, argc, kw_names, nkw)) return false;
+
+            // Function-trace fast path: if a function-entry trace exists
+            // (keyed by (unit_id << 16) | 0), invoke it. This handles
+            // hot functions that have no loops (like fib_recursion).
+            {
+                std::uint64_t fkey = (static_cast<std::uint64_t>(unit->id) << 16);
+                Trace** pp = tracer.traces.get(fkey);
+                if (pp && *pp && (*pp)->native_code && !jit_disabled_in_bridge &&
+                    (*pp)->consecutive_deopts < 3) {
+                    auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
+                    Value rv = trace_fn(f.regs);
+                    // Giga Tracing: record the guard outcome.
+                    profiler.record_guard((*pp)->header_pc, rv.tag != Tag::None);
+                    if (rv.tag == Tag::None) {
+                        // Deopt — the trace's guards failed. Re-execute
+                        // in the interpreter. If the trace deopts too many
+                        // times consecutively, it's the wrong path — stop
+                        // invoking it.
+                        ++(*pp)->consecutive_deopts;
+                        f.pc = 0;
+                        ExecStatus st = exec_frame(f);
+                        if (st == ExecStatus::Returned) {
+                            out = frame_return_;
+                            frame_return_ = Value::none();
+                            return true;
+                        }
+                        return false;
+                    }
+                    // Success — reset deopt counter.
+                    (*pp)->consecutive_deopts = 0;
+                    out = rv;
+                    return true;
+                }
+            }
 
             // JIT fast path: call jit_entry when available.
             // The bridge executes ONE dynamic op via step_one and returns.
@@ -2823,7 +2874,13 @@ L_LIST_APPEND: {
     VM_DISPATCH();
 }
 L_CALL: {
-    if (tracer.is_recording()) tracer.record_unsupported_op();
+    // Record CALL in traces (function-entry tracing). Previously this
+    // called record_unsupported_op(), which prevented function-entry
+    // traces from compiling. Now we record the CALL instruction so the
+    // trace compiler can emit a call to the C shim.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, f.pc, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
+    }
     Value callee = regs[cur->a];
     Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
     Value out;
@@ -2990,7 +3047,14 @@ L_JUMP_IF_TRUE: {
     VM_DISPATCH();
 }
 L_RETURN: {
-    if (tracer.is_recording()) tracer.record_unsupported_op();
+    // Record RETURN in traces. For function-entry traces, finish recording
+    // when the function returns.
+    if (tracer.is_recording()) {
+        tracer.record_instr(*cur, f.pc, static_cast<std::uint8_t>(regs[cur->a].tag), 0, 0);
+        if (tracer.is_function_recording()) {
+            tracer.finish_function_trace();
+        }
+    }
     Value v = regs[cur->a];
     if (v.tag == Tag::Obj && v.as.obj) rt.incref(v.as.obj);
     frame_return_ = v;

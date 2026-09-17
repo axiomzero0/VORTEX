@@ -35,6 +35,11 @@
 using BinOpKind = vortex::ir::BinOpKind;
 using CmpOpKind = vortex::ir::CmpOpKind;
 
+// C shim for trace compiler fallback (defined in jit.cpp).
+// Executes ONE Tier-0 instruction via step_one.
+extern "C" vortex::Value vortex_trace_step_one(void* regs_raw, std::uint32_t unit_id,
+                                                std::uint32_t pc) noexcept;
+
 namespace vortex::rt {
 inline namespace abi_v1 {
 
@@ -846,10 +851,71 @@ namespace x86_cond {
                 }
                 break;
             }
-            default:
-                // Unsupported op in trace — abort compilation
-                munmap(buf, mapped);
-                return false;
+            case Op::RETURN: {
+                // Return: load the full 16-byte Value from regs[a].
+                // The SysV ABI returns a 16-byte struct in RAX (first 8
+                // bytes = tag + padding) and RDX (next 8 bytes = payload).
+                // We load both: tag+pad into RAX, payload into RDX.
+                std::uint8_t ret_reg = instr.a;
+                // Load tag (offset 0) into EAX (zero-extends to RAX)
+                e.mov_r64_mem(x86::RAX, x86::RBX, slot_disp(ret_reg, kTagOffset));
+                // Load payload (offset 8) into RDX
+                e.mov_r64_mem(x86::RDX, x86::RBX, slot_disp(ret_reg, kPayloadOffset));
+                // Restore RBX and return
+                e.pop_r64(x86::RBX);
+                e.ret();
+                break;
+            }
+            default: {
+                // For any op the trace compiler can't handle inline,
+                // emit a call to the C shim (vortex_trace_step_one)
+                // which executes ONE Tier-0 instruction via step_one
+                // and returns. This makes the trace compiler handle
+                // ALL ops — CALL, LOAD_GLOBAL, LOAD_ATTR, etc.
+                //
+                // The shim signature is:
+                //   Value vortex_trace_step_one(void* regs, uint32_t unit_id, uint32_t pc)
+                //
+                // We pass RBX (frame_base = regs pointer), the unit_id
+                // (from trace.unit->id), and the instruction's PC (ti.pc).
+                //
+                // Encoding:
+                //   MOV RDI, RBX              (regs pointer)
+                //   MOV ESI, unit_id          (32-bit immediate)
+                //   MOV EDX, pc               (32-bit immediate)
+                //   MOV RAX, &vortex_trace_step_one
+                //   CALL RAX
+                //   MOV [RBX + dst*16 + 8], RAX  (store result payload)
+                //   MOV byte [RBX + dst*16 + 0], RAX tag? No — we don't
+                //   know the tag. The shim writes to regs[dst] internally
+                //   via step_one, so we DON'T need to store the result
+                //   ourselves. step_one already wrote the result to
+                //   regs[dst]. We just need to check for deopt.
+
+                // Pass RDI = RBX (regs pointer)
+                e.emit8(0x48); e.emit8(0x89); e.emit8(0xDF);  // MOV RDI, RBX
+
+                // Pass ESI = unit_id (32-bit immediate)
+                e.emit8(0xBE);  // MOV ESI, imm32
+                e.emit32(trace.unit->id);
+
+                // Pass EDX = pc (32-bit immediate)
+                e.emit8(0xBA);  // MOV EDX, imm32
+                e.emit32(ti.pc);
+
+                // Load function pointer
+                e.mov_r64_imm64(x86::RAX,
+                    reinterpret_cast<std::uint64_t>(&vortex_trace_step_one));
+                e.call_rax();
+
+                // The shim returns a Value (16 bytes in RAX:RDX).
+                // RAX = tag+pad, RDX = payload.
+                // Check for deopt: if tag (AL) == 0 (Tag::None), jump to deopt.
+                e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);  // TEST RAX, RAX
+                std::size_t je_j = e.je_rel32();  // if RAX == 0 (None), deopt
+                deopt_jumps.push_back(je_j);
+                break;
+            }
         }
     }
 
@@ -867,10 +933,12 @@ namespace x86_cond {
         e.patch_rel32(j, deopt_pos);
     }
 
-    // Deopt: restore RBX, return None (signal to caller to resume Tier-0)
+    // Deopt: restore RBX, return None (tag=0, payload=0).
+    // The caller checks rv.tag == Tag::None to detect deopt.
+    // Value is 16 bytes returned in RAX (tag+pad) and RDX (payload).
     e.pop_r64(x86::RBX);
-    // MOV EAX, 0 (Tag::None = 0)
-    e.emit8(0xB8); e.emit32(0);  // MOV EAX, 0
+    e.emit8(0x48); e.emit8(0x31); e.emit8(0xC0);  // XOR RAX, RAX (tag=0)
+    e.emit8(0x48); e.emit8(0x31); e.emit8(0xD2);  // XOR RDX, RDX (payload=0)
     e.ret();
 
     // --- Rule 97: W^X — flip from RW to RX ---
@@ -1042,6 +1110,46 @@ void MetaTracer::finish_recording() noexcept {
     // we freed the old entry above.
     traces.insert(key, recording);
 
+    recording = nullptr;
+}
+
+void MetaTracer::finish_function_trace() noexcept {
+    if (!recording) return;
+
+    recording->is_recording = false;
+
+    // Compile the trace to native code.
+    if (!compile_trace(*recording, profiler_)) {
+        std::fprintf(stderr, "VORTEX tracer: function trace compilation failed\n");
+        // Cache the failure so we don't re-record.
+        std::uint64_t key = (static_cast<std::uint64_t>(recording->unit->id) << 16);
+        if (Trace** existing = traces.get(key)) {
+            if (*existing) free_trace(*existing);
+            traces.erase(key);
+        }
+        if (traces.size() >= kMaxCompiledTraces) {
+            evict_coldest_trace();
+        }
+        traces.insert(key, recording);
+        recording = nullptr;
+        return;
+    }
+
+    std::fprintf(stderr, "VORTEX tracer: function trace compiled (%zu instrs, %zu bytes native)\n",
+                 recording->instrs.size(), recording->native_code_size);
+
+    // Build the lookup key: (unit_id << 16) | 0 (header_pc=0 for function entry)
+    std::uint64_t key = (static_cast<std::uint64_t>(recording->unit->id) << 16);
+
+    if (Trace** existing = traces.get(key)) {
+        if (*existing) free_trace(*existing);
+        traces.erase(key);
+    }
+    if (traces.size() >= kMaxCompiledTraces) {
+        evict_coldest_trace();
+    }
+
+    traces.insert(key, recording);
     recording = nullptr;
 }
 

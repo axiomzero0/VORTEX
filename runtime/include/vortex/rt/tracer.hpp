@@ -77,6 +77,15 @@ struct Trace {
     /// compile_trace checks this flag and refuses to compile if set.
     /// This prevents incorrect traces that skip unsupported ops.
     bool has_unsupported_op{false};
+    /// Function-entry trace (not a backedge trace). Set when the tracer
+    /// starts recording from a function entry point (not a backedge).
+    /// The trace records from entry to return, and the RETURN instruction
+    /// triggers finish_function_trace().
+    bool is_function_trace{false};
+    /// Consecutive deopt counter for function traces. If the trace
+    /// deopts N times in a row, it's recording the wrong path — stop
+    /// invoking it. Reset on success.
+    std::uint32_t consecutive_deopts{0};
 
     // Layer 2: CorrelationId — causally links this trace to its Tier-0
     // execution context. Used by the Introspector (Rule 119) to answer:
@@ -232,6 +241,31 @@ struct MetaTracer {
 
     /// Check if we're currently recording a trace.
     [[nodiscard]] bool is_recording() const noexcept { return recording != nullptr; }
+
+    /// Start recording a function-entry trace (not a backedge trace).
+    /// Used for hot functions that have no loops (like fib_recursion).
+    /// The trace records from the function entry to return.
+    void start_function_trace(CodeUnit* unit) noexcept {
+        if (recording) return;  // already recording
+        recording = static_cast<Trace*>(std::malloc(sizeof(Trace)));
+        if (!recording) return;
+        recording = new (recording) Trace{};
+        recording->unit = unit;
+        recording->header_pc = 0;  // function entry = PC 0
+        recording->is_recording = true;
+        recording->is_function_trace = true;
+        record_start_pc = 0;
+        record_unit = unit;
+    }
+
+    /// Check if the current recording is a function-entry trace.
+    [[nodiscard]] bool is_function_recording() const noexcept {
+        return recording && recording->is_function_trace;
+    }
+
+    /// Finish a function-entry trace when the function returns.
+    /// Compiles the trace and stores it with key (unit_id << 16).
+    void finish_function_trace() noexcept;
 };
 
 }  // namespace abi_v1

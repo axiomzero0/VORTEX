@@ -136,3 +136,39 @@ extern "C" void vortex_rt_munmap_jit_buffer(void* buf, std::size_t cap) noexcept
     std::size_t mapped = ((cap + pagesz - 1) / pagesz) * pagesz;
     munmap(buf, mapped);
 }
+
+// =============================================================================
+// Trace compiler C shim: executes ONE Tier-0 instruction via step_one.
+//
+// The trace compiler emits a CALL to this function for any op it can't
+// compile inline (CALL, LOAD_GLOBAL, LOAD_ATTR, etc.). The shim
+// executes the instruction via step_one and returns. The trace
+// continues after the shim returns.
+//
+// Parameters:
+//   regs    — the register file (same as trace_fn's argument)
+//   unit_id — the code unit ID (for looking up the CodeUnit)
+//   pc      — the Tier-0 PC of the instruction to execute
+//
+// Returns: the result value of the instruction (for most ops, this is
+// written to regs[dst] by step_one; for CALL, the result is returned).
+// =============================================================================
+
+extern "C" vortex::Value vortex_trace_step_one(void* regs_raw, std::uint32_t unit_id,
+                                                std::uint32_t pc) noexcept {
+    using namespace vortex::rt;
+    Vm* vm = active_vm();
+    if (!vm) return vortex::Value::none();
+    CodeUnit* unit = nullptr;
+    if (unit_id < vm->program.units.size()) {
+        unit = vm->program.units[unit_id];
+    }
+    if (!unit) return vortex::Value::none();
+    Value* regs = static_cast<Value*>(regs_raw);
+    Value out;
+    bool ok = vm->step_one(unit, regs, unit->n_registers, pc, out);
+    if (!ok) {
+        return vortex::Value::none();  // deopt signal
+    }
+    return out;
+}
