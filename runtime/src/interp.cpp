@@ -765,7 +765,8 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
             // the body are recorded and compiled via a C shim.
             if (!tracer.is_recording() &&
                 unit->call_count >= tracer.kHotThreshold &&
-                !jit_disabled_in_bridge) {
+                !jit_disabled_in_bridge &&
+                unit->trace_re_record_count <= 1) {
                 std::uint64_t key = (static_cast<std::uint64_t>(unit->id) << 16);
                 if (!tracer.traces.get(key)) {
                     tracer.start_function_trace(unit);
@@ -810,24 +811,18 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                     // Giga Tracing: record the guard outcome.
                     profiler.record_guard((*pp)->header_pc, rv.tag != Tag::None);
                     if (rv.tag == Tag::None) {
-                        // Deopt — the trace's guards failed. The trace
-                        // recorded the WRONG path (e.g., the base case
-                        // instead of the recursive case). Delete the old
-                        // trace and RE-RECORD from the current call. The
-                        // re-recording captures the actual hot path.
-                        ++(*pp)->consecutive_deopts;
-                        if ((*pp)->consecutive_deopts >= 3) {
+                        // Deopt — the trace's guards failed. Check if
+                        // we should re-record or give up.
+                        ++unit->trace_re_record_count;
+                        if (unit->trace_re_record_count > 1) {
                             // Too many re-records — give up on tracing
-                            // this function. Delete the trace so it
-                            // doesn't get invoked again.
+                            // this function. Delete the trace.
                             MetaTracer::free_trace(*pp);
                             tracer.traces.erase(fkey);
                         } else {
-                            // Delete the old trace and re-record.
+                            // Delete old trace and re-record.
                             MetaTracer::free_trace(*pp);
                             tracer.traces.erase(fkey);
-                            // Start re-recording NOW. The exec_frame
-                            // below will record the actual hot path.
                             tracer.start_function_trace(unit);
                         }
                         // Re-execute the function in the interpreter.

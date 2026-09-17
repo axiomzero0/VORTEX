@@ -120,6 +120,10 @@ struct CodeUnit {
     // small (most functions have ≤4 loops) so lookup is ~4 comparisons.
     mutable std::uint64_t backedge_count{0};  // Total (legacy, for telemetry)
     mutable std::uint64_t call_count{0};
+    /// Function-trace re-record count. After 3 re-records, stop trying
+    /// to trace this function (the trace keeps deopting). Prevents
+    /// the re-record overhead from dominating recursive call performance.
+    std::uint32_t trace_re_record_count{0};
     /// Per-header backedge counts. Keyed by the backedge TARGET PC
     /// (the loop header). Looked up by on_backedge to decide if a
     /// specific loop is hot, not the whole unit.
