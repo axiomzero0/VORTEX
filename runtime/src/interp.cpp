@@ -799,17 +799,38 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 std::uint64_t fkey = (static_cast<std::uint64_t>(unit->id) << 16);
                 Trace** pp = tracer.traces.get(fkey);
                 if (pp && *pp && (*pp)->native_code && !jit_disabled_in_bridge &&
-                    (*pp)->consecutive_deopts < 3) {
+                    (*pp)->consecutive_deopts < 3 &&
+                    // Only invoke if the trace is worth it: inline ops
+                    // must outnumber shim ops (otherwise the trace is
+                    // slower than the interpreter due to C shim overhead).
+                    (*pp)->inline_op_count > (*pp)->shim_op_count) {
                     auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
                     Value rv = trace_fn(f.regs);
                     // Giga Tracing: record the guard outcome.
                     profiler.record_guard((*pp)->header_pc, rv.tag != Tag::None);
                     if (rv.tag == Tag::None) {
-                        // Deopt — the trace's guards failed. Re-execute
-                        // in the interpreter. If the trace deopts too many
-                        // times consecutively, it's the wrong path — stop
-                        // invoking it.
+                        // Deopt — the trace's guards failed. The trace
+                        // recorded the WRONG path (e.g., the base case
+                        // instead of the recursive case). Delete the old
+                        // trace and RE-RECORD from the current call. The
+                        // re-recording captures the actual hot path.
                         ++(*pp)->consecutive_deopts;
+                        if ((*pp)->consecutive_deopts >= 3) {
+                            // Too many re-records — give up on tracing
+                            // this function. Delete the trace so it
+                            // doesn't get invoked again.
+                            MetaTracer::free_trace(*pp);
+                            tracer.traces.erase(fkey);
+                        } else {
+                            // Delete the old trace and re-record.
+                            MetaTracer::free_trace(*pp);
+                            tracer.traces.erase(fkey);
+                            // Start re-recording NOW. The exec_frame
+                            // below will record the actual hot path.
+                            tracer.start_function_trace(unit);
+                        }
+                        // Re-execute the function in the interpreter.
+                        // If recording, this captures the instructions.
                         f.pc = 0;
                         ExecStatus st = exec_frame(f);
                         if (st == ExecStatus::Returned) {
@@ -2593,7 +2614,7 @@ L_PY_CMP: {
     VM_DISPATCH();
 }
 L_LOAD_GLOBAL: {
-    if (tracer.is_recording()) tracer.record_unsupported_op();
+    if (tracer.is_recording()) tracer.record_instr(*cur, f.pc, 0, 0, 0);
     Value v;
     RAISE_CHECK(get_global(cur->imm, v));
     write_reg_owned(cur->dst, v);

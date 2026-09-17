@@ -86,6 +86,11 @@ struct Trace {
     /// deopts N times in a row, it's recording the wrong path — stop
     /// invoking it. Reset on success.
     std::uint32_t consecutive_deopts{0};
+    /// Count of inline-compiled ops vs C-shim ops. If the trace has
+    /// too many C-shim calls (more than inline ops), it's slower
+    /// than the interpreter — don't invoke it.
+    std::uint32_t inline_op_count{0};
+    std::uint32_t shim_op_count{0};
 
     // Layer 2: CorrelationId — causally links this trace to its Tier-0
     // execution context. Used by the Introspector (Rule 119) to answer:

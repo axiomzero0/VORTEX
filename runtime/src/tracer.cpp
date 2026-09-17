@@ -522,14 +522,17 @@ namespace x86_cond {
     std::size_t header_pos = e.pos;
 
     // Giga Tracing (1.10): PC → emitter-position map for JUMP target resolution.
-    // Built incrementally as each instruction is emitted. When the JUMP case
-    // needs to patch a backedge, it looks up the target PC in this map to
-    // find the correct position within the trace (NOT always header_pos —
-    // nested-loop inner backedges patch to the inner header, not the outer).
-    // Without this, nested loops hang: the inner backedge JUMPs to the
-    // outer header, the inner loop runs once per outer iteration, and
-    // `i` never increments (infinite loop).
+    // Built in a PRE-PASS so forward jumps can find their target PC.
+    // Forward jumps use DEFERRED PATCHING: the patch position is recorded,
+    // and after all instructions are emitted, the patches are resolved.
     stdx::small_vector<std::pair<std::uint32_t, std::size_t>, 32> pc_to_pos;
+    // Pre-pass: record each instruction's PC (position filled in later).
+    for (std::size_t idx = start_idx; idx < trace.instrs.size(); ++idx) {
+        pc_to_pos.push_back({trace.instrs[idx].pc, 0});
+    }
+    // Deferred patches: (patch_position, target_pc). Resolved after all
+    // instructions are emitted, when all positions are known.
+    stdx::small_vector<std::pair<std::size_t, std::uint32_t>, 8> deferred_patches;
 
     stdx::small_vector<std::size_t, 4> deopt_jumps;
 
@@ -538,10 +541,11 @@ namespace x86_cond {
         const Instr& instr = ti.instr;
         Op op = static_cast<Op>(instr.op);
 
-        // Giga Tracing (1.10): record this instruction's emitter position
-        // BEFORE emitting it, so the JUMP case can resolve backedge targets
-        // to the correct position within the trace.
-        pc_to_pos.push_back({ti.pc, e.pos});
+        // Update the emitter position for this PC (now that we know it).
+        std::size_t map_idx = idx - start_idx;
+        if (map_idx < pc_to_pos.size()) {
+            pc_to_pos[map_idx].second = e.pos;
+        }
 
         // Bug fix 1.7.1: check buffer capacity before each instruction.
         // Worst case per instruction: ~30 bytes (guard + load + op + write).
@@ -812,13 +816,58 @@ namespace x86_cond {
                 break;
             }
             case Op::JUMP_IF_FALSE: {
-                // Conditional: if condition is FALSE (zero), jump to deopt (loop exit).
-                // If TRUE (non-zero), fall through to the body (loop continues).
+                // Conditional branch: if condition is FALSE (zero),
+                // jump to the target PC's position in the trace.
+                // If TRUE (non-zero), fall through to the next instruction.
+                //
+                // CRITICAL: the fall-through (TRUE) path must lead to
+                // PC+1 (the next instruction in the bytecode). If the
+                // next recorded instruction has a different PC, the
+                // TRUE path is not in the trace — deopt.
                 std::uint8_t cond_reg = instr.a;
                 e.mov_r64_mem(x86::RAX, x86::RBX, slot_disp(cond_reg, kPayloadOffset));
                 e.emit8(0x48); e.emit8(0x85); e.emit8(0xC0);  // TEST RAX, RAX
-                std::size_t deopt_j = e.je_rel32();  // JE to deopt (zero = false)
-                deopt_jumps.push_back(deopt_j);
+                // Look up the target PC in the pc_to_pos map.
+                bool found = false;
+                std::size_t target_emit_pos = 0;
+                for (const auto& kv : pc_to_pos) {
+                    if (kv.first == instr.imm) {
+                        found = true;
+                        target_emit_pos = kv.second;
+                        break;
+                    }
+                }
+                if (found) {
+                    // Target is in the trace — emit conditional jump.
+                    std::size_t j = e.je_rel32();  // JE to target (zero = false)
+                    if (target_emit_pos > 0) {
+                        // Backward jump — patch now.
+                        e.patch_rel32(j, target_emit_pos);
+                    } else {
+                        // Forward jump — defer the patch.
+                        deferred_patches.push_back({j, instr.imm});
+                    }
+                    // Check the fall-through (TRUE) path: the next
+                    // instruction in the trace must have PC = current PC + 1.
+                    // If not, the TRUE path is not in the trace — deopt.
+                    if (idx + 1 < trace.instrs.size()) {
+                        std::uint32_t next_pc = trace.instrs[idx + 1].pc;
+                        if (next_pc != ti.pc + 1) {
+                            // Fall-through leads to wrong PC — deopt when
+                            // condition is TRUE (non-zero = fall-through).
+                            std::size_t deopt_j = e.jne_rel32();
+                            deopt_jumps.push_back(deopt_j);
+                        }
+                    } else {
+                        // No next instruction — deopt on fall-through.
+                        std::size_t deopt_j = e.jne_rel32();
+                        deopt_jumps.push_back(deopt_j);
+                    }
+                } else {
+                    // Target NOT in trace — deopt when condition is false.
+                    std::size_t deopt_j = e.je_rel32();
+                    deopt_jumps.push_back(deopt_j);
+                }
                 break;
             }
             case Op::LOAD_CONST: {
@@ -919,6 +968,23 @@ namespace x86_cond {
         }
     }
 
+    // Resolve deferred forward-jump patches. Now that all instructions
+    // have been emitted, all emitter positions are known.
+    for (const auto& [patch_pos, target_pc] : deferred_patches) {
+        bool found = false;
+        for (const auto& kv : pc_to_pos) {
+            if (kv.first == target_pc) {
+                e.patch_rel32(patch_pos, kv.second);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            // Target not in trace — patch to deopt stub (will be set below).
+            deopt_jumps.push_back(patch_pos);
+        }
+    }
+
     // Bug fix 1.7.1: check for emission overflow after all instructions.
     // If the emitter ran out of space, the code is truncated — don't execute it.
     if (e.failed()) {
@@ -951,6 +1017,31 @@ namespace x86_cond {
     trace.native_code_size = e.pos;
     trace.native_code_capacity = mapped;  // for munmap in free_trace
     trace.is_compiled = true;
+    // Count inline vs shim ops. The trace is only worth invoking if
+    // the inline ops (which are faster than the interpreter) outnumber
+    // the shim ops (which are slower). This prevents traces full of
+    // CALL/LOAD_GLOBAL (like fib_recursion) from being slower than
+    // the interpreter.
+    trace.inline_op_count = 0;
+    trace.shim_op_count = 0;
+    for (std::size_t idx = start_idx; idx < trace.instrs.size(); ++idx) {
+        const Instr& instr = trace.instrs[idx].instr;
+        Op op = static_cast<Op>(instr.op);
+        switch (op) {
+            case Op::PY_BINOP:
+            case Op::PY_CMP:
+            case Op::LOAD_CONST:
+            case Op::MOVE:
+            case Op::JUMP:
+            case Op::JUMP_IF_FALSE:
+            case Op::RETURN:
+                ++trace.inline_op_count;
+                break;
+            default:
+                ++trace.shim_op_count;
+                break;
+        }
+    }
     return true;
 }
 
