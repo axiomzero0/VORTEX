@@ -79,15 +79,14 @@ enum class Op : std::uint16_t {
 };
 
 struct Instr {
-    std::uint8_t op;
-    std::uint8_t dst;
-    std::uint8_t a;
-    std::uint8_t b;
-    std::uint8_t c;
-    std::uint8_t aux;     // CALL_KW: kwnode register; otherwise unused
-    std::uint16_t imm;   // 16-bit immediate (jump targets, const idx, symbol IDs)
+    std::uint16_t op;
+    std::uint16_t dst;
+    std::uint16_t a;
+    std::uint16_t b;
+    std::uint16_t c;
+    std::uint32_t imm;
 };
-static_assert(sizeof(Instr) == 8, "Instr is 8 bytes — 2x cache density vs 16");
+static_assert(sizeof(Instr) == 16, "Instr is 16 bytes — no hardcoded caps on registers or immediates");
 
 struct TryRange {
     std::uint32_t start_pc{0};

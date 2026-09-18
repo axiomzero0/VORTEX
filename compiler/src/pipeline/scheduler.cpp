@@ -227,17 +227,17 @@ void Scheduler::emit_value(NodeId id) noexcept {
 
     BlockInfo* b = block(current_leader_);
     Instr i{};
-    i.dst = static_cast<std::uint8_t>(id);
+    i.dst = static_cast<std::uint16_t>(id);
     switch (n.kind) {
         case NodeKind::ConstInt:
         case NodeKind::ConstFloat: {
-            i.op = static_cast<std::uint8_t>(Op::LOAD_CONST);
+            i.op = static_cast<std::uint16_t>(Op::LOAD_CONST);
             i.imm = static_cast<std::uint16_t>(add_constant(n.const_value));
             ins(b->body, i);
             return;
         }
         case NodeKind::ConstPy: {
-            i.op = static_cast<std::uint8_t>(Op::LOAD_CONST);
+            i.op = static_cast<std::uint16_t>(Op::LOAD_CONST);
             // String literals carry (aux0=offset, aux1=length) into the
             // module pool; Bool/None literals carry tag-only payloads.
             bool is_pool_string = n.aux0 != 0xFFFF'FFFF && n.aux1 != 0xFFFF'FFFF &&
@@ -268,22 +268,22 @@ void Scheduler::emit_value(NodeId id) noexcept {
         case NodeKind::PyBinary:
             // Py ops carry (control, effect, lhs, rhs) since the effectful
             // rework — data operands start at index 2.
-            i.op = static_cast<std::uint8_t>(Op::PY_BINOP);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
-            i.b = static_cast<std::uint8_t>(n.ins[3]);
+            i.op = static_cast<std::uint16_t>(Op::PY_BINOP);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
+            i.b = static_cast<std::uint16_t>(n.ins[3]);
             i.imm = static_cast<std::uint16_t>(n.subop);
             ins(b->body, i);
             return;
         case NodeKind::PyUnary:
-            i.op = static_cast<std::uint8_t>(Op::PY_UNOP);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::PY_UNOP);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             i.imm = static_cast<std::uint16_t>(n.subop);
             ins(b->body, i);
             return;
         case NodeKind::PyCompare:
-            i.op = static_cast<std::uint8_t>(Op::PY_CMP);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
-            i.b = static_cast<std::uint8_t>(n.ins[3]);
+            i.op = static_cast<std::uint16_t>(Op::PY_CMP);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
+            i.b = static_cast<std::uint16_t>(n.ins[3]);
             i.imm = static_cast<std::uint16_t>(n.subop);
             ins(b->body, i);
             return;
@@ -315,9 +315,9 @@ void Scheduler::emit_value(NodeId id) noexcept {
                 case NodeKind::Shr:    bop = BinOpKind::RShift; break;
                 default: return;   // unreachable
             }
-            i.op = static_cast<std::uint8_t>(Op::PY_BINOP);
-            i.a = static_cast<std::uint8_t>(n.ins[0]);
-            i.b = static_cast<std::uint8_t>(n.ins[1]);
+            i.op = static_cast<std::uint16_t>(Op::PY_BINOP);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
+            i.b = static_cast<std::uint16_t>(n.ins[1]);
             i.imm = static_cast<std::uint16_t>(bop);
             ins(b->body, i);
             return;
@@ -328,9 +328,9 @@ void Scheduler::emit_value(NodeId id) noexcept {
                                               CmpOpKind::GE, CmpOpKind::EQ, CmpOpKind::NE};
             std::uint32_t kind_base = static_cast<std::uint32_t>(NodeKind::CmpLT);
             std::uint32_t idx = static_cast<std::uint32_t>(n.kind) - kind_base;
-            i.op = static_cast<std::uint8_t>(Op::PY_CMP);
-            i.a = static_cast<std::uint8_t>(n.ins[0]);
-            i.b = static_cast<std::uint8_t>(n.ins[1]);
+            i.op = static_cast<std::uint16_t>(Op::PY_CMP);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
+            i.b = static_cast<std::uint16_t>(n.ins[1]);
             i.imm = static_cast<std::uint16_t>(table[idx]);
             ins(b->body, i);
             return;
@@ -340,8 +340,8 @@ void Scheduler::emit_value(NodeId id) noexcept {
         case NodeKind::BitCast: case NodeKind::I2F: case NodeKind::F2I: {
             // Pure value-form preservation ops (no semantic change to the
             // Tier-0 surface — these are unboxing markers for the JIT only).
-            i.op = static_cast<std::uint8_t>(Op::MOVE);
-            i.a = static_cast<std::uint8_t>(n.ins[0]);
+            i.op = static_cast<std::uint16_t>(Op::MOVE);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
             ins(b->body, i);
             return;
         }
@@ -350,8 +350,8 @@ void Scheduler::emit_value(NodeId id) noexcept {
             // lowered to MOVE — a copy, not a negation — so `-x` returned x).
             // UnOpKind constants: un_neg=1, un_invert=2, un_not=3
             // (see frontend/parser.cpp + lowering.cpp).
-            i.op = static_cast<std::uint8_t>(Op::PY_UNOP);
-            i.a = static_cast<std::uint8_t>(n.ins[0]);
+            i.op = static_cast<std::uint16_t>(Op::PY_UNOP);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
             i.imm = 1;   // un_neg
             ins(b->body, i);
             return;
@@ -359,8 +359,8 @@ void Scheduler::emit_value(NodeId id) noexcept {
         case NodeKind::Not: {
             // IBE-10 fix: Not lowered to PY_UNOP with un_not subop (was
             // lowered to MOVE — a copy, so `not x` returned x).
-            i.op = static_cast<std::uint8_t>(Op::PY_UNOP);
-            i.a = static_cast<std::uint8_t>(n.ins[0]);
+            i.op = static_cast<std::uint16_t>(Op::PY_UNOP);
+            i.a = static_cast<std::uint16_t>(n.ins[0]);
             i.imm = 3;   // un_not
             ins(b->body, i);
             return;
@@ -413,55 +413,55 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
     const Node& n = g_.node(id);
     BlockInfo* b = block(current_leader_);
     Instr i{};
-    i.dst = static_cast<std::uint8_t>(id);
+    i.dst = static_cast<std::uint16_t>(id);
     switch (n.kind) {
         case NodeKind::LoadGlobal:
-            i.op = static_cast<std::uint8_t>(Op::LOAD_GLOBAL);
+            i.op = static_cast<std::uint16_t>(Op::LOAD_GLOBAL);
             i.imm = static_cast<std::uint16_t>(n.symbol);
             ins(b->body, i);
             return;
         case NodeKind::StoreGlobal:
-            i.op = static_cast<std::uint8_t>(Op::STORE_GLOBAL);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::STORE_GLOBAL);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             i.imm = static_cast<std::uint16_t>(n.symbol);
             ins(b->body, i);
             return;
         case NodeKind::LoadAttr:
-            i.op = static_cast<std::uint8_t>(Op::LOAD_ATTR);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::LOAD_ATTR);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             i.imm = static_cast<std::uint16_t>(n.symbol);
             ins(b->body, i);
             return;
         case NodeKind::StoreAttr:
-            i.op = static_cast<std::uint8_t>(Op::STORE_ATTR);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
-            i.b = static_cast<std::uint8_t>(n.ins[3]);
+            i.op = static_cast<std::uint16_t>(Op::STORE_ATTR);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
+            i.b = static_cast<std::uint16_t>(n.ins[3]);
             i.imm = static_cast<std::uint16_t>(n.symbol);
             ins(b->body, i);
             return;
         case NodeKind::LoadIndex:
-            i.op = static_cast<std::uint8_t>(Op::LOAD_INDEX);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
-            i.b = static_cast<std::uint8_t>(n.ins[3]);
+            i.op = static_cast<std::uint16_t>(Op::LOAD_INDEX);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
+            i.b = static_cast<std::uint16_t>(n.ins[3]);
             ins(b->body, i);
             return;
         case NodeKind::StoreIndex:
-            i.op = static_cast<std::uint8_t>(Op::STORE_INDEX);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
-            i.b = static_cast<std::uint8_t>(n.ins[3]);
-            i.c = static_cast<std::uint8_t>(n.ins[4]);
+            i.op = static_cast<std::uint16_t>(Op::STORE_INDEX);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
+            i.b = static_cast<std::uint16_t>(n.ins[3]);
+            i.c = static_cast<std::uint16_t>(n.ins[4]);
             ins(b->body, i);
             return;
         case NodeKind::StoreField:
-            i.op = static_cast<std::uint8_t>(Op::STORE_FIELD);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);   // base
-            i.b = static_cast<std::uint8_t>(n.ins[3]);   // value
+            i.op = static_cast<std::uint16_t>(Op::STORE_FIELD);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);   // base
+            i.b = static_cast<std::uint16_t>(n.ins[3]);   // value
             i.imm = static_cast<std::uint16_t>(n.aux0);                               // slot ordinal
             ins(b->body, i);
             return;
         case NodeKind::LoadField:
-            i.op = static_cast<std::uint8_t>(Op::LOAD_FIELD);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::LOAD_FIELD);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             i.imm = static_cast<std::uint16_t>(n.aux0);
             ins(b->body, i);
             return;
@@ -472,20 +472,20 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
             for (std::uint32_t k = 0; k < count; ++k) {
                 emit_value(n.ins[2 + k]);
                 Instr mv{};
-                mv.op = static_cast<std::uint8_t>(Op::MOVE);
-                mv.dst = static_cast<std::uint8_t>(scratch_base_ + k);
-                mv.a = static_cast<std::uint8_t>(n.ins[2 + k]);
+                mv.op = static_cast<std::uint16_t>(Op::MOVE);
+                mv.dst = static_cast<std::uint16_t>(scratch_base_ + k);
+                mv.a = static_cast<std::uint16_t>(n.ins[2 + k]);
                 ins(b->body, mv);
             }
-            i.op = static_cast<std::uint8_t>(n.kind == NodeKind::NewList ? Op::NEW_LIST
+            i.op = static_cast<std::uint16_t>(n.kind == NodeKind::NewList ? Op::NEW_LIST
                                                                           : Op::NEW_TUPLE);
-            i.a = static_cast<std::uint8_t>(base);
-            i.b = static_cast<std::uint8_t>(count);
+            i.a = static_cast<std::uint16_t>(base);
+            i.b = static_cast<std::uint16_t>(count);
             ins(b->body, i);
             return;
         }
         case NodeKind::NewDict: {
-            i.op = static_cast<std::uint8_t>(Op::NEW_DICT);
+            i.op = static_cast<std::uint16_t>(Op::NEW_DICT);
             ins(b->body, i);
             // Literal pairs arrive as data inputs [key, value, key, value...]
             // after (control, effect): emit a StoreIndex per pair.
@@ -496,28 +496,28 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
                 emit_value(key);
                 emit_value(val);
                 Instr mvk{};
-                mvk.op = static_cast<std::uint8_t>(Op::MOVE);
-                mvk.dst = static_cast<std::uint8_t>(scratch_base_);
-                mvk.a = static_cast<std::uint8_t>(key);
+                mvk.op = static_cast<std::uint16_t>(Op::MOVE);
+                mvk.dst = static_cast<std::uint16_t>(scratch_base_);
+                mvk.a = static_cast<std::uint16_t>(key);
                 ins(b->body, mvk);
                 Instr mvv{};
-                mvv.op = static_cast<std::uint8_t>(Op::MOVE);
-                mvv.dst = static_cast<std::uint8_t>(scratch_base_ + 1);
-                mvv.a = static_cast<std::uint8_t>(val);
+                mvv.op = static_cast<std::uint16_t>(Op::MOVE);
+                mvv.dst = static_cast<std::uint16_t>(scratch_base_ + 1);
+                mvv.a = static_cast<std::uint16_t>(val);
                 ins(b->body, mvv);
                 Instr st{};
-                st.op = static_cast<std::uint8_t>(Op::STORE_INDEX);
-                st.a = static_cast<std::uint8_t>(id);   // the dict register
-                st.b = static_cast<std::uint8_t>(scratch_base_);
-                st.c = static_cast<std::uint8_t>(scratch_base_ + 1);
+                st.op = static_cast<std::uint16_t>(Op::STORE_INDEX);
+                st.a = static_cast<std::uint16_t>(id);   // the dict register
+                st.b = static_cast<std::uint16_t>(scratch_base_);
+                st.c = static_cast<std::uint16_t>(scratch_base_ + 1);
                 ins(b->body, st);
             }
             return;
         }
         case NodeKind::ListAppend:
-            i.op = static_cast<std::uint8_t>(Op::LIST_APPEND);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
-            i.b = static_cast<std::uint8_t>(n.ins[3]);
+            i.op = static_cast<std::uint16_t>(Op::LIST_APPEND);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
+            i.b = static_cast<std::uint16_t>(n.ins[3]);
             ins(b->body, i);
             return;
         case NodeKind::CallPy:
@@ -532,9 +532,9 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
             for (std::uint32_t k = 0; k < argc; ++k) {
                 emit_value(n.ins[data_start + 1 + k]);
                 Instr mv{};
-                mv.op = static_cast<std::uint8_t>(Op::MOVE);
-                mv.dst = static_cast<std::uint8_t>(scratch_base_ + k);
-                mv.a = static_cast<std::uint8_t>(n.ins[data_start + 1 + k]);
+                mv.op = static_cast<std::uint16_t>(Op::MOVE);
+                mv.dst = static_cast<std::uint16_t>(scratch_base_ + k);
+                mv.a = static_cast<std::uint16_t>(n.ins[data_start + 1 + k]);
                 ins(b->body, mv);
             }
             emit_value(callee);
@@ -542,21 +542,20 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
                 NodeId kwnode = n.ins[data_start + 1 + argc];
                 emit_value(kwnode);
                 Instr ikw{};
-                ikw.op = static_cast<std::uint8_t>(Op::CALL_KW);
-                ikw.dst = static_cast<std::uint8_t>(id);
-                ikw.a = static_cast<std::uint8_t>(callee);
-                ikw.b = static_cast<std::uint8_t>(base);
-                ikw.c = static_cast<std::uint8_t>(argc);
-                ikw.imm = static_cast<std::uint16_t>(n.aux1 & 0xFFFF);
-                ikw.aux = static_cast<std::uint8_t>(kwnode);
+                ikw.op = static_cast<std::uint16_t>(Op::CALL_KW);
+                ikw.dst = static_cast<std::uint16_t>(id);
+                ikw.a = static_cast<std::uint16_t>(callee);
+                ikw.b = static_cast<std::uint16_t>(base);
+                ikw.c = static_cast<std::uint16_t>(argc);
+                ikw.imm = (static_cast<std::uint32_t>(kwnode) << 16) | (n.aux1 & 0xFFFF);
                 ins(b->body, ikw);
             } else {
                 Instr ic{};
-                ic.op = static_cast<std::uint8_t>(Op::CALL);
-                ic.dst = static_cast<std::uint8_t>(id);
-                ic.a = static_cast<std::uint8_t>(callee);
-                ic.b = static_cast<std::uint8_t>(base);
-                ic.c = static_cast<std::uint8_t>(argc);
+                ic.op = static_cast<std::uint16_t>(Op::CALL);
+                ic.dst = static_cast<std::uint16_t>(id);
+                ic.a = static_cast<std::uint16_t>(callee);
+                ic.b = static_cast<std::uint16_t>(base);
+                ic.c = static_cast<std::uint16_t>(argc);
                 ic.imm = static_cast<std::uint16_t>(n.aux1);
                 ins(b->body, ic);
             }
@@ -568,45 +567,45 @@ void Scheduler::emit_effect_op(NodeId id) noexcept {
             for (std::uint32_t k = 0; k < count; ++k) {
                 emit_value(n.ins[2 + k]);
                 Instr mv{};
-                mv.op = static_cast<std::uint8_t>(Op::MOVE);
-                mv.dst = static_cast<std::uint8_t>(scratch_base_ + k);
-                mv.a = static_cast<std::uint8_t>(n.ins[2 + k]);
+                mv.op = static_cast<std::uint16_t>(Op::MOVE);
+                mv.dst = static_cast<std::uint16_t>(scratch_base_ + k);
+                mv.a = static_cast<std::uint16_t>(n.ins[2 + k]);
                 ins(b->body, mv);
             }
             Instr in2{};
-            in2.op = static_cast<std::uint8_t>(Op::NATIVE);
-            in2.dst = static_cast<std::uint8_t>(id);
-            in2.a = static_cast<std::uint8_t>(base);
-            in2.b = static_cast<std::uint8_t>(count);
+            in2.op = static_cast<std::uint16_t>(Op::NATIVE);
+            in2.dst = static_cast<std::uint16_t>(id);
+            in2.a = static_cast<std::uint16_t>(base);
+            in2.b = static_cast<std::uint16_t>(count);
             in2.imm = static_cast<std::uint16_t>(n.subop);
             ins(b->body, in2);
             return;
         }
         case NodeKind::Iter:
-            i.op = static_cast<std::uint8_t>(Op::ITER);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::ITER);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             ins(b->body, i);
             return;
         case NodeKind::GetIterCheck:
-            i.op = static_cast<std::uint8_t>(Op::ITER_CHECK);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::ITER_CHECK);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             ins(b->body, i);
             return;
         case NodeKind::IterNext:
-            i.op = static_cast<std::uint8_t>(Op::ITER_NEXT);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::ITER_NEXT);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             ins(b->body, i);
             return;
         case NodeKind::Yield:
-            i.op = static_cast<std::uint8_t>(Op::YIELD);
-            i.a = static_cast<std::uint8_t>(n.ins[2]);
+            i.op = static_cast<std::uint16_t>(Op::YIELD);
+            i.a = static_cast<std::uint16_t>(n.ins[2]);
             ins(b->body, i);
             return;
         default:
             // Vector/memory/speculation kinds never appear in frontend IR.
             if (!n.ins.empty() && !is_control(g_.node(n.ins[0]).kind)) {
-                i.op = static_cast<std::uint8_t>(Op::MOVE);
-                i.a = static_cast<std::uint8_t>(n.ins[0]);
+                i.op = static_cast<std::uint16_t>(Op::MOVE);
+                i.a = static_cast<std::uint16_t>(n.ins[0]);
                 ins(b->body, i);
             }
             return;
@@ -652,8 +651,8 @@ void Scheduler::emit_terminator(NodeId leader) noexcept {
             }
         });
         Instr j{};
-        j.op = static_cast<std::uint8_t>(Op::JUMP_IF_FALSE);
-        j.a = static_cast<std::uint8_t>(iff.ins[1]);
+        j.op = static_cast<std::uint16_t>(Op::JUMP_IF_FALSE);
+        j.a = static_cast<std::uint16_t>(iff.ins[1]);
         ins(b->term, j);
         if (false_target != invalid_node) {
             b->term_fixups.push_back({b->term.size() - 1, false_target});
@@ -669,8 +668,8 @@ void Scheduler::emit_terminator(NodeId leader) noexcept {
         if (n.kind == NodeKind::Return && !n.ins.empty() && n.ins[0] == leader) {
             emit_value(n.ins[1]);
             Instr r{};
-            r.op = static_cast<std::uint8_t>(Op::RETURN);
-            r.a = static_cast<std::uint8_t>(n.ins[1]);
+            r.op = static_cast<std::uint16_t>(Op::RETURN);
+            r.a = static_cast<std::uint16_t>(n.ins[1]);
             ins(b->term, r);
             terminated = true;
             return;
@@ -678,8 +677,8 @@ void Scheduler::emit_terminator(NodeId leader) noexcept {
         if (n.kind == NodeKind::Throw && !n.ins.empty() && n.ins[0] == leader) {
             emit_value(n.ins[1]);
             Instr r{};
-            r.op = static_cast<std::uint8_t>(Op::RAISE);
-            r.a = static_cast<std::uint8_t>(n.ins[1]);
+            r.op = static_cast<std::uint16_t>(Op::RAISE);
+            r.a = static_cast<std::uint16_t>(n.ins[1]);
             ins(b->term, r);
             terminated = true;
             return;
@@ -712,13 +711,13 @@ void Scheduler::emit_terminator(NodeId leader) noexcept {
             NodeId src = p.ins[1];
             materialize_phi_source(src);
             Instr mv{};
-            mv.op = static_cast<std::uint8_t>(Op::MOVE);
-            mv.dst = static_cast<std::uint8_t>(phi);
-            mv.a = static_cast<std::uint8_t>(src);
+            mv.op = static_cast<std::uint16_t>(Op::MOVE);
+            mv.dst = static_cast<std::uint16_t>(phi);
+            mv.a = static_cast<std::uint16_t>(src);
             ins(b->term, mv);
         }
         Instr j{};
-        j.op = static_cast<std::uint8_t>(Op::JUMP);
+        j.op = static_cast<std::uint16_t>(Op::JUMP);
         ins(b->term, j);
         b->term_fixups.push_back({b->term.size() - 1, loop_header});
         return;
@@ -764,13 +763,13 @@ void Scheduler::emit_terminator(NodeId leader) noexcept {
             // continue-path double-add regression).
             materialize_phi_source(src);
             Instr mv{};
-            mv.op = static_cast<std::uint8_t>(Op::MOVE);
-            mv.dst = static_cast<std::uint8_t>(phi);
-            mv.a = static_cast<std::uint8_t>(src);
+            mv.op = static_cast<std::uint16_t>(Op::MOVE);
+            mv.dst = static_cast<std::uint16_t>(phi);
+            mv.a = static_cast<std::uint16_t>(src);
             ins(b->term, mv);
         }
         Instr j{};
-        j.op = static_cast<std::uint8_t>(Op::JUMP);
+        j.op = static_cast<std::uint16_t>(Op::JUMP);
         ins(b->term, j);
         b->term_fixups.push_back({b->term.size() - 1, merge_target});
         return;

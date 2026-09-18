@@ -787,7 +787,27 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
             }
 
             Frame f(unit);
-            if (!bind_parameters(f, fn, args, argc, kw_names, nkw)) return false;
+            // Fast path for simple functions: no defaults, no varargs,
+            // no kwargs, no closures. This is the common case for
+            // recursive functions like fib(n) — skip all the complex
+            // bind_parameters logic and just copy args directly.
+            if (argc == static_cast<std::uint32_t>(unit->param_regs.size()) ||
+                (fn->cells && argc + 1 == static_cast<std::uint32_t>(unit->param_regs.size()))) {
+                // Direct copy: no defaults, no varargs, no kwargs.
+                Runtime& rt2 = Runtime::instance();
+                for (std::uint32_t i = 0; i < argc; ++i) {
+                    f.regs[unit->param_regs[i]] = args[i];
+                    if (args[i].tag == Tag::Obj && args[i].as.obj) rt2.incref(args[i].as.obj);
+                }
+                // Closure cells: hidden last param.
+                if (fn->cells && !unit->param_regs.empty()) {
+                    std::uint32_t cells_reg = unit->param_regs.back();
+                    f.regs[cells_reg] = Value::object(reinterpret_cast<PyObj*>(fn->cells));
+                    rt2.incref(reinterpret_cast<PyObj*>(fn->cells));
+                }
+            } else {
+                if (!bind_parameters(f, fn, args, argc, kw_names, nkw)) return false;
+            }
 
             // Hot function fast paths: only check for traces/JIT when
             // the function has been called enough times to be hot.
@@ -2910,7 +2930,7 @@ L_CALL_KW: {
     if (tracer.is_recording()) tracer.record_unsupported_op();
     Value callee = regs[cur->a];
     Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
-    std::uint32_t kwnode = cur->aux;  // kwnode stored in aux field (8-byte Instr)
+    std::uint32_t kwnode = cur->imm >> 16;
     PyTupleObj* kw_names = kwnode < f.unit->n_registers &&
                                    regs[kwnode].tag == Tag::Obj &&
                                    regs[kwnode].as.obj &&
@@ -3637,7 +3657,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
         case Op::CALL_KW: {
             Value callee = regs[cur->a];
             Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
-            std::uint32_t kwnode = cur->aux;  // 8-byte Instr: kwnode in aux
+            std::uint32_t kwnode = cur->imm >> 16;
             PyTupleObj* kw_names = kwnode < n_regs && regs[kwnode].tag == Tag::Obj &&
                                    regs[kwnode].as.obj &&
                                    regs[kwnode].as.obj->tag == ObjTag::Tuple
