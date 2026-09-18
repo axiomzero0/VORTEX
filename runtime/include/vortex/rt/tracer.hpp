@@ -168,6 +168,9 @@ struct MetaTracer {
     /// Free a single trace: munmap native_code, destroy Trace, free memory.
     static void free_trace(Trace* t) noexcept {
         if (!t) return;
+        // Clear the has_function_trace flag on the unit so the CALL
+        // handler stops checking for traces (avoids hash lookup).
+        if (t->unit) t->unit->has_function_trace = false;
         // munmap the native code buffer (allocated via mmap in compile_trace).
         // Use the stored capacity (set by compile_trace) so munmap gets the
         // correct size — don't hardcode 4096 here.

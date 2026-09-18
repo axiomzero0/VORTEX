@@ -749,27 +749,23 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                 raise_builtin(rt.type_runtime_error, "code unit not linked");
                 return false;
             }
-            // Telemetry: call_count — used by the tracer to detect hot
-            // functions (not just hot loops). When a function is called
-            // kHotThreshold times, the tracer starts recording from the
-            // function entry point — this makes the tracer handle
-            // recursive and non-loop code (like fib_recursion), not just
-            // loops.
             ++unit->call_count;
 
-            // Function-entry tracing: if the function is hot (called
-            // kHotThreshold times) and no trace exists yet, start
-            // recording. This makes the tracer handle ALL hot code,
-            // not just loops with backedges. The recording captures
-            // the function body from entry to return. CALLs within
-            // the body are recorded and compiled via a C shim.
-            if (!tracer.is_recording() &&
-                unit->call_count >= tracer.kHotThreshold &&
-                !jit_disabled_in_bridge &&
-                unit->trace_re_record_count <= 1) {
-                std::uint64_t key = (static_cast<std::uint64_t>(unit->id) << 16);
-                if (!tracer.traces.get(key)) {
-                    tracer.start_function_trace(unit);
+            // Function-entry tracing: only attempt recording when the
+            // function is hot AND doesn't already have a trace. The
+            // has_function_trace flag avoids the hash lookup on every
+            // call when no trace exists (the common case for cold code).
+            // Also skip all trace/JIT checks for cold functions (first
+            // kHotThreshold calls) — they have zero overhead.
+            if (unit->call_count >= tracer.kHotThreshold) {
+                if (!unit->has_function_trace &&
+                    !tracer.is_recording() &&
+                    !jit_disabled_in_bridge &&
+                    unit->trace_re_record_count <= 1) {
+                    std::uint64_t key = (static_cast<std::uint64_t>(unit->id) << 16);
+                    if (!tracer.traces.get(key)) {
+                        tracer.start_function_trace(unit);
+                    }
                 }
             }
 
@@ -793,16 +789,21 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
             Frame f(unit);
             if (!bind_parameters(f, fn, args, argc, kw_names, nkw)) return false;
 
-            // Function-trace fast path: if a function-entry trace exists
-            // (keyed by (unit_id << 16) | 0), invoke it. This handles
-            // hot functions that have no loops (like fib_recursion).
-            {
-                std::uint64_t fkey = (static_cast<std::uint64_t>(unit->id) << 16);
-                Trace** pp = tracer.traces.get(fkey);
-                if (pp && *pp && (*pp)->native_code && !jit_disabled_in_bridge &&
-                    !tracer.is_recording() &&  // Don't invoke during recording
-                    (*pp)->consecutive_deopts < 3 &&
-                    (*pp)->inline_op_count >= (*pp)->shim_op_count * 3) {
+            // Hot function fast paths: only check for traces/JIT when
+            // the function has been called enough times to be hot.
+            // For cold functions (first kHotThreshold calls), skip ALL
+            // trace/JIT checks and go straight to exec_frame. This
+            // eliminates the per-call overhead of hash lookups and
+            // atomic loads for the common case.
+            if (unit->call_count >= tracer.kHotThreshold) {
+                // Function-trace fast path
+                if (unit->has_function_trace) {
+                    std::uint64_t fkey = (static_cast<std::uint64_t>(unit->id) << 16);
+                    Trace** pp = tracer.traces.get(fkey);
+                    if (pp && *pp && (*pp)->native_code && !jit_disabled_in_bridge &&
+                        !tracer.is_recording() &&
+                        (*pp)->consecutive_deopts < 3 &&
+                        (*pp)->inline_op_count >= (*pp)->shim_op_count * 3) {
                     auto trace_fn = reinterpret_cast<Value(*)(Value*)>((*pp)->native_code);
                     Value rv = trace_fn(f.regs);
                     // Giga Tracing: record the guard outcome.
@@ -839,6 +840,7 @@ bool Vm::call_value_kw(const Value& callee, Value* args, std::uint32_t argc,
                     return true;
                 }
             }
+            }  // end if (unit->call_count >= kHotThreshold)
 
             // JIT fast path: call jit_entry when available.
             // The bridge executes ONE dynamic op via step_one and returns.

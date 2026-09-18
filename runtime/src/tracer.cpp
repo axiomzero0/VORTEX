@@ -1260,6 +1260,9 @@ void MetaTracer::finish_recording() noexcept {
     // Store in the traces map. Now safe — either the key was empty or
     // we freed the old entry above.
     traces.insert(key, recording);
+    // Set the has_function_trace flag so the CALL handler knows to
+    // check for traces (avoids hash lookup when no trace exists).
+    recording->unit->has_function_trace = true;
 
     recording = nullptr;
 }
@@ -1301,6 +1304,8 @@ void MetaTracer::finish_function_trace() noexcept {
     }
 
     traces.insert(key, recording);
+    // Set the has_function_trace flag for function-entry traces.
+    recording->unit->has_function_trace = true;
     recording = nullptr;
 }
 

@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>   // memset for Frame init
 
 #include "vortex/common/value.hpp"
 #include "vortex/rt/object.hpp"
@@ -124,6 +125,10 @@ struct CodeUnit {
     /// to trace this function (the trace keeps deopting). Prevents
     /// the re-record overhead from dominating recursive call performance.
     std::uint32_t trace_re_record_count{0};
+    /// Fast flag: set when a function trace exists for this unit.
+    /// Avoids the hash lookup on every call when no trace exists.
+    /// Checked before the traces.get() call in call_value_kw.
+    bool has_function_trace{false};
     /// Per-header backedge counts. Keyed by the backedge TARGET PC
     /// (the loop header). Looked up by on_backedge to decide if a
     /// specific loop is hot, not the whole unit.
@@ -257,7 +262,12 @@ struct Frame {
         // Fast path: small frames use the inline buffer (no malloc).
         if (n_regs <= kInlineRegs) {
             regs = inline_regs;
-            for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+            // Value::none() is all zeros (tag=0, pad=0, as.i=0), so
+            // memset(0) is equivalent to the loop but much faster
+            // (SIMD-optimized). This is critical for call-heavy code
+            // like fib_recursion where Frame construction happens
+            // 21891 times.
+            std::memset(regs, 0, sizeof(Value) * n_regs);
             return;
         }
         // Slow path: large frames spill to heap.
@@ -271,7 +281,7 @@ struct Frame {
             n_regs = 0;
             return;
         }
-        for (std::uint32_t i = 0; i < n_regs; ++i) regs[i] = Value::none();
+        std::memset(regs, 0, bytes);
     }
     ~Frame() {
         Runtime& rt = Runtime::instance();
