@@ -2910,7 +2910,7 @@ L_CALL_KW: {
     if (tracer.is_recording()) tracer.record_unsupported_op();
     Value callee = regs[cur->a];
     Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
-    std::uint32_t kwnode = cur->imm >> 16;
+    std::uint32_t kwnode = cur->aux;  // kwnode stored in aux field (8-byte Instr)
     PyTupleObj* kw_names = kwnode < f.unit->n_registers &&
                                    regs[kwnode].tag == Tag::Obj &&
                                    regs[kwnode].as.obj &&
@@ -3637,7 +3637,7 @@ bool Vm::step_one(CodeUnit* unit, Value* regs, std::uint32_t n_regs,
         case Op::CALL_KW: {
             Value callee = regs[cur->a];
             Value* args = cur->c > 0 ? &regs[cur->b] : nullptr;
-            std::uint32_t kwnode = cur->imm >> 16;
+            std::uint32_t kwnode = cur->aux;  // 8-byte Instr: kwnode in aux
             PyTupleObj* kw_names = kwnode < n_regs && regs[kwnode].tag == Tag::Obj &&
                                    regs[kwnode].as.obj &&
                                    regs[kwnode].as.obj->tag == ObjTag::Tuple
